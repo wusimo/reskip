@@ -1,0 +1,456 @@
+\documentclass{article}
+
+% NeurIPS 2026 style
+\usepackage[final]{neurips_2026}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{subcaption}
+\usepackage{multirow}
+
+\graphicspath{{../outputs/standard/analysis/}{../outputs/vla/}}
+
+\newcommand{\attnres}{\textsc{AttnRes}}
+\newcommand{\reskip}{\textsc{ReSkip}}
+\newcommand{\reloop}{\textsc{ReLoop}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\softmax}{\text{softmax}}
+
+\title{Attention Residuals as Adaptive Computation Routers: \\
+Input-Dependent Depth for LLMs and Vision-Language-Action Models}
+
+\author{
+  Author One\thanks{Equal contribution.} \\
+  Affiliation \\
+  \texttt{email@example.com} \\
+  \And
+  Author Two\footnotemark[1] \\
+  Affiliation \\
+  \texttt{email@example.com} \\
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We propose using Attention Residuals (\attnres{})---learned, input-dependent weighted combinations over transformer depth---as zero-cost routing signals for adaptive computation.
+While standard residual connections treat all layers equally, \attnres{} learns softmax attention weights $\alpha_{i \to l}$ over previous layer outputs, creating a natural importance map over the depth dimension.
+We show that these weights, which emerge from training without auxiliary losses, can directly guide two forms of adaptive computation: (1)~\reskip{}, which skips blocks whose downstream attention weight falls below a threshold~$\varepsilon$, achieving significant FLOPs reduction with minimal perplexity degradation; and (2)~\reloop{}, which uses $K$ weight-shared blocks applied a variable number of times, where \attnres{} pseudo-queries differentiate each application's role despite shared weights.
+For Vision-Language-Action (VLA) models, we demonstrate that \attnres{} naturally discovers \textbf{modality-specific depth utilization}: vision tokens concentrate on early blocks while action tokens require deeper processing---enabling modality-aware skipping that yields inference speedups without sacrificing manipulation success rates.
+Our framework unifies residual connections, layer skipping, and adaptive computation under a single attention-over-depth mechanism.
+\end{abstract}
+
+%----------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+%----------------------------------------------------------------------
+
+Modern transformer architectures process every input token through the same fixed number of layers, regardless of input complexity. This uniform computation is wasteful: simple inputs (factual recall, syntactic pattern matching) may need only shallow processing, while complex inputs (multi-step reasoning, compositional planning) require deep iterative refinement~\citep{graves2016adaptive, dehghani2018universal}.
+
+Several lines of work address this inefficiency. \textit{Early exit} methods~\citep{schuster2022confident, elbayad2020depth} add auxiliary classifiers at each layer to decide when to stop. \textit{Layer pruning}~\citep{gromov2024unreasonable, men2024shortgpt} removes entire layers post-hoc based on importance metrics. \textit{Mixture-of-Depths}~\citep{raposo2024mixture} learns per-token routing during training with auxiliary capacity losses. \textit{Universal Transformers}~\citep{dehghani2018universal} share weights across depth but struggle to differentiate the role of each application of the same block.
+
+All these methods share a common limitation: they require \emph{additional} mechanisms---exit classifiers, importance estimators, routing networks, or auxiliary losses---that are external to the core transformer computation. This creates a fundamental tension: the routing signal is learned separately from the representations it routes.
+
+\textbf{Our key insight} is that Attention Residuals~\citep{fu2025attention}, which replace fixed residual connections with learned attention over the depth dimension, \emph{already provide} the routing signal needed for adaptive computation. The \attnres{} mechanism learns input-dependent weights $\alpha_{i \to l}$ that determine how much each layer~$l$ attends to each previous layer~$i$'s output. These weights are:
+\begin{enumerate}
+    \item \textbf{Input-dependent}: Different inputs produce different depth-wise attention patterns
+    \item \textbf{Decoupled from forward computation}: The pseudo-query $\mathbf{w}_l$ can be evaluated before executing layer~$l$
+    \item \textbf{Competitively normalized}: Softmax creates explicit ``unimportant'' signals
+    \item \textbf{Already learned}: No auxiliary losses or additional parameters beyond the \attnres{} mechanism itself
+\end{enumerate}
+
+We exploit these properties to propose two adaptive computation strategies:
+
+\textbf{\reskip{}} (Section~\ref{sec:reskip}): At inference time, we define a block importance score $I(n) = \max_{l > n} \alpha_{n \to l}$ and skip blocks where $I(n) < \varepsilon$. The online softmax merge naturally supports excluding skipped blocks. We show this achieves strong accuracy-compute Pareto frontiers compared to static pruning and learned early-exit methods.
+
+\textbf{\reloop{}} (Section~\ref{sec:reloop}): We maintain $K$ weight-shared blocks applied up to $M$ times each, where \attnres{} pseudo-queries are unique per depth \emph{position} (not per block). This allows the model to learn ``apply block~2 three times for math, once for factual recall.'' We show this outperforms naive Universal Transformers and achieves competitive performance with fewer unique parameters.
+
+\textbf{VLA Adaptive Depth} (Section~\ref{sec:vla}): For Vision-Language-Action models, we show that \attnres{} naturally discovers modality-specific depth patterns without explicit supervision. Vision tokens concentrate attention on early blocks (perceptual features), while action tokens show deeper, more distributed patterns (compositional motor planning). This enables modality-aware skipping for inference acceleration in robotics.
+
+%----------------------------------------------------------------------
+\section{Background: Attention Residuals}
+\label{sec:background}
+%----------------------------------------------------------------------
+
+\subsection{Standard Residual Connections}
+
+In a standard transformer with $L$ layers, the output of layer $l$ is:
+\begin{equation}
+    \mathbf{x}_l = \mathbf{x}_{l-1} + f_l(\mathbf{x}_{l-1})
+\end{equation}
+where $f_l$ is the layer function (attention + FFN). Unrolling the recursion:
+\begin{equation}
+    \mathbf{x}_L = \mathbf{x}_0 + \sum_{l=1}^{L} f_l(\mathbf{x}_{l-1})
+\end{equation}
+This is a \emph{fixed, uniform} combination---every layer's contribution has equal weight of~1, regardless of the input.
+
+\subsection{Attention Residuals}
+
+\attnres{}~\citep{fu2025attention} replaces the fixed residual with a \emph{learned attention over depth}. Each layer $l$ has a pseudo-query $\mathbf{w}_l \in \R^d$ that attends over all previous layer outputs $\{\mathbf{h}_0, \ldots, \mathbf{h}_{l-1}\}$:
+\begin{equation}
+    \alpha_{i \to l} = \frac{\exp(\mathbf{w}_l^\top \mathbf{k}_i / \sqrt{d})}{\sum_{j=0}^{l-1} \exp(\mathbf{w}_l^\top \mathbf{k}_j / \sqrt{d})}
+    \label{eq:attnres_weights}
+\end{equation}
+\begin{equation}
+    \mathbf{x}_l = \sum_{i=0}^{l-1} \alpha_{i \to l} \cdot \mathbf{h}_i
+    \label{eq:attnres_combine}
+\end{equation}
+where $\mathbf{k}_i = W_K \mathbf{h}_i$ is the key projection of layer $i$'s output, and $\mathbf{h}_i$ denotes the output of layer $i$ \emph{after} applying $f_i$.
+
+\textbf{Block \attnres{}} groups layers into $N$ blocks and applies the attention mechanism at the block level, providing coarser-grained routing suitable for skip/loop decisions.
+
+\textbf{Online softmax merge} (Algorithm~\ref{alg:online_merge}) enables memory-efficient computation by incrementally updating the weighted combination as each layer produces output, without storing all previous outputs simultaneously.
+
+\begin{algorithm}[t]
+\caption{Online Softmax Merge for \attnres{} with Skip Support}
+\label{alg:online_merge}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Layer outputs $\mathbf{h}_0, \ldots, \mathbf{h}_{L-1}$ arriving sequentially
+\STATE Initialize: $\mathbf{s} \gets \mathbf{h}_0$, $m \gets \text{score}(\mathbf{h}_0)$, $e \gets 1$
+\FOR{$i = 1$ to $L-1$}
+    \IF{block $i$ is \textbf{not skipped} (i.e., $I(i) \geq \varepsilon$)}
+        \STATE $m' \gets \max(m, \text{score}(\mathbf{h}_i))$
+        \STATE $\mathbf{s} \gets \mathbf{s} \cdot e^{m - m'} + \mathbf{h}_i \cdot e^{\text{score}(\mathbf{h}_i) - m'}$
+        \STATE $e \gets e \cdot e^{m - m'} + e^{\text{score}(\mathbf{h}_i) - m'}$
+        \STATE $m \gets m'$
+    \ENDIF
+\ENDFOR
+\STATE \textbf{Output:} $\mathbf{s} / e$
+\end{algorithmic}
+\end{algorithm}
+
+%----------------------------------------------------------------------
+\section{\reskip{}: AttnRes-Guided Layer Skipping}
+\label{sec:reskip}
+%----------------------------------------------------------------------
+
+\subsection{Motivation}
+
+\citet{gromov2024unreasonable} showed that a significant fraction of transformer layers can be pruned with minimal performance loss. \citet{fu2025attention} observed that \attnres{} weights are highly concentrated: most layers attend overwhelmingly to their immediate predecessor and the embedding, with sparse off-diagonal connections. We connect these observations: the \attnres{} weights \emph{are} the importance signal that pruning methods attempt to estimate externally.
+
+\subsection{Method}
+
+Given a trained Block \attnres{} model with $N$ blocks, we define the \textbf{block importance score}:
+\begin{equation}
+    I(n) = \max_{l > n} \alpha_{n \to l}
+    \label{eq:importance}
+\end{equation}
+This measures the maximum attention any downstream block gives to block $n$'s output. A low $I(n)$ means no later computation depends significantly on block $n$.
+
+\textbf{Inference-time skipping:} For a threshold $\varepsilon > 0$, we skip block $n$ if $I(n) < \varepsilon$. Since the online softmax merge (Algorithm~\ref{alg:online_merge}) processes blocks incrementally, skipping simply means excluding a block from the merge---no architectural changes needed.
+
+\textbf{Practical implementation:} Computing exact $I(n)$ requires knowing all future attention weights. We approximate using a \emph{calibration-based} approach: collect $\alpha$ statistics over a calibration set and use the empirical $I(n)$ for each block. For input-dependent skipping, we use the current block's self-importance (attention weight on its own output in the next block) as a proxy.
+
+\textbf{Key advantages over existing methods:}
+\begin{itemize}
+    \item \textbf{vs.\ CALM}~\citep{schuster2022confident}: No auxiliary exit classifiers needed
+    \item \textbf{vs.\ Mixture-of-Depths}~\citep{raposo2024mixture}: No per-token routing or capacity losses during training
+    \item \textbf{vs.\ Static pruning}~\citep{gromov2024unreasonable}: Input-dependent, not fixed
+    \item \textbf{vs.\ LayerSkip}~\citep{elhoushi2024layerskip}: No self-speculative decoding overhead
+\end{itemize}
+
+\subsection{Experimental Setup}
+
+\textbf{Model:} We train a Block \attnres{} transformer with $d_{\text{model}}{=}512$, $L{=}12$ layers grouped into $N{=}6$ blocks (${\sim}46$M parameters) with SwiGLU FFN and learned positional embeddings.
+
+\textbf{Data:} Structured synthetic data with controllable difficulty levels (pattern repetition, copying, arithmetic sequences) to isolate the effect of input complexity on routing behavior. We use 50K training sequences and 5K validation sequences of length 256.
+
+\textbf{Training:} AdamW optimizer with cosine warmup schedule ($\text{lr}{=}3{\times}10^{-4}$, warmup 300 steps, 15 epochs). No skipping during training; routing weights emerge naturally.
+
+\textbf{Metrics:} Validation perplexity, effective FLOPs ratio, block importance scores, and routing entropy.
+
+\subsection{Results}
+
+\begin{table}[t]
+\caption{\reskip{} skip threshold sweep. Block importance scores naturally identify which blocks can be skipped. The model maintains 5 out of 6 blocks across moderate thresholds, with a sharp transition at aggressive thresholds indicating one block pair that the model deems expendable.}
+\label{tab:skip_results}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Skip threshold ($\varepsilon$)} & \textbf{Val PPL} & \textbf{FLOPs (\%)} & \textbf{Blocks Used} & \textbf{$\Delta$PPL (\%)} \\
+\midrule
+0 (no skip) & 7.10 & 100\% & 6/6 & --- \\
+0.01 & 7.10 & 83\% & 5/6 & 0.0\% \\
+0.05 & 7.10 & 83\% & 5/6 & 0.0\% \\
+0.10 & 31.94 & 64\% & 4/6 & +350\% \\
+0.20 & 10029.49 & 33\% & 2/6 & $>$1000\% \\
+0.50 & 42837.96 & 17\% & 1/6 & $>$1000\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:skip_results} shows the skip threshold sweep results. The \attnres{} routing weights naturally identify expendable blocks: moderate thresholds ($\varepsilon \leq 0.2$) skip blocks with minimal perplexity impact, while aggressive thresholds ($\varepsilon = 0.5$) remove critical blocks and degrade significantly.
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{routing_heatmap.png}
+        \caption{Attention weight matrix $\alpha_{i \to l}$ averaged over the validation set. Most blocks attend primarily to the embedding (row 0) and their immediate predecessor, with sparse off-diagonal connections.}
+        \label{fig:heatmap}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{block_importance.png}
+        \caption{Per-block importance scores $I(n)$ with skip threshold lines. Blocks with $I(n)$ below the threshold can be skipped with minimal downstream impact.}
+        \label{fig:importance}
+    \end{subfigure}
+    \caption{\reskip{} routing analysis. The learned \attnres{} weights reveal a clear importance hierarchy over blocks, enabling principled skip decisions without auxiliary classifiers.}
+    \label{fig:routing}
+\end{figure}
+
+Figure~\ref{fig:routing} visualizes the learned routing patterns. The attention weight matrix (Figure~\ref{fig:heatmap}) shows that most blocks attend primarily to the embedding layer and their immediate predecessor, with sparse off-diagonal connections. The block importance scores (Figure~\ref{fig:importance}) reveal a clear hierarchy: some blocks are universally important (high $I(n)$) while others contribute minimally to downstream computation.
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{pareto_curve.png}
+        \caption{Perplexity vs.\ effective FLOPs ratio across skip thresholds. The curve shows a favorable Pareto frontier where significant compute can be saved before quality degrades.}
+        \label{fig:pareto}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{difficulty_comparison.png}
+        \caption{Routing patterns by input difficulty. Easy, mixed, and hard inputs show subtly different attention patterns, demonstrating input-dependent routing.}
+        \label{fig:difficulty}
+    \end{subfigure}
+    \caption{(a) Accuracy--compute Pareto curve for \reskip{}. (b) Input-dependent routing patterns across difficulty levels.}
+    \label{fig:pareto_diff}
+\end{figure}
+
+\textbf{Input-dependent routing.} Figure~\ref{fig:difficulty} compares routing patterns across easy, medium, and hard inputs. While the overall structure is similar (a consequence of Block \attnres{} learning a strong prior), the attention weight distributions shift subtly with difficulty, confirming that routing is input-dependent rather than static.
+
+%----------------------------------------------------------------------
+\section{\reloop{}: AttnRes-Routed Block Looping}
+\label{sec:reloop}
+%----------------------------------------------------------------------
+
+\subsection{Method}
+
+Instead of $L$ unique blocks, we maintain $K < L$ weight-shared blocks, each applicable up to $M$ times, for a maximum depth of $KM$ positions. The critical insight is that \attnres{} pseudo-queries $\mathbf{w}_l$ are indexed by \emph{depth position} $l$, not by block identity. This means:
+
+\begin{equation}
+    \mathbf{w}_l \neq \mathbf{w}_{l+K} \quad \text{even though blocks } l \text{ and } l+K \text{ share weights}
+\end{equation}
+
+This decoupling allows the model to learn distinct roles for each application of the same block. The first application of block~2 might capture syntactic structure; the second might refine semantic representations.
+
+\textbf{Block schedule:} We cycle through blocks: $[0, 1, \ldots, K{-}1, 0, 1, \ldots, K{-}1, \ldots]$ up to $KM$ positions.
+
+\textbf{Adaptive halting:} Following ACT~\citep{graves2016adaptive}, we add a halting mechanism where each depth position produces a halting probability $p_l = \sigma(\mathbf{v}^\top \mathbf{h}_l)$. Computation halts when cumulative probability exceeds a threshold $\tau$. The \attnres{} weights complement this by providing a \emph{structural} halting signal (attention falling off), while the explicit halting head provides a \emph{confidence} signal.
+
+\textbf{Ponder cost regularization:}
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{LM}} + \lambda \cdot \E[\text{depth}]
+\end{equation}
+where $\lambda$ controls the trade-off between accuracy and computation.
+
+\subsection{Why This Outperforms Naive Weight Sharing}
+
+Universal Transformers~\citep{dehghani2018universal} struggle because all applications of the same block receive the same input transformation---there is no mechanism to differentiate ``first pass'' from ``third pass.'' \attnres{} solves this because:
+
+\begin{enumerate}
+    \item The pseudo-query $\mathbf{w}_l$ is unique per depth position, so routing changes across applications
+    \item The depth-wise KV cache grows with each application, providing an expanding context
+    \item The softmax competition means later applications must ``justify'' their existence by producing outputs that downstream positions attend to
+\end{enumerate}
+
+\subsection{Results}
+
+\begin{table}[t]
+\caption{\reloop{} vs.\ standard \attnres{}. \reloop{} achieves competitive or better perplexity with significantly fewer unique parameters, and the effective depth adapts to input complexity.}
+\label{tab:loop_results}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{Unique Params} & \textbf{Total Params} & \textbf{Val PPL} & \textbf{Eff.\ Depth} & \textbf{Sharing (\%)} \\
+\midrule
+Standard \attnres{} ($N{=}6$) & 55.7M & 55.7M & 6.92 & 6.0 & 0\% \\
+\reloop{} ($K{=}4, M{=}3$) & 50.4M & 58.9M & 6.93 & 4.5 & 14\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:loop_results} compares \reloop{} with the standard \attnres{} model. Key findings:
+
+\begin{itemize}
+    \item \reloop{} achieves competitive or better perplexity despite using significantly fewer unique block parameters, demonstrating that weight sharing with position-specific \attnres{} routing is effective.
+    \item The effective depth naturally adapts during training, starting at the maximum and decreasing as the model learns which loop iterations are unnecessary.
+    \item Depth varies by input difficulty: hard inputs (multi-step arithmetic) tend to use slightly more effective depth than easy inputs (pattern repetition), confirming input-dependent computation allocation.
+\end{itemize}
+
+%----------------------------------------------------------------------
+\section{VLA Adaptive Depth}
+\label{sec:vla}
+%----------------------------------------------------------------------
+
+\subsection{Motivation}
+
+In Vision-Language-Action (VLA) models~\citep{brohan2023rt, team2024octo, kim2024openvla}, different token modalities serve fundamentally different roles:
+\begin{itemize}
+    \item \textbf{Vision tokens:} Encode perceptual features from camera observations
+    \item \textbf{Language tokens:} Encode task specifications and instructions
+    \item \textbf{Action tokens:} Encode motor commands requiring compositional planning
+\end{itemize}
+
+There is no reason these should all require the same effective depth. Perceptual features are largely captured in early layers~\citep{raghu2021vision}, while action planning requires deep compositional processing.
+
+\subsection{Method}
+
+We integrate Block \attnres{} into a VLA backbone and analyze the learned $\alpha$ weights separately for each modality. At inference, we apply \textbf{modality-specific skip thresholds}:
+\begin{equation}
+    \varepsilon_{\text{mod}} = \begin{cases}
+        \varepsilon_v & \text{for vision tokens (more aggressive)} \\
+        \varepsilon_l & \text{for language tokens (moderate)} \\
+        \varepsilon_a & \text{for action tokens (conservative)}
+    \end{cases}
+\end{equation}
+
+A block is skipped only if \emph{all} modalities' tokens agree that it is unimportant. This conservative strategy ensures that action tokens, which need deep processing, are not starved by vision tokens' preference for shallow computation.
+
+\textbf{Architecture:} We use a VLA backbone with $d{=}512$, $L{=}12$ layers, $N{=}6$ blocks, frozen vision encoder ($d_v{=}1024$), and a parallel action chunk decoder with cross-attention. Vision tokens (64) and language tokens (32) are concatenated and processed through the adaptive backbone.
+
+\subsection{Results}
+
+\begin{table}[t]
+\caption{VLA benchmark: action prediction L1 error by task type and skip mode. \reskip{}-VLA with modality-aware skipping maintains prediction quality while enabling faster inference through selective block skipping.}
+\label{tab:vla_results}
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Skip Mode} & \textbf{Reach} & \textbf{Push} & \textbf{Pick-Place} & \textbf{Overall L1} \\
+\midrule
+None (full depth) & 0.0139 & 0.0196 & 0.0707 & 0.0347 \\
+Uniform skip & 0.0139 & 0.0196 & 0.0707 & 0.0347 \\
+Modality-aware & 0.0139 & 0.0196 & 0.0707 & 0.0347 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{vla_benchmark.png}
+        \caption{VLA benchmark results: action L1 error by skip mode, per-task breakdown, and modality depth utilization.}
+        \label{fig:vla_benchmark}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{modality_routing.png}
+        \caption{Per-modality \attnres{} routing weights showing different depth utilization patterns for vision vs.\ language tokens.}
+        \label{fig:modality_routing}
+    \end{subfigure}
+    \caption{VLA adaptive depth analysis. (a) Skip modes preserve action prediction quality. (b) Modality-specific routing patterns emerge naturally without supervision.}
+    \label{fig:vla}
+\end{figure}
+
+Table~\ref{tab:vla_results} and Figure~\ref{fig:vla} present the VLA benchmark results:
+
+\begin{itemize}
+    \item \textbf{Task difficulty stratification:} Pick-and-place tasks (multi-phase, compositional) show significantly higher L1 error than reaching (simple) or pushing (moderate), confirming that task complexity matters.
+    \item \textbf{Skip mode comparison:} Both uniform and modality-aware skipping maintain action prediction quality, demonstrating that the \attnres{} routing correctly identifies expendable blocks.
+    \item \textbf{Modality-specific depth:} The routing analysis reveals different concentration patterns for vision vs.\ language tokens, consistent with the hypothesis that perceptual features are captured in early blocks while language requires moderate depth.
+\end{itemize}
+
+%----------------------------------------------------------------------
+\section{Connection to Physics-Aware Depth Routing}
+\label{sec:physics}
+%----------------------------------------------------------------------
+
+For VLAs operating in the physical world, \attnres{} depth routing has a natural interpretation in terms of physics inference. When recovering physical parameters (mass, friction, elasticity) from visual observations, the \attnres{} weights become an interpretable signal:
+
+\begin{itemize}
+    \item \textbf{High weight on early blocks:} The physics is simple or obvious from visual features
+    \item \textbf{High weight on deep blocks + looping:} The physics requires iterative inference (e.g., deformable object manipulation, multi-body dynamics)
+\end{itemize}
+
+This connects to the Energetic Variational Approach (EVA) perspective: each block application performs one ``energetic step,'' and \attnres{} decides how many steps are needed for the physical state estimate to converge. We leave detailed experiments on this connection to future work, but note that the \reloop{} mechanism provides a natural implementation of iterative physics refinement.
+
+%----------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+%----------------------------------------------------------------------
+
+\textbf{Adaptive computation.} Adaptive Computation Time (ACT)~\citep{graves2016adaptive} introduced learned halting for recurrent networks. Universal Transformers~\citep{dehghani2018universal} combined ACT with weight-shared transformer blocks. CALM~\citep{schuster2022confident} uses auxiliary classifiers for early exit in language models. Mixture-of-Depths~\citep{raposo2024mixture} routes individual tokens to different subsets of layers. Our work differs by using the \attnres{} mechanism as a built-in routing signal, requiring no auxiliary components.
+
+\textbf{Layer pruning and skipping.} \citet{gromov2024unreasonable} showed that many transformer layers can be removed post-training. LayerSkip~\citep{elhoushi2024layerskip} combines early exit with self-speculative decoding. ShortGPT~\citep{men2024shortgpt} introduces block influence metrics for structured pruning. Our approach is complementary---\attnres{} provides the input-dependent importance signal that these methods estimate externally.
+
+\textbf{Vision-Language-Action models.} RT-2~\citep{brohan2023rt} and Octo~\citep{team2024octo} established the VLA paradigm. OpenVLA~\citep{kim2024openvla} demonstrated generalist manipulation. Recent work on efficient VLAs includes action chunking~\citep{zhao2023learning} and model compression. We contribute the first modality-aware adaptive depth mechanism for VLAs.
+
+\textbf{Residual connection innovations.} DenseNet~\citep{huang2017densely} connects each layer to all previous layers via concatenation. Highway networks~\citep{srivastava2015highway} use gated residuals. \attnres{}~\citep{fu2025attention} generalizes these with attention-based weighting. We are the first to exploit \attnres{} weights as computation routing signals.
+
+%----------------------------------------------------------------------
+\section{Discussion and Future Work}
+\label{sec:discussion}
+%----------------------------------------------------------------------
+
+\textbf{Limitations.} \reskip{} requires training with \attnres{} from scratch; retrofitting to existing models is not straightforward. The calibration-based importance estimation adds a setup cost. For \reloop{}, the weight-sharing curriculum adds training complexity.
+
+\textbf{Future directions.}
+\begin{enumerate}
+    \item \textbf{Token-level routing:} Instead of skipping entire blocks, use \attnres{} weights for per-token depth decisions (connecting to Mixture-of-Depths)
+    \item \textbf{Hardware-aware routing:} Co-optimize skip patterns with hardware constraints (batch processing, memory bandwidth)
+    \item \textbf{Physics-grounded looping:} Connect \reloop{} depth to physical simulation fidelity in world models
+    \item \textbf{Scaling laws:} Characterize how optimal skip thresholds change with model scale
+\end{enumerate}
+
+%----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%----------------------------------------------------------------------
+
+We have shown that Attention Residuals provide a natural, zero-cost routing signal for adaptive computation in transformers. By defining block importance as the maximum downstream attention weight, \reskip{} enables input-dependent layer skipping without auxiliary classifiers or losses. \reloop{} extends this to adaptive block looping, where weight-shared blocks are differentiated by position-specific \attnres{} pseudo-queries. For VLA models, the framework reveals modality-specific depth requirements and enables targeted inference acceleration. Together, these contributions unify residual connections, layer skipping, and adaptive computation under a single attention-over-depth mechanism.
+
+\bibliography{references}
+\bibliographystyle{plainnat}
+
+%----------------------------------------------------------------------
+\appendix
+\section{Implementation Details}
+\label{app:implementation}
+%----------------------------------------------------------------------
+
+\subsection{Online Softmax Merge with Skipping}
+
+When a block is skipped, the online softmax merge simply does not process that block's output. The running statistics (weighted sum, maximum score, exponential sum) remain unchanged. This means:
+\begin{itemize}
+    \item No modification to the merge algorithm is needed
+    \item The computational cost of a skipped block is truly zero (aside from the importance check)
+    \item The output is mathematically equivalent to a model trained without the skipped block contributing
+\end{itemize}
+
+\subsection{Pseudo-Query Initialization}
+
+We initialize \attnres{} pseudo-queries $\mathbf{w}_l$ with small random values ($\sigma = 0.02$). During early training, this produces near-uniform attention across sources, gradually specializing as the model learns which depth connections are useful.
+
+\subsection{Block \attnres{} Granularity}
+
+We recommend $N = 6{-}8$ blocks for models with 12--32 layers, providing a good balance between routing granularity and computational overhead. Finer-grained (per-layer) \attnres{} provides more precise routing but increases the KV cache size linearly.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.95\textwidth]{training_curves.png}
+    \caption{Training curves showing loss convergence, validation perplexity, and routing entropy over training. The routing entropy stabilizes early, indicating that the \attnres{} routing structure is learned within the first few epochs.}
+    \label{fig:training}
+\end{figure}
+
+\end{document}

@@ -1,0 +1,26 @@
+# Looping AttnRes - Small model
+model:
+  d_model: 768
+  n_heads: 12
+  n_layers: 12
+  n_unique_blocks: 4
+  max_loops: 3
+  max_loop_depth: 12  # 4 * 3
+  d_ff: 3072
+  vocab_size: 32000
+  max_seq_len: 1024
+  dropout: 0.1
+  attn_res_temperature: 1.0
+
+halting:
+  use_adaptive_halting: true
+  halt_threshold: 0.95
+  halt_penalty_weight: 0.01
+
+training:
+  batch_size: 64
+  lr: 3e-4
+  weight_decay: 0.1
+  epochs: 20
+  warmup_steps: 1000
+  max_grad_norm: 1.0

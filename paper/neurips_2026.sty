@@ -1,0 +1,68 @@
+% NeurIPS 2026 style file - simplified version compatible with standard LaTeX
+% Based on NeurIPS formatting guidelines
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{neurips_2026}[2026/01/01 NeurIPS 2026 style]
+
+\newif\if@final
+\@finalfalse
+\DeclareOption{final}{\@finaltrue}
+\DeclareOption{preprint}{}
+\DeclareOption{nonatbib}{}
+\ProcessOptions\relax
+
+% Page layout
+\RequirePackage[letterpaper,margin=1in,top=1.25in,bottom=1.25in]{geometry}
+
+% Fonts and spacing
+\RequirePackage{times}
+\linespread{1.0}
+
+% Title formatting
+\def\@maketitle{%
+  \newpage
+  \null
+  \vskip 2em
+  \begin{center}%
+    {\LARGE \bf \@title \par}%
+    \vskip 1.5em%
+    {\large
+      \lineskip .5em%
+      \begin{tabular}[t]{c}%
+        \@author
+      \end{tabular}\par}%
+    \vskip 1em%
+    {\large \@date}%
+  \end{center}%
+  \par
+  \vskip 1.5em}
+
+% Section formatting
+\renewcommand\section{\@startsection{section}{1}{\z@}%
+  {-2.5ex \@plus -1ex \@minus -.2ex}%
+  {1.5ex \@plus .2ex}%
+  {\normalfont\Large\bfseries}}
+\renewcommand\subsection{\@startsection{subsection}{2}{\z@}%
+  {-2.0ex\@plus -1ex \@minus -.2ex}%
+  {1.0ex \@plus .2ex}%
+  {\normalfont\large\bfseries}}
+
+% Abstract
+\renewenvironment{abstract}%
+  {\centerline{\large\bfseries Abstract}%
+   \vspace{0.5ex}%
+   \begin{quote}}%
+  {\par\end{quote}\vskip 1ex}
+
+% Author commands
+\newcommand{\And}{\end{tabular}\hfil\linebreak[0]\hfil
+  \begin{tabular}[t]{c}\bfseries}
+\newcommand{\AND}{\end{tabular}\hfil\linebreak[4]\hfil
+  \begin{tabular}[t]{c}\bfseries}
+
+% Citation style
+\RequirePackage[numbers]{natbib}
+\bibliographystyle{plainnat}
+
+% Footnote for equal contribution
+\renewcommand{\thefootnote}{\fnsymbol{footnote}}
