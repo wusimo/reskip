@@ -34,9 +34,12 @@ class AdaptiveTransformerConfig:
     vocab_size: int = 32000
     max_seq_len: int = 2048
     dropout: float = 0.1
+    use_rope: bool = False
+    rope_base: float = 10000.0
 
     # AttnRes parameters
     attn_res_temperature: float = 1.0
+    use_attn_res: bool = True
 
     # Skipping parameters
     skip_threshold: float = 0.01  # epsilon for importance-based skipping
@@ -50,16 +53,26 @@ class AdaptiveTransformerConfig:
 class MultiHeadAttention(nn.Module):
     """Standard multi-head self-attention."""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.1,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+    ):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.use_rope = use_rope
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
+        if use_rope:
+            self.rotary = RotaryEmbedding(self.head_dim, rope_base)
 
     def forward(
         self,
@@ -71,6 +84,11 @@ class MultiHeadAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, S, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, S, HD)
         q, k, v = qkv.unbind(0)
+
+        if self.use_rope:
+            cos, sin = self.rotary(q, S)
+            q = apply_rotary_pos_emb(q, cos, sin)
+            k = apply_rotary_pos_emb(k, cos, sin)
 
         # Scaled dot-product attention
         scale = math.sqrt(self.head_dim)
@@ -100,13 +118,52 @@ class FeedForward(nn.Module):
         return self.dropout(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def apply_rotary_pos_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    return (x * cos) + (rotate_half(x) * sin)
+
+
+class RotaryEmbedding(nn.Module):
+    """Precompute rotary frequencies for attention heads."""
+
+    def __init__(self, head_dim: int, base: float = 10000.0):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError("RoPE requires an even head dimension")
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(positions, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()[None, None, :, :].to(dtype=x.dtype)
+        sin = emb.sin()[None, None, :, :].to(dtype=x.dtype)
+        return cos, sin
+
+
 class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm."""
 
     def __init__(self, config: AdaptiveTransformerConfig):
         super().__init__()
         self.attn_norm = nn.LayerNorm(config.d_model)
-        self.attn = MultiHeadAttention(config.d_model, config.n_heads, config.dropout)
+        self.attn = MultiHeadAttention(
+            config.d_model,
+            config.n_heads,
+            config.dropout,
+            use_rope=config.use_rope,
+            rope_base=config.rope_base,
+        )
         self.ff_norm = nn.LayerNorm(config.d_model)
         self.ff = FeedForward(config.d_model, config.d_ff, config.dropout)
 
@@ -143,7 +200,7 @@ class AdaptiveTransformerWithAttnRes(nn.Module):
 
         # Token + position embeddings
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
+        self.pos_emb = None if config.use_rope else nn.Embedding(config.max_seq_len, config.d_model)
         self.emb_dropout = nn.Dropout(config.dropout)
 
         # Determine block structure
@@ -251,10 +308,11 @@ class AdaptiveTransformerWithAttnRes(nn.Module):
         device = input_ids.device
 
         # Embeddings
-        positions = torch.arange(S, device=device).unsqueeze(0)
-        x = self.emb_dropout(
-            self.token_emb(input_ids) + self.pos_emb(positions)
-        )
+        if self.pos_emb is not None:
+            positions = torch.arange(S, device=device).unsqueeze(0)
+            x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
+        else:
+            x = self.emb_dropout(self.token_emb(input_ids))
 
         # Causal mask
         if mask is None:
@@ -449,3 +507,61 @@ class AdaptiveTransformerForCausalLM(nn.Module):
             total_entropy += entropy
             count += 1
         return total_entropy / max(count, 1)
+
+
+class StandardTransformerForCausalLM(nn.Module):
+    """Baseline transformer without AttnRes routing."""
+
+    def __init__(self, config: AdaptiveTransformerConfig):
+        super().__init__()
+        self.config = config
+        self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
+        self.pos_emb = None if config.use_rope else nn.Embedding(config.max_seq_len, config.d_model)
+        self.emb_dropout = nn.Dropout(config.dropout)
+        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layers)])
+        self.out_norm = nn.LayerNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        return_routing_info: bool = False,
+    ) -> dict:
+        del return_routing_info
+        _, seq_len = input_ids.shape
+        device = input_ids.device
+
+        if self.pos_emb is not None:
+            positions = torch.arange(seq_len, device=device).unsqueeze(0)
+            x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
+        else:
+            x = self.emb_dropout(self.token_emb(input_ids))
+
+        mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).unsqueeze(0).unsqueeze(0)
+        for block in self.blocks:
+            x = block(x, mask)
+
+        logits = self.lm_head(self.out_norm(x))
+        result = {"logits": logits}
+
+        if labels is not None:
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            result["loss"] = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+        return result
