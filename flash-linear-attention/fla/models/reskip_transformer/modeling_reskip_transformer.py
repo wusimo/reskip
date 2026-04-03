@@ -178,6 +178,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         active_mask: torch.Tensor | None = None,
+        return_routing_weights: bool = False,
         **kwargs: Unpack[Any],
     ) -> tuple[
         torch.Tensor,
@@ -188,7 +189,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         torch.Tensor,
     ]:
         attn_sources, attn_source_ids = make_router_sources(block_states, current_block_idx, partial_block)
-        routed_attn, attn_weights = self.attn_router(attn_sources, return_weights=True)
+        routed_attn, attn_weights = self.attn_router(attn_sources, return_weights=return_routing_weights)
         updated_partial, past_key_values = self.forward_attention(
             routed_attn,
             attention_mask=attention_mask,
@@ -199,7 +200,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         partial_block = blend_states(partial_block, updated_partial, active_mask)
 
         mlp_sources, mlp_source_ids = make_router_sources(block_states, current_block_idx, partial_block)
-        routed_mlp, mlp_weights = self.mlp_router(mlp_sources, return_weights=True)
+        routed_mlp, mlp_weights = self.mlp_router(mlp_sources, return_weights=return_routing_weights)
         updated_partial = self.forward_mlp(routed_mlp, **kwargs)
         partial_block = blend_states(partial_block, updated_partial, active_mask)
 
@@ -476,6 +477,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
 
+        collect_routing_info = return_routing_info
         all_hidden_states = () if output_hidden_states else None
         next_cache = past_key_values
         keep_mask = self._resolve_keep_mask(enable_skipping, skip_keep_mask)
@@ -505,30 +507,32 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 active_mask = halt_cumulative < self.config.halt_threshold
                 executed_fraction = float(active_mask.float().mean().item())
                 if not torch.any(active_mask):
-                    execution_trace.append(
-                        {
-                            "position": position,
-                            "block_idx": block_idx,
-                            "status": "halted",
-                            "executed_fraction": 0.0,
-                            "halt_probability": 0.0,
-                        }
-                    )
+                    if collect_routing_info:
+                        execution_trace.append(
+                            {
+                                "position": position,
+                                "block_idx": block_idx,
+                                "status": "halted",
+                                "executed_fraction": 0.0,
+                                "halt_probability": 0.0,
+                            }
+                        )
                     continue
             else:
                 executed_fraction = 1.0
 
             should_execute = True if keep_mask is None else keep_mask[position]
             if not should_execute:
-                execution_trace.append(
-                    {
-                        "position": position,
-                        "block_idx": block_idx,
-                        "status": "skipped",
-                        "executed_fraction": 0.0,
-                        "halt_probability": 0.0,
-                    }
-                )
+                if collect_routing_info:
+                    execution_trace.append(
+                        {
+                            "position": position,
+                            "block_idx": block_idx,
+                            "status": "skipped",
+                            "executed_fraction": 0.0,
+                            "halt_probability": 0.0,
+                        }
+                    )
                 continue
 
             partial_block = hidden_states
@@ -542,10 +546,12 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                     past_key_values=next_cache,
                     use_cache=use_cache,
                     active_mask=active_mask,
+                    return_routing_weights=collect_routing_info,
                     **kwargs,
                 )
-                self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
-                self._record_routing(routing_events, position, "mlp", mlp_source_ids, mlp_weights)
+                if collect_routing_info:
+                    self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
+                    self._record_routing(routing_events, position, "mlp", mlp_source_ids, mlp_weights)
 
             hidden_states = partial_block
             block_states[position + 1] = hidden_states
@@ -563,27 +569,30 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 halt_probabilities.append(halt_probability_mean)
                 ponder_cost += executed_fraction
 
-            execution_trace.append(
-                {
-                    "position": position,
-                    "block_idx": block_idx,
-                    "status": "executed",
-                    "executed_fraction": executed_fraction,
-                    "halt_probability": halt_probability_mean,
-                }
-            )
+            if collect_routing_info:
+                execution_trace.append(
+                    {
+                        "position": position,
+                        "block_idx": block_idx,
+                        "status": "executed",
+                        "executed_fraction": executed_fraction,
+                        "halt_probability": halt_probability_mean,
+                    }
+                )
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        routing_info = self._build_routing_info(
-            routing_events=routing_events,
-            execution_trace=execution_trace,
-            keep_mask=keep_mask,
-            halt_probabilities=halt_probabilities,
-            ponder_cost=ponder_cost,
-        )
+        routing_info = None
+        if collect_routing_info:
+            routing_info = self._build_routing_info(
+                routing_events=routing_events,
+                execution_trace=execution_trace,
+                keep_mask=keep_mask,
+                halt_probabilities=halt_probabilities,
+                ponder_cost=ponder_cost,
+            )
         self._last_routing_info = routing_info
 
         if not return_dict:
