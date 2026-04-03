@@ -264,6 +264,21 @@ def iter_execution_blocks(model: nn.Module):
         yield blocks, layer_id, block
 
 
+def iter_fsdp_blocks(model: nn.Module):
+    real_model = get_model(model)
+    model_type = getattr(getattr(real_model, "config", None), "model_type", None)
+    blocks = get_blocks(model)
+    if blocks is None:
+        return
+
+    if model_type == "reskip_transformer":
+        for block_id, block in blocks.named_children():
+            yield blocks, block_id, block
+        return
+
+    yield from iter_execution_blocks(model)
+
+
 def apply_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
@@ -396,7 +411,7 @@ def apply_compile(model: nn.Module):
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
 
-    execution_blocks = list(iter_execution_blocks(model))
+    execution_blocks = list(iter_fsdp_blocks(model))
     if not execution_blocks:
         logger.warning("No block found for torch.compile")
     else:
@@ -459,7 +474,7 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    execution_blocks = list(iter_execution_blocks(model))
+    execution_blocks = list(iter_fsdp_blocks(model))
     if not execution_blocks:
         logger.warning("No block found for FSDP")
     else:
