@@ -1,26 +1,5 @@
 # Flame/FLA LM Playbook
 
-## Review Findings
-
-Current prototype LM code is directionally aligned with the paper, but several core pieces are not faithful enough for the main pretraining line:
-
-1. `src/attn_residual.py`
-   `BlockAttnRes` uses a value projection plus an extra normalization on the routed mixture. The paper definition is `x_l = Σ α_{i→l} h_i` with projected keys, not projected values plus post-mix norm.
-
-2. `src/adaptive_transformer.py`
-   The skip decision is currently `weights[:, :, -1].mean()` computed before executing the current block. That is neither the paper’s downstream importance
-   `I(n) = max_{l>n} α_{n→l}`
-   nor the practical proxy described in the draft.
-
-3. `src/attn_residual.py` + `src/adaptive_transformer.py`
-   `OnlineSoftmaxMerge` exists, but the main LM forward path does not actually use it. So the prototype does not yet realize the paper’s online-merge skip path.
-
-4. `src/looping_transformer.py`
-   The loop implementation is centered on ACT halting and ponder cost. The paper’s ReLoop claim is different: position-specific AttnRes pseudo-queries let shared blocks play different roles across depth positions. ACT can be an add-on, but it should not be the defining mechanism.
-
-5. `experiments/train_lm.py`
-   This is still the prototype training line. It is not the flame/FLA pretraining path needed for the 340M experiments.
-
 ## New Implementation
 
 The new LM implementation now lives in FLA itself:
@@ -33,9 +12,9 @@ This keeps the architecture change inside FLA’s transformer family, while flam
 
 Implemented behavior:
 
-- AttnRes is injected at the block level on top of FLA transformer blocks.
-- Skip inference uses a calibrated block keep-mask, which matches the paper draft’s practical path better than the old online heuristic.
-- Looping uses shared block groups plus depth-position-specific AttnRes routers.
+- Block AttnRes now follows the draft and AttnRes README design more closely: routing is over `completed blocks + partial block`, and it is applied before both attention and MLP inside each logical layer.
+- ReSkip uses the draft’s block importance definition `I(n) = max_{l>n} α_{n→l)` aggregated from downstream block-routing events, while deployment/eval still uses the calibration-based keep-mask path.
+- ReLoop now uses shared block groups, depth-position-specific AttnRes routers, and ACT-style halting with optional ponder-cost regularization.
 - Skip-ready checkpoints can be exported after routing analysis and then used directly for generation or `lm_eval`.
 
 ## Training
@@ -161,6 +140,7 @@ python experiments/flame_lm_eval.py \
 ## Notes
 
 - `reskip_transformer_340M.json` is the main pretraining config.
-- `reloop_transformer_340M.json` is the weight-shared loop variant for the loop ablation line.
+- `reloop_transformer_340M.json` is the weight-shared loop variant for the loop ablation line and enables ACT halting.
 - In looping mode, KV cache is disabled intentionally because shared blocks reuse logical layer positions.
-- The skip path used for deployment/eval is calibrated keep-mask skipping, not the incorrect local heuristic from the prototype.
+- The skip path used for deployment/eval is calibrated keep-mask skipping, which matches the draft’s practical implementation section.
+- `ponder_loss_weight` controls the ACT depth penalty in looping mode.

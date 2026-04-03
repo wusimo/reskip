@@ -42,6 +42,8 @@ class ReSkipTransformerConfig(PretrainedConfig):
         max_loops: int = 1,
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
+        halt_threshold: float = 0.99,
+        ponder_loss_weight: float = 0.0,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -73,6 +75,8 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.max_loops = max_loops
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
+        self.halt_threshold = halt_threshold
+        self.ponder_loss_weight = ponder_loss_weight
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
@@ -92,6 +96,10 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 raise ValueError("`num_recurrent_blocks` is required when `enable_looping=True`.")
             if num_recurrent_blocks <= 0 or max_loops <= 0:
                 raise ValueError("`num_recurrent_blocks` and `max_loops` must be positive.")
+            if not 0.0 < halt_threshold <= 1.0:
+                raise ValueError("`halt_threshold` must be in (0, 1].")
+            if ponder_loss_weight < 0:
+                raise ValueError("`ponder_loss_weight` must be non-negative.")
             if attn_res_num_blocks != num_recurrent_blocks * max_loops:
                 raise ValueError(
                     "`attn_res_num_blocks` must equal `num_recurrent_blocks * max_loops` in looping mode."

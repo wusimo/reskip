@@ -40,12 +40,15 @@ class ReSkipCausalLMOutputWithPast(CausalLMOutputWithPast):
     routing_info: dict[str, Any] | None = None
 
 
-class DepthAttentionResidual(nn.Module):
+class BlockAttentionResidual(nn.Module):
+    """Block AttnRes over completed blocks plus the current partial block."""
+
     def __init__(self, config: ReSkipTransformerConfig):
         super().__init__()
         self.temperature = config.attn_res_temperature
         self.w_query = nn.Parameter(torch.empty(config.hidden_size))
         self.key_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.key_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
     def reset_parameters(self, initializer_range: float) -> None:
         nn.init.normal_(self.w_query, mean=0.0, std=initializer_range)
@@ -56,15 +59,16 @@ class DepthAttentionResidual(nn.Module):
         source_states: list[torch.Tensor],
         return_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if len(source_states) == 0:
-            raise ValueError("DepthAttentionResidual needs at least one source state.")
+        if not source_states:
+            raise ValueError("BlockAttentionResidual requires at least one source state.")
+
         if len(source_states) == 1:
             routed = source_states[0]
             weights = routed.new_ones(routed.shape[0], routed.shape[1], 1)
             return routed, weights if return_weights else None
 
         sources = torch.stack(source_states, dim=2)
-        keys = self.key_proj(sources)
+        keys = self.key_norm(self.key_proj(sources))
         scores = torch.einsum("d,btnd->btn", self.w_query, keys)
         scores = scores / (math.sqrt(sources.shape[-1]) * self.temperature)
         weights = torch.softmax(scores, dim=-1)
@@ -72,15 +76,13 @@ class DepthAttentionResidual(nn.Module):
         return routed, weights if return_weights else None
 
 
-class ReSkipTransformerBlock(GradientCheckpointingLayer):
+class ReSkipTransformerLayer(nn.Module):
+    """Standard transformer layer split into attention and MLP phases."""
+
     def __init__(self, config: ReSkipTransformerConfig, layer_idx: int):
         super().__init__()
-        self.config = config
         self.layer_idx = layer_idx
-        self.attn_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
-            config.hidden_size,
-            eps=config.norm_eps,
-        )
+        self.attn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.attn = Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
@@ -92,10 +94,7 @@ class ReSkipTransformerBlock(GradientCheckpointingLayer):
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
         )
-        self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
-            config.hidden_size,
-            eps=config.norm_eps,
-        )
+        self.mlp_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.mlp = TransformerMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
@@ -104,40 +103,35 @@ class ReSkipTransformerBlock(GradientCheckpointingLayer):
             fuse_swiglu=config.fuse_swiglu,
         )
 
-    def forward(
+    def forward_attention(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
-        output_attentions: bool | None = False,
         use_cache: bool | None = False,
         **kwargs: Unpack[Any],
-    ) -> tuple[torch.FloatTensor, torch.Tensor | None, Cache | None]:
+    ) -> tuple[torch.Tensor, Cache | None]:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
-        hidden_states, attentions, past_key_values = self.attn(
+        hidden_states, _, past_key_values = self.attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            output_attentions=output_attentions,
+            output_attentions=False,
             **kwargs,
         )
-        if self.config.fuse_norm:
-            hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
-        else:
-            hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = self.mlp_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states, **kwargs)
-        hidden_states = residual + hidden_states
+        return residual + hidden_states, past_key_values
 
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (attentions,)
-        if use_cache:
-            outputs += (past_key_values,)
-        return outputs
+    def forward_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        **kwargs: Unpack[Any],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.mlp_norm(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
+        return residual + hidden_states
 
 
 class ReSkipBlockGroup(nn.Module):
@@ -151,49 +145,15 @@ class ReSkipBlockGroup(nn.Module):
         super().__init__()
         self.block_idx = block_idx
         self.layers = nn.ModuleList(
-            [
-                ReSkipTransformerBlock(config, first_layer_idx + offset)
-                for offset in range(layers_per_block)
-            ]
+            [ReSkipTransformerLayer(config, first_layer_idx + offset) for offset in range(layers_per_block)]
         )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        past_key_values: Cache | None = None,
-        output_attentions: bool | None = False,
-        use_cache: bool | None = False,
-        **kwargs: Unpack[Any],
-    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
-        attentions = None
-        for layer in self.layers:
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                **kwargs,
-            )
-            hidden_states = layer_outputs[0]
-            if output_attentions:
-                attentions = layer_outputs[1]
-            if use_cache:
-                past_key_values = layer_outputs[2 if output_attentions else 1]
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (attentions,)
-        if use_cache:
-            outputs += (past_key_values,)
-        return outputs
 
 
 class ReSkipTransformerPreTrainedModel(PreTrainedModel):
     config_class = ReSkipTransformerConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["ReSkipBlockGroup", "ReSkipTransformerBlock"]
+    _no_split_modules = ["ReSkipBlockGroup", "ReSkipTransformerLayer"]
     _supports_cache_class = True
 
     def _init_weights(
@@ -208,7 +168,7 @@ class ReSkipTransformerPreTrainedModel(PreTrainedModel):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-        elif isinstance(module, DepthAttentionResidual):
+        elif isinstance(module, BlockAttentionResidual):
             module.reset_parameters(self.config.initializer_range)
         elif hasattr(module, "reset_parameters"):
             module.reset_parameters()
@@ -249,13 +209,15 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 for block_idx in range(self.num_unique_blocks)
             ]
         )
-        self.depth_routers = nn.ModuleList(
-            [DepthAttentionResidual(config) for _ in range(self.num_block_positions)]
+        self.attn_routers = nn.ModuleList(
+            [BlockAttentionResidual(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(
-            config.hidden_size,
-            eps=config.norm_eps,
+        self.mlp_routers = nn.ModuleList(
+            [BlockAttentionResidual(config) for _ in range(config.num_hidden_layers)]
         )
+        self.halt_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.halt_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.gradient_checkpointing = False
         self._skip_keep_mask = self._normalize_keep_mask(config.skip_keep_mask)
         self._last_routing_info: dict[str, Any] | None = None
@@ -265,10 +227,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
     def _build_block_schedule(self) -> list[int]:
         if not self.config.enable_looping:
             return list(range(self.config.attn_res_num_blocks))
-        return [
-            position % self.config.num_recurrent_blocks
-            for position in range(self.config.attn_res_num_blocks)
-        ]
+        return [position % self.config.num_recurrent_blocks for position in range(self.config.attn_res_num_blocks)]
 
     def _normalize_keep_mask(
         self,
@@ -320,45 +279,115 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             keep_mask[-1] = True
         return keep_mask
 
-    def _compute_importance_matrix(
+    def _pool_hidden(
         self,
-        routing_weights: list[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        device = routing_weights[0].device if routing_weights else self.embeddings.weight.device
+        if attention_mask is None:
+            return hidden_states.mean(dim=1)
+        mask = attention_mask.to(hidden_states.dtype).unsqueeze(-1)
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return (hidden_states * mask).sum(dim=1) / denom
+
+    @staticmethod
+    def _blend_states(
+        old_states: torch.Tensor,
+        new_states: torch.Tensor,
+        active_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if active_mask is None:
+            return new_states
+        mask = active_mask[:, None, None].to(dtype=new_states.dtype)
+        return new_states * mask + old_states * (1.0 - mask)
+
+    def _make_router_sources(
+        self,
+        block_states: list[torch.Tensor | None],
+        current_block_idx: int,
+        partial_block: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[int]]:
+        source_states = [block_states[0]]
+        source_ids = [-1]
+        for block_idx in range(current_block_idx):
+            state = block_states[block_idx + 1]
+            if state is not None:
+                source_states.append(state)
+                source_ids.append(block_idx)
+        source_states.append(partial_block)
+        source_ids.append(current_block_idx)
+        return source_states, source_ids
+
+    def _record_routing(
+        self,
+        storage: list[dict[str, Any]],
+        block_idx: int,
+        site: str,
+        source_ids: list[int],
+        weights: torch.Tensor,
+    ) -> None:
+        storage.append(
+            {
+                "target_block": block_idx,
+                "site": site,
+                "source_ids": list(source_ids),
+                "weights": weights.detach(),
+            }
+        )
+
+    def _aggregate_routing(
+        self,
+        routing_events: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, list[float], list[float]]:
+        device = self.embeddings.weight.device
         matrix = torch.zeros(
             self.num_block_positions,
             self.num_block_positions,
             device=device,
             dtype=torch.float32,
         )
-        for target_pos, weights in enumerate(routing_weights):
-            avg_weights = weights.mean(dim=(0, 1)).float()
-            for source_pos in range(target_pos):
-                source_index = source_pos + 1
-                if source_index < avg_weights.shape[0]:
-                    matrix[source_pos, target_pos] = avg_weights[source_index]
-        return matrix
+        self_importance = torch.zeros(self.num_block_positions, device=device, dtype=torch.float32)
+
+        for event in routing_events:
+            avg_weights = event["weights"].mean(dim=(0, 1)).float()
+            target_block = int(event["target_block"])
+            for source_weight, source_id in zip(avg_weights, event["source_ids"], strict=True):
+                if source_id < 0:
+                    continue
+                if source_id == target_block:
+                    self_importance[target_block] = torch.maximum(self_importance[target_block], source_weight)
+                elif source_id < target_block:
+                    matrix[source_id, target_block] = torch.maximum(matrix[source_id, target_block], source_weight)
+
+        block_importance = []
+        for block_idx in range(self.num_block_positions):
+            downstream = matrix[block_idx, block_idx + 1 :]
+            block_importance.append(float(downstream.max().item()) if downstream.numel() > 0 else 1.0)
+
+        return matrix, block_importance, self_importance.tolist()
 
     def _build_routing_info(
         self,
-        routing_weights: list[torch.Tensor],
-        blocks_executed: list[tuple[int, int, int]],
+        routing_events: list[dict[str, Any]],
+        execution_trace: list[dict[str, Any]],
         keep_mask: list[bool] | None,
+        halt_probabilities: list[float] | None,
+        ponder_cost: float,
     ) -> dict[str, Any]:
-        importance_matrix = self._compute_importance_matrix(routing_weights)
-        block_importance = []
-        for block_pos in range(self.num_block_positions):
-            downstream = importance_matrix[block_pos, block_pos + 1 :]
-            block_importance.append(float(downstream.max().item()) if downstream.numel() > 0 else 1.0)
+        importance_matrix, block_importance, self_importance = self._aggregate_routing(routing_events)
+        num_blocks_executed = sum(entry["executed_fraction"] for entry in execution_trace)
         return {
-            "routing_weights": routing_weights,
             "importance_matrix": importance_matrix,
             "block_importance": block_importance,
+            "self_importance": self_importance,
             "block_schedule": list(self.block_schedule),
             "keep_mask": keep_mask if keep_mask is not None else [True] * self.num_block_positions,
-            "blocks_executed": blocks_executed,
-            "num_blocks_executed": sum(1 for _, _, status in blocks_executed if status >= 0),
-            "effective_depth": sum(1 for _, _, status in blocks_executed if status >= 0),
+            "blocks_executed": execution_trace,
+            "execution_trace": execution_trace,
+            "num_blocks_executed": float(num_blocks_executed),
+            "effective_depth": float(num_blocks_executed),
+            "halt_probabilities": halt_probabilities,
+            "ponder_cost": float(ponder_cost),
         }
 
     def get_input_embeddings(self):
@@ -410,11 +439,19 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             inputs_embeds = self.embeddings(input_ids)
 
         all_hidden_states = () if output_hidden_states else None
-        next_cache = None
+        next_cache = past_key_values
         keep_mask = self._resolve_keep_mask(enable_skipping, skip_keep_mask)
-        adapted_outputs = [inputs_embeds]
-        routing_weights: list[torch.Tensor] = []
-        blocks_executed: list[tuple[int, int, int]] = []
+        routing_events: list[dict[str, Any]] = []
+        execution_trace: list[dict[str, Any]] = []
+
+        block_states: list[torch.Tensor | None] = [None] * (self.num_block_positions + 1)
+        block_states[0] = inputs_embeds
+        hidden_states = inputs_embeds
+
+        batch_size = hidden_states.shape[0]
+        halt_cumulative = hidden_states.new_zeros(batch_size)
+        halt_probabilities: list[float] | None = [] if self.config.enable_looping else None
+        ponder_cost = 0.0
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
@@ -422,44 +459,100 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
 
         for position, block_idx in enumerate(self.block_schedule):
             if output_hidden_states:
-                all_hidden_states += (adapted_outputs[-1],)
+                all_hidden_states += (hidden_states,)
 
-            routed_input, weights = self.depth_routers[position](adapted_outputs, return_weights=True)
-            routing_weights.append(weights)
-            should_execute = True if keep_mask is None else keep_mask[position]
-
-            if should_execute:
-                if self.gradient_checkpointing and self.training:
-                    block_outputs = self._gradient_checkpointing_func(
-                        self.layers[block_idx].__call__,
-                        routed_input,
-                        attention_mask,
-                        past_key_values,
-                        False,
-                        use_cache,
-                        **kwargs,
+            active_mask = None
+            executed_fraction = 0.0
+            if self.config.enable_looping:
+                active_mask = halt_cumulative < self.config.halt_threshold
+                executed_fraction = float(active_mask.float().mean().item())
+                if not torch.any(active_mask):
+                    execution_trace.append(
+                        {
+                            "position": position,
+                            "block_idx": block_idx,
+                            "status": "halted",
+                            "executed_fraction": 0.0,
+                            "halt_probability": 0.0,
+                        }
                     )
-                else:
-                    block_outputs = self.layers[block_idx](
-                        routed_input,
-                        attention_mask=attention_mask,
-                        past_key_values=past_key_values,
-                        output_attentions=False,
-                        use_cache=use_cache,
-                        **kwargs,
-                    )
-                adapted_outputs.append(block_outputs[0])
-                blocks_executed.append((position, block_idx, 0))
-                if use_cache:
-                    next_cache = block_outputs[1]
+                    continue
             else:
-                blocks_executed.append((position, block_idx, -1))
+                executed_fraction = 1.0
 
-        hidden_states = self.norm(adapted_outputs[-1])
+            should_execute = True if keep_mask is None else keep_mask[position]
+            if not should_execute:
+                execution_trace.append(
+                    {
+                        "position": position,
+                        "block_idx": block_idx,
+                        "status": "skipped",
+                        "executed_fraction": 0.0,
+                        "halt_probability": 0.0,
+                    }
+                )
+                continue
+
+            partial_block = hidden_states
+            current_block = self.layers[block_idx]
+            for layer_offset, layer in enumerate(current_block.layers):
+                logical_layer_idx = position * self.layers_per_block + layer_offset
+
+                attn_sources, attn_source_ids = self._make_router_sources(block_states, position, partial_block)
+                routed_attn, attn_weights = self.attn_routers[logical_layer_idx](attn_sources, return_weights=True)
+                self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
+                updated_partial, next_cache = layer.forward_attention(
+                    routed_attn,
+                    attention_mask=attention_mask,
+                    past_key_values=next_cache,
+                    use_cache=use_cache,
+                    **kwargs,
+                )
+                partial_block = self._blend_states(partial_block, updated_partial, active_mask)
+
+                mlp_sources, mlp_source_ids = self._make_router_sources(block_states, position, partial_block)
+                routed_mlp, mlp_weights = self.mlp_routers[logical_layer_idx](mlp_sources, return_weights=True)
+                self._record_routing(routing_events, position, "mlp", mlp_source_ids, mlp_weights)
+                updated_partial = layer.forward_mlp(routed_mlp, **kwargs)
+                partial_block = self._blend_states(partial_block, updated_partial, active_mask)
+
+            hidden_states = partial_block
+            block_states[position + 1] = hidden_states
+
+            halt_probability_mean = 0.0
+            if self.config.enable_looping:
+                pooled = self._pool_hidden(self.halt_norm(hidden_states), attention_mask)
+                block_halt = torch.sigmoid(self.halt_head(pooled)).squeeze(-1)
+                if active_mask is not None:
+                    block_halt = block_halt * active_mask.to(block_halt.dtype)
+                    halt_cumulative = torch.clamp(halt_cumulative + block_halt, max=1.0)
+                else:
+                    halt_cumulative = torch.clamp(halt_cumulative + block_halt, max=1.0)
+                halt_probability_mean = float(block_halt.mean().item())
+                halt_probabilities.append(halt_probability_mean)
+                ponder_cost += executed_fraction
+
+            execution_trace.append(
+                {
+                    "position": position,
+                    "block_idx": block_idx,
+                    "status": "executed",
+                    "executed_fraction": executed_fraction,
+                    "halt_probability": halt_probability_mean,
+                }
+            )
+
+        hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        routing_info = self._build_routing_info(routing_weights, blocks_executed, keep_mask)
+        routing_info = self._build_routing_info(
+            routing_events=routing_events,
+            execution_trace=execution_trace,
+            keep_mask=keep_mask,
+            halt_probabilities=halt_probabilities,
+            ponder_cost=ponder_cost,
+        )
         self._last_routing_info = routing_info
 
         if not return_dict:
@@ -572,6 +665,9 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        need_routing_info = return_routing_info or (
+            labels is not None and self.config.enable_looping and self.config.ponder_loss_weight > 0
+        )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -582,14 +678,18 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            return_routing_info=return_routing_info,
+            return_routing_info=need_routing_info,
             enable_skipping=enable_skipping,
             skip_keep_mask=skip_keep_mask,
             **kwargs,
         )
 
         hidden_states = outputs[0]
-        logits = None if self.config.fuse_linear_cross_entropy else self.lm_head(hidden_states[:, -logits_to_keep:])
+        if self.config.fuse_linear_cross_entropy:
+            logits = None
+        else:
+            logits_input = hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:]
+            logits = self.lm_head(logits_input)
 
         loss = None
         if labels is not None:
@@ -612,6 +712,10 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
+
+            routing_info = getattr(outputs, "routing_info", None)
+            if routing_info is not None and self.config.enable_looping and self.config.ponder_loss_weight > 0:
+                loss = loss + self.config.ponder_loss_weight * hidden_states.new_tensor(routing_info["ponder_cost"])
 
         if not return_dict:
             output = (logits,) + outputs[1:]

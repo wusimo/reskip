@@ -19,7 +19,6 @@ for path in (FLAME_ROOT, FLA_ROOT):
         sys.path.insert(0, path_str)
 
 import fla  # noqa: E402,F401
-import custom_models  # noqa: E402,F401
 from flame.data import build_dataloader, build_dataset  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 

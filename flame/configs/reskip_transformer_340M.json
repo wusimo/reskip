@@ -21,5 +21,7 @@
   "num_recurrent_blocks": 8,
   "max_loops": 1,
   "enable_skip_inference": false,
-  "skip_keep_mask": null
+  "skip_keep_mask": null,
+  "halt_threshold": 0.99,
+  "ponder_loss_weight": 0.0
 }
