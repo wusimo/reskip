@@ -70,11 +70,12 @@ class BlockAttentionResidual(nn.Module):
             return routed, weights if return_weights else None
 
         sources = torch.stack(source_states, dim=2)
+        source_dtype = sources.dtype
         keys = self.key_norm(self.key_proj(sources))
         scores = torch.einsum("d,btnd->btn", self.w_query, keys)
         scores = scores / (math.sqrt(sources.shape[-1]) * self.temperature)
-        weights = torch.softmax(scores, dim=-1)
-        routed = torch.sum(weights.unsqueeze(-1) * sources, dim=2)
+        weights = torch.softmax(scores.float(), dim=-1).to(source_dtype)
+        routed = torch.sum(weights.unsqueeze(-1) * sources, dim=2).contiguous()
         return routed, weights if return_weights else None
 
 
