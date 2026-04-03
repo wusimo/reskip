@@ -738,6 +738,7 @@ def build_dataloader(
     varlen: bool = False,
     num_workers: int = 0,
     pin_memory: bool = False,
+    prefetch_factor: int = 2,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
 ):
@@ -751,6 +752,7 @@ def build_dataloader(
         collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, context_len=context_len, varlen=varlen),
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         snapshot_every_n_steps=snapshot_every_n_steps,
     )

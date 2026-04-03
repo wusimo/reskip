@@ -166,6 +166,9 @@ def main(job_config: JobConfig):
     )
 
     logger.info("Building dataloader...")
+    pin_memory = getattr(job_config.training, "pin_memory", False)
+    persistent_workers = getattr(job_config.training, "persistent_workers", False)
+    prefetch_factor = getattr(job_config.training, "prefetch_factor", 2)
     dataloader = build_dataloader(
         dataset=dataset,
         tokenizer=tokenizer,
@@ -176,8 +179,9 @@ def main(job_config: JobConfig):
         context_len=job_config.training.context_len,
         varlen=job_config.training.varlen,
         num_workers=job_config.training.num_workers,
-        pin_memory=job_config.training.pin_memory,
-        persistent_workers=job_config.training.persistent_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
     )
 

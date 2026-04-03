@@ -345,6 +345,16 @@ class JobConfig:
             help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
         )
         self.parser.add_argument(
+            "--training.pin_memory",
+            action="store_true",
+            help="Enable pinned host memory for the dataloader.",
+        )
+        self.parser.add_argument(
+            "--training.persistent_workers",
+            action="store_true",
+            help="Keep dataloader workers alive across iterations.",
+        )
+        self.parser.add_argument(
             "--training.prefetch_factor",
             type=int,
             default=2,
