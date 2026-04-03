@@ -124,7 +124,7 @@ torchrun --nnodes=${NNODE} \
   --local-ranks-filter ${LOG_RANK} \
   --role rank \
   --tee 3 \
-  --log-dir "$path"/logs \
+  --log-dir logs \
   -m flame.train \
   $params
 
