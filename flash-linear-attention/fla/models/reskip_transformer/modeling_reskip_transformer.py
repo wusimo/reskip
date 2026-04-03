@@ -48,7 +48,9 @@ class BlockAttentionResidual(nn.Module):
         self.temperature = config.attn_res_temperature
         self.w_query = nn.Parameter(torch.empty(config.hidden_size))
         self.key_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.key_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        # The fused Triton RMSNorm in FLA is exercised on [B, T, D] tensors in the base
+        # transformer. AttnRes keys are [B, T, N, D], so use the safe PyTorch variant here.
+        self.key_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
 
     def reset_parameters(self, initializer_range: float) -> None:
         nn.init.normal_(self.w_query, mean=0.0, std=initializer_range)
@@ -82,7 +84,8 @@ class ReSkipTransformerLayer(nn.Module):
     def __init__(self, config: ReSkipTransformerConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.attn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        norm_cls = RMSNorm if config.fuse_norm else nn.RMSNorm
+        self.attn_norm = norm_cls(config.hidden_size, eps=config.norm_eps)
         self.attn = Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_heads,
@@ -94,7 +97,7 @@ class ReSkipTransformerLayer(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             layer_idx=layer_idx,
         )
-        self.mlp_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.mlp_norm = norm_cls(config.hidden_size, eps=config.norm_eps)
         self.mlp = TransformerMLP(
             hidden_size=config.hidden_size,
             hidden_ratio=config.hidden_ratio,
@@ -215,9 +218,10 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         self.mlp_routers = nn.ModuleList(
             [BlockAttentionResidual(config) for _ in range(config.num_hidden_layers)]
         )
-        self.halt_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        norm_cls = RMSNorm if config.fuse_norm else nn.RMSNorm
+        self.halt_norm = norm_cls(config.hidden_size, eps=config.norm_eps)
         self.halt_head = nn.Linear(config.hidden_size, 1, bias=True)
-        self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = norm_cls(config.hidden_size, eps=config.norm_eps)
         self.gradient_checkpointing = False
         self._skip_keep_mask = self._normalize_keep_mask(config.skip_keep_mask)
         self._last_routing_info: dict[str, Any] | None = None
