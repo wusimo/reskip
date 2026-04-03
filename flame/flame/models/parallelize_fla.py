@@ -393,7 +393,7 @@ def _apply_ac_to_block(module: nn.Module, ac_config):
 
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
-    execution_blocks = list(iter_execution_blocks(model))
+    execution_blocks = list(iter_fsdp_blocks(model))
     if not execution_blocks:
         logger.warning("No block found for activation checkpointing")
         return
@@ -437,9 +437,6 @@ def apply_compile(model: nn.Module):
     if lm_head_key is not None:
         lm_head = torch.compile(getattr(model, lm_head_key), fullgraph=True)
         model.register_module(lm_head_key, lm_head)
-
-    logger.info("Compiling the entire model with torch.compile")
-    model = torch.compile(model)
 
 
 def apply_fsdp(

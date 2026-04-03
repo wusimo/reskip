@@ -12,7 +12,8 @@ This keeps the architecture change inside FLA’s transformer family, while flam
 
 Implemented behavior:
 
-- Block AttnRes now follows the draft and AttnRes README design more closely: routing is over `completed blocks + partial block`, and it is applied before both attention and MLP inside each logical layer.
+- Block AttnRes now follows the paper implementation more closely: routing uses the paper's learned pseudo-query plus RMS-normalized block states, without the extra router-side `key_proj` that the paper does not use.
+- ReSkip now uses the paper's two-phase block execution path during training: completed-block routing for all sites in a block is batched first, then each site merges that result with the current `partial_block` online.
 - ReSkip uses the draft’s block importance definition `I(n) = max_{l>n} α_{n→l)` aggregated from downstream block-routing events, while deployment/eval still uses the calibration-based keep-mask path.
 - ReLoop now uses shared block groups, depth-position-specific AttnRes routers, and ACT-style halting with optional ponder-cost regularization.
 - Skip-ready checkpoints can be exported after routing analysis and then used directly for generation or `lm_eval`.
@@ -139,8 +140,9 @@ python experiments/flame_lm_eval.py \
 
 ## Notes
 
-- `reskip_transformer_340M.json` is the main pretraining config.
+- `reskip_transformer_340M.json` is the main pretraining config. The filename is kept for continuity with earlier experiments, but after removing the non-paper router projection the exact parameter count is lower than the historical name suggests; use the training log as the source of truth.
 - `reloop_transformer_340M.json` is the weight-shared loop variant for the loop ablation line and enables ACT halting.
 - In looping mode, KV cache is disabled intentionally because shared blocks reuse logical layer positions.
+- Activation checkpointing, per-block compile, and FSDP for `reskip_transformer` now follow the block-group boundary, because the two-phase AttnRes work is executed at the block level rather than at individual layer-call boundaries.
 - The skip path used for deployment/eval is calibrated keep-mask skipping, which matches the draft’s practical implementation section.
 - `ponder_loss_weight` controls the ACT depth penalty in looping mode.

@@ -243,6 +243,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
 
     def forward(
         self,
+        block_input: torch.Tensor,
         partial_block: torch.Tensor | None,
         attn_phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
         mlp_phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
@@ -274,7 +275,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         old_partial = partial_block
         partial_block = attn_out if partial_block is None else partial_block + attn_out
         partial_block = blend_states(
-            torch.zeros_like(partial_block) if old_partial is None else old_partial,
+            block_input if old_partial is None else old_partial,
             partial_block,
             active_mask,
         )
@@ -323,6 +324,10 @@ class ReSkipBlockGroup(nn.Module):
         list[tuple[list[int], torch.Tensor | None]],
         list[tuple[list[int], torch.Tensor | None]],
     ]:
+        block_input = block_states[current_block_idx]
+        if block_input is None:
+            raise RuntimeError("Expected the current block input to be available in block_states.")
+
         completed_blocks, completed_source_ids = collect_completed_blocks(block_states, current_block_idx)
         routers = []
         for layer in self.layers:
@@ -343,6 +348,7 @@ class ReSkipBlockGroup(nn.Module):
             mlp_phase1 = phase1_outputs[2 * layer_idx + 1]
             attn_source_ids = list(completed_source_ids) if partial_block is None else [*completed_source_ids, current_block_idx]
             partial_block, next_cache, attn_weights, mlp_weights = layer(
+                block_input=block_input,
                 partial_block=partial_block,
                 attn_phase1=attn_phase1,
                 mlp_phase1=mlp_phase1,
