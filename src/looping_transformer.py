@@ -67,7 +67,7 @@ class LoopingTransformerWithAttnRes(nn.Module):
 
         # Token + position embeddings
         self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_emb = nn.Embedding(config.max_seq_len, config.d_model)
+        self.pos_emb = None if config.use_rope else nn.Embedding(config.max_seq_len, config.d_model)
         self.emb_dropout = nn.Dropout(config.dropout)
 
         # K unique blocks
@@ -140,10 +140,11 @@ class LoopingTransformerWithAttnRes(nn.Module):
         device = input_ids.device
 
         # Embeddings
-        positions = torch.arange(S, device=device).unsqueeze(0)
-        x = self.emb_dropout(
-            self.token_emb(input_ids) + self.pos_emb(positions)
-        )
+        if self.pos_emb is not None:
+            positions = torch.arange(S, device=device).unsqueeze(0)
+            x = self.emb_dropout(self.token_emb(input_ids) + self.pos_emb(positions))
+        else:
+            x = self.emb_dropout(self.token_emb(input_ids))
 
         # Causal mask
         if mask is None:

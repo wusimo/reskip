@@ -3,15 +3,20 @@ Data pipelines for training and evaluation.
 
 Supports:
 1. Structured synthetic data (for fast prototyping and unit tests)
-2. HuggingFace datasets (WikiText, C4 subset, SlimPajama)
-3. Synthetic VLA data with learnable structure
+2. HuggingFace datasets (WikiText)
+3. Local text/JSONL corpora streamed from disk for large-scale LM training
+4. Synthetic VLA data with learnable structure
 """
 
+import gzip
+import json
 import math
-from typing import Optional
+import os
+from typing import Iterable, Optional
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+from torch.utils.data.distributed import DistributedSampler
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +185,175 @@ class HuggingFaceLMDataset(Dataset):
         return {"input_ids": tokens, "labels": tokens}
 
 
+def _load_tiktoken_tokenizer(tokenizer_name: str):
+    import tiktoken
+
+    aliases = {
+        "gpt-neox": "gpt2",
+        "gpt_neox": "gpt2",
+        "gpt-neox-20b": "gpt2",
+    }
+    resolved_name = aliases.get(tokenizer_name, tokenizer_name)
+
+    try:
+        enc = tiktoken.get_encoding(resolved_name)
+    except KeyError:
+        enc = tiktoken.encoding_for_model(resolved_name)
+    return enc
+
+
+class LocalTextLMDataset(IterableDataset):
+    """
+    Stream text from local `.txt`, `.jsonl`, `.json`, `.parquet`, and `.gz` files.
+
+    Each yielded example is a fixed-length token chunk suitable for causal LM.
+    Sharding is handled inside the dataset so it can be used under DDP without
+    requiring a distributed sampler.
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        seq_len: int = 2048,
+        tokenizer_name: str = "gpt2",
+        max_samples: Optional[int] = None,
+        text_key: str = "text",
+        global_rank: int = 0,
+        world_size: int = 1,
+    ):
+        super().__init__()
+        self.data_path = data_path
+        self.seq_len = seq_len
+        self.max_samples = max_samples
+        self.text_key = text_key
+        self.global_rank = global_rank
+        self.world_size = world_size
+
+        self.enc = _load_tiktoken_tokenizer(tokenizer_name)
+        self.vocab_size = self.enc.n_vocab
+        self.files = self._discover_files(data_path)
+        if not self.files:
+            raise FileNotFoundError(f"No supported text files found under: {data_path}")
+
+    def _discover_files(self, data_path: str) -> list[str]:
+        if os.path.isfile(data_path):
+            return [data_path]
+
+        supported = (
+            ".txt", ".text", ".jsonl", ".json", ".parquet",
+            ".txt.gz", ".jsonl.gz", ".json.gz",
+        )
+        files = []
+        for root, _, filenames in os.walk(data_path):
+            for name in sorted(filenames):
+                if name.endswith(supported):
+                    files.append(os.path.join(root, name))
+        return sorted(files)
+
+    def _iter_parquet_texts(self, path: str) -> Iterable[str]:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "Reading local parquet datasets requires `pyarrow`. "
+                "Install it with `pip install pyarrow`."
+            ) from exc
+
+        parquet_file = pq.ParquetFile(path)
+        schema_names = set(parquet_file.schema.names)
+        if self.text_key not in schema_names:
+            raise KeyError(
+                f"Column `{self.text_key}` not found in parquet file {path}. "
+                f"Available columns: {sorted(schema_names)}"
+            )
+
+        for row_group_idx in range(parquet_file.num_row_groups):
+            table = parquet_file.read_row_group(row_group_idx, columns=[self.text_key])
+            column = table.column(self.text_key)
+            for value in column.to_pylist():
+                if isinstance(value, str) and value.strip():
+                    yield value
+
+    def _open_file(self, path: str):
+        if path.endswith(".gz"):
+            return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
+        return open(path, "r", encoding="utf-8", errors="ignore")
+
+    def _iter_texts(self) -> Iterable[str]:
+        for path in self.files:
+            if path.endswith(".parquet"):
+                yield from self._iter_parquet_texts(path)
+                continue
+
+            with self._open_file(path) as f:
+                if path.endswith((".jsonl", ".jsonl.gz")):
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        text = record.get(self.text_key, "")
+                        if text:
+                            yield text
+                elif path.endswith((".json", ".json.gz")):
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(data, dict):
+                        text = data.get(self.text_key, "")
+                        if text:
+                            yield text
+                    elif isinstance(data, list):
+                        for record in data:
+                            if isinstance(record, dict):
+                                text = record.get(self.text_key, "")
+                                if text:
+                                    yield text
+                else:
+                    for line in f:
+                        text = line.strip()
+                        if text:
+                            yield text
+
+    def __iter__(self):
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+        total_shards = max(1, self.world_size * num_workers)
+        shard_id = self.global_rank * num_workers + worker_id
+
+        buffer = []
+        emitted = 0
+        sample_idx = 0
+
+        for text in self._iter_texts():
+            tokens = self.enc.encode_ordinary(text)
+            if not tokens:
+                continue
+            buffer.extend(tokens + [self.enc.eot_token])
+
+            while len(buffer) >= self.seq_len:
+                chunk = buffer[:self.seq_len]
+                del buffer[:self.seq_len]
+
+                if sample_idx % total_shards == shard_id:
+                    sample = torch.tensor(chunk, dtype=torch.long)
+                    yield {"input_ids": sample, "labels": sample.clone()}
+                    emitted += 1
+                    if self.max_samples is not None and emitted >= self.max_samples:
+                        return
+                sample_idx += 1
+
+    def __len__(self):
+        if self.max_samples is None:
+            raise TypeError("Streaming dataset length is undefined without max_samples")
+        return self.max_samples
+
+
 # ---------------------------------------------------------------------------
 # VLA Datasets
 # ---------------------------------------------------------------------------
@@ -311,6 +485,13 @@ def create_lm_dataloaders(
     vocab_size: int = 32000,
     num_train: int = 50000,
     num_val: int = 5000,
+    data_path: str = "",
+    val_data_path: str = "",
+    tokenizer_name: str = "gpt2",
+    text_key: str = "text",
+    global_rank: int = 0,
+    world_size: int = 1,
+    num_workers: int = 0,
     **kwargs,
 ) -> tuple[DataLoader, DataLoader, int]:
     """
@@ -351,14 +532,50 @@ def create_lm_dataloaders(
         )
         actual_vocab = train_ds.vocab_size
 
+    elif dataset_type in {"local_text", "slimpajama"}:
+        if not data_path:
+            raise ValueError(f"`data_path` is required for dataset_type={dataset_type}")
+        per_rank_train = math.ceil(num_train / max(world_size, 1))
+        train_ds = LocalTextLMDataset(
+            data_path=data_path,
+            seq_len=seq_len,
+            tokenizer_name=tokenizer_name,
+            max_samples=per_rank_train,
+            text_key=text_key,
+            global_rank=global_rank,
+            world_size=world_size,
+        )
+        val_ds = LocalTextLMDataset(
+            data_path=val_data_path or data_path,
+            seq_len=seq_len,
+            tokenizer_name=tokenizer_name,
+            max_samples=num_val,
+            text_key=text_key,
+            global_rank=0,
+            world_size=1,
+        )
+        actual_vocab = train_ds.vocab_size
+
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
+    train_sampler = None
+    val_sampler = None
+    if world_size > 1 and not isinstance(train_ds, IterableDataset):
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True)
+    if world_size > 1 and not isinstance(val_ds, IterableDataset):
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=global_rank, shuffle=False)
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=train_sampler is None and isinstance(train_ds, Dataset) and not isinstance(train_ds, IterableDataset),
+        sampler=train_sampler,
+        num_workers=num_workers,
+        drop_last=True,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=0,
+        val_ds, batch_size=batch_size, shuffle=False, sampler=val_sampler, num_workers=num_workers,
     )
 
     return train_loader, val_loader, actual_vocab

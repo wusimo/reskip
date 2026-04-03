@@ -172,7 +172,7 @@ def load_yaml_config(config_path: str) -> dict:
             for k, v in value.items():
                 flat[k] = v
         else:
-            flat[key] = v
+            flat[key] = value
 
     return flat
 
