@@ -41,10 +41,85 @@ def blend_states(
     return new_states * mask + old_states * (1.0 - mask)
 
 
-def make_router_sources(
+def _router_effective_query(router: "BlockAttentionResidual") -> torch.Tensor:
+    query = router.w_query.float()
+    norm_weight = getattr(router.key_norm, "weight", None)
+    if norm_weight is not None:
+        query = query * norm_weight.float()
+    return query
+
+
+def _rms_norm_base(hidden_states: torch.Tensor, eps: float) -> torch.Tensor:
+    hidden_states_fp32 = hidden_states.float()
+    inv_rms = torch.rsqrt(hidden_states_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return hidden_states_fp32 * inv_rms
+
+
+def batch_attend_completed_blocks(
+    routers: list["BlockAttentionResidual"],
+    completed_blocks: list[torch.Tensor],
+    return_weights: bool,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+    values = torch.stack(completed_blocks, dim=0)
+    base_keys = _rms_norm_base(values, routers[0].key_norm.eps)
+    queries = torch.stack([_router_effective_query(router) for router in routers], dim=0)
+    scale = math.sqrt(values.shape[-1]) * routers[0].temperature
+    scores = torch.einsum("qd,nbtd->qnbt", queries, base_keys) / scale
+    max_scores = scores.amax(dim=1)
+    exp_scores = torch.exp(scores - max_scores.unsqueeze(1))
+    lse = exp_scores.sum(dim=1)
+    outputs = torch.einsum("qnbt,nbtd->qbtd", exp_scores, values.float()).to(values.dtype)
+
+    if return_weights:
+        weights = (exp_scores / lse.unsqueeze(1)).permute(0, 2, 3, 1).to(values.dtype)
+    else:
+        weights = None
+
+    result = []
+    for idx in range(len(routers)):
+        result.append((outputs[idx], max_scores[idx], lse[idx], None if weights is None else weights[idx]))
+    return result
+
+
+def merge_with_partial_block(
+    router: "BlockAttentionResidual",
+    phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+    partial_block: torch.Tensor | None,
+    return_weights: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    phase1_output, phase1_max, phase1_lse, phase1_weights = phase1
+    if partial_block is None:
+        hidden_states = (phase1_output.float() / phase1_lse.unsqueeze(-1)).to(phase1_output.dtype)
+        return hidden_states, phase1_weights
+
+    partial_scores = torch.einsum(
+        "d,btd->bt",
+        _router_effective_query(router),
+        _rms_norm_base(partial_block, router.key_norm.eps),
+    ) / (math.sqrt(partial_block.shape[-1]) * router.temperature)
+    merged_max = torch.maximum(phase1_max, partial_scores)
+    phase1_coeff = torch.exp(phase1_max - merged_max)
+    partial_coeff = torch.exp(partial_scores - merged_max)
+    denom = phase1_coeff * phase1_lse + partial_coeff
+    hidden_states = (
+        phase1_coeff.unsqueeze(-1) * phase1_output.float()
+        + partial_coeff.unsqueeze(-1) * partial_block.float()
+    ) / denom.unsqueeze(-1)
+
+    if not return_weights:
+        return hidden_states.to(partial_block.dtype), None
+
+    if phase1_weights is None:
+        raise RuntimeError("Phase-1 weights are required when return_weights=True.")
+    completed_mass = (phase1_coeff * phase1_lse / denom).unsqueeze(-1)
+    partial_weight = (partial_coeff / denom).unsqueeze(-1)
+    weights = torch.cat([phase1_weights.float() * completed_mass, partial_weight], dim=-1).to(partial_block.dtype)
+    return hidden_states.to(partial_block.dtype), weights
+
+
+def collect_completed_blocks(
     block_states: list[torch.Tensor | None],
     current_block_idx: int,
-    partial_block: torch.Tensor,
 ) -> tuple[list[torch.Tensor], list[int]]:
     source_states = [block_states[0]]
     source_ids = [-1]
@@ -53,8 +128,6 @@ def make_router_sources(
         if state is not None:
             source_states.append(state)
             source_ids.append(block_idx)
-    source_states.append(partial_block)
-    source_ids.append(current_block_idx)
     return source_states, source_ids
 
 
@@ -75,14 +148,16 @@ class BlockAttentionResidual(nn.Module):
         super().__init__()
         self.temperature = config.attn_res_temperature
         self.w_query = nn.Parameter(torch.empty(config.hidden_size))
-        self.key_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        # The fused Triton RMSNorm in FLA is exercised on [B, T, D] tensors in the base
-        # transformer. AttnRes keys are [B, T, N, D], so use the safe PyTorch variant here.
-        self.key_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.key_norm = nn.RMSNorm(
+            config.hidden_size,
+            eps=config.norm_eps,
+            elementwise_affine=config.elementwise_affine,
+        )
 
     def reset_parameters(self, initializer_range: float) -> None:
-        nn.init.normal_(self.w_query, mean=0.0, std=initializer_range)
-        nn.init.normal_(self.key_proj.weight, mean=0.0, std=initializer_range)
+        nn.init.zeros_(self.w_query)
+        if getattr(self.key_norm, "weight", None) is not None:
+            nn.init.ones_(self.key_norm.weight)
 
     def forward(
         self,
@@ -98,11 +173,10 @@ class BlockAttentionResidual(nn.Module):
             return routed, weights if return_weights else None
 
         sources = torch.stack(source_states, dim=2)
-        source_dtype = sources.dtype
-        keys = self.key_norm(self.key_proj(sources))
-        scores = torch.einsum("d,btnd->btn", self.w_query, keys)
+        base_keys = _rms_norm_base(sources, self.key_norm.eps)
+        scores = torch.einsum("d,btnd->btn", _router_effective_query(self), base_keys)
         scores = scores / (math.sqrt(sources.shape[-1]) * self.temperature)
-        weights = torch.softmax(scores.float(), dim=-1).to(source_dtype)
+        weights = torch.softmax(scores, dim=-1).to(sources.dtype)
         routed = torch.sum(weights.unsqueeze(-1) * sources, dim=2).contiguous()
         return routed, weights if return_weights else None
 
@@ -147,7 +221,6 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         use_cache: bool | None = False,
         **kwargs: Unpack[Any],
     ) -> tuple[torch.Tensor, Cache | None]:
-        residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
         hidden_states, _, past_key_values = self.attn(
             hidden_states=hidden_states,
@@ -157,23 +230,22 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
             output_attentions=False,
             **kwargs,
         )
-        return residual + hidden_states, past_key_values
+        return hidden_states, past_key_values
 
     def forward_mlp(
         self,
         hidden_states: torch.Tensor,
         **kwargs: Unpack[Any],
     ) -> torch.Tensor:
-        residual = hidden_states
         hidden_states = self.mlp_norm(hidden_states)
         hidden_states = self.mlp(hidden_states, **kwargs)
-        return residual + hidden_states
+        return hidden_states
 
     def forward(
         self,
-        block_states: list[torch.Tensor | None],
-        current_block_idx: int,
-        partial_block: torch.Tensor,
+        partial_block: torch.Tensor | None,
+        attn_phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+        mlp_phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
@@ -183,28 +255,42 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
     ) -> tuple[
         torch.Tensor,
         Cache | None,
-        list[int],
         torch.Tensor,
-        list[int],
         torch.Tensor,
     ]:
-        attn_sources, attn_source_ids = make_router_sources(block_states, current_block_idx, partial_block)
-        routed_attn, attn_weights = self.attn_router(attn_sources, return_weights=return_routing_weights)
-        updated_partial, past_key_values = self.forward_attention(
-            routed_attn,
+        attn_input, attn_weights = merge_with_partial_block(
+            self.attn_router,
+            attn_phase1,
+            partial_block,
+            return_weights=return_routing_weights,
+        )
+        attn_out, past_key_values = self.forward_attention(
+            attn_input,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             **kwargs,
         )
-        partial_block = blend_states(partial_block, updated_partial, active_mask)
+        old_partial = partial_block
+        partial_block = attn_out if partial_block is None else partial_block + attn_out
+        partial_block = blend_states(
+            torch.zeros_like(partial_block) if old_partial is None else old_partial,
+            partial_block,
+            active_mask,
+        )
 
-        mlp_sources, mlp_source_ids = make_router_sources(block_states, current_block_idx, partial_block)
-        routed_mlp, mlp_weights = self.mlp_router(mlp_sources, return_weights=return_routing_weights)
-        updated_partial = self.forward_mlp(routed_mlp, **kwargs)
-        partial_block = blend_states(partial_block, updated_partial, active_mask)
+        mlp_input, mlp_weights = merge_with_partial_block(
+            self.mlp_router,
+            mlp_phase1,
+            partial_block,
+            return_weights=return_routing_weights,
+        )
+        mlp_out = self.forward_mlp(mlp_input, **kwargs)
+        old_partial = partial_block
+        partial_block = partial_block + mlp_out
+        partial_block = blend_states(old_partial, partial_block, active_mask)
 
-        return partial_block, past_key_values, attn_source_ids, attn_weights, mlp_source_ids, mlp_weights
+        return partial_block, past_key_values, attn_weights, mlp_weights
 
 
 class ReSkipBlockGroup(nn.Module):
@@ -220,6 +306,57 @@ class ReSkipBlockGroup(nn.Module):
         self.layers = nn.ModuleList(
             [ReSkipTransformerLayer(config, first_layer_idx + offset) for offset in range(layers_per_block)]
         )
+
+    def forward(
+        self,
+        block_states: list[torch.Tensor | None],
+        current_block_idx: int,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        active_mask: torch.Tensor | None = None,
+        return_routing_weights: bool = False,
+        **kwargs: Unpack[Any],
+    ) -> tuple[
+        torch.Tensor,
+        Cache | None,
+        list[tuple[list[int], torch.Tensor | None]],
+        list[tuple[list[int], torch.Tensor | None]],
+    ]:
+        completed_blocks, completed_source_ids = collect_completed_blocks(block_states, current_block_idx)
+        routers = []
+        for layer in self.layers:
+            routers.extend([layer.attn_router, layer.mlp_router])
+        phase1_outputs = batch_attend_completed_blocks(
+            routers=routers,
+            completed_blocks=completed_blocks,
+            return_weights=return_routing_weights,
+        )
+
+        partial_block = None
+        next_cache = past_key_values
+        attn_records: list[tuple[list[int], torch.Tensor | None]] = []
+        mlp_records: list[tuple[list[int], torch.Tensor | None]] = []
+
+        for layer_idx, layer in enumerate(self.layers):
+            attn_phase1 = phase1_outputs[2 * layer_idx]
+            mlp_phase1 = phase1_outputs[2 * layer_idx + 1]
+            attn_source_ids = list(completed_source_ids) if partial_block is None else [*completed_source_ids, current_block_idx]
+            partial_block, next_cache, attn_weights, mlp_weights = layer(
+                partial_block=partial_block,
+                attn_phase1=attn_phase1,
+                mlp_phase1=mlp_phase1,
+                attention_mask=attention_mask,
+                past_key_values=next_cache,
+                use_cache=use_cache,
+                active_mask=active_mask,
+                return_routing_weights=return_routing_weights,
+                **kwargs,
+            )
+            attn_records.append((attn_source_ids, attn_weights))
+            mlp_records.append(([*completed_source_ids, current_block_idx], mlp_weights))
+
+        return partial_block, next_cache, attn_records, mlp_records
 
 
 class ReSkipTransformerPreTrainedModel(PreTrainedModel):
@@ -535,25 +672,22 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                     )
                 continue
 
-            partial_block = hidden_states
             current_block = self.layers[block_idx]
-            for layer in current_block.layers:
-                partial_block, next_cache, attn_source_ids, attn_weights, mlp_source_ids, mlp_weights = layer(
-                    block_states,
-                    position,
-                    partial_block,
-                    attention_mask=attention_mask,
-                    past_key_values=next_cache,
-                    use_cache=use_cache,
-                    active_mask=active_mask,
-                    return_routing_weights=collect_routing_info,
-                    **kwargs,
-                )
-                if collect_routing_info:
-                    self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
-                    self._record_routing(routing_events, position, "mlp", mlp_source_ids, mlp_weights)
-
-            hidden_states = partial_block
+            hidden_states, next_cache, attn_records, mlp_records = current_block(
+                block_states=block_states,
+                current_block_idx=position,
+                attention_mask=attention_mask,
+                past_key_values=next_cache,
+                use_cache=use_cache,
+                active_mask=active_mask,
+                return_routing_weights=collect_routing_info,
+                **kwargs,
+            )
+            if collect_routing_info:
+                for source_ids, attn_weights in attn_records:
+                    self._record_routing(routing_events, position, "attn", source_ids, attn_weights)
+                for source_ids, mlp_weights in mlp_records:
+                    self._record_routing(routing_events, position, "mlp", source_ids, mlp_weights)
             block_states[position + 1] = hidden_states
 
             halt_probability_mean = 0.0
