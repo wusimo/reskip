@@ -439,9 +439,17 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
+    real_model = get_model(model)
+    model_type = getattr(getattr(real_model, "config", None), "model_type", None)
     blocks = get_blocks(model)
     if blocks is None:
         logger.warning("No block found for FSDP")
+    elif model_type == "reskip_transformer":
+        logger.info(
+            "Skipping per-block FSDP for reskip_transformer because its forward path "
+            "executes inside block internals without calling the block module itself. "
+            "Applying root-model FSDP only."
+        )
     else:
         total_blocks = len(blocks)
         for layer_id, block in enumerate(blocks):
