@@ -85,6 +85,8 @@ class ReSkipTransformerLayer(nn.Module):
     def __init__(self, config: ReSkipTransformerConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
+        self.attn_router = BlockAttentionResidual(config)
+        self.mlp_router = BlockAttentionResidual(config)
         # Keep FLA's RMSNorm for the standard 3D transformer path because flame's
         # sequence-parallel / DTensor stack expects norm modules that understand DTensor.
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
@@ -213,12 +215,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 )
                 for block_idx in range(self.num_unique_blocks)
             ]
-        )
-        self.attn_routers = nn.ModuleList(
-            [BlockAttentionResidual(config) for _ in range(config.num_hidden_layers)]
-        )
-        self.mlp_routers = nn.ModuleList(
-            [BlockAttentionResidual(config) for _ in range(config.num_hidden_layers)]
         )
         self.halt_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.halt_head = nn.Linear(config.hidden_size, 1, bias=True)
@@ -501,10 +497,8 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             partial_block = hidden_states
             current_block = self.layers[block_idx]
             for layer_offset, layer in enumerate(current_block.layers):
-                logical_layer_idx = position * self.layers_per_block + layer_offset
-
                 attn_sources, attn_source_ids = self._make_router_sources(block_states, position, partial_block)
-                routed_attn, attn_weights = self.attn_routers[logical_layer_idx](attn_sources, return_weights=True)
+                routed_attn, attn_weights = layer.attn_router(attn_sources, return_weights=True)
                 self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
                 updated_partial, next_cache = layer.forward_attention(
                     routed_attn,
@@ -516,7 +510,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 partial_block = self._blend_states(partial_block, updated_partial, active_mask)
 
                 mlp_sources, mlp_source_ids = self._make_router_sources(block_states, position, partial_block)
-                routed_mlp, mlp_weights = self.mlp_routers[logical_layer_idx](mlp_sources, return_weights=True)
+                routed_mlp, mlp_weights = layer.mlp_router(mlp_sources, return_weights=True)
                 self._record_routing(routing_events, position, "mlp", mlp_source_ids, mlp_weights)
                 updated_partial = layer.forward_mlp(routed_mlp, **kwargs)
                 partial_block = self._blend_states(partial_block, updated_partial, active_mask)
