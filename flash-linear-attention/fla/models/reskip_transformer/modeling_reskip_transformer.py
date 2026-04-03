@@ -30,6 +30,34 @@ except ImportError:
 logger = logging.get_logger(__name__)
 
 
+def blend_states(
+    old_states: torch.Tensor,
+    new_states: torch.Tensor,
+    active_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    if active_mask is None:
+        return new_states
+    mask = active_mask[:, None, None].to(dtype=new_states.dtype)
+    return new_states * mask + old_states * (1.0 - mask)
+
+
+def make_router_sources(
+    block_states: list[torch.Tensor | None],
+    current_block_idx: int,
+    partial_block: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[int]]:
+    source_states = [block_states[0]]
+    source_ids = [-1]
+    for block_idx in range(current_block_idx):
+        state = block_states[block_idx + 1]
+        if state is not None:
+            source_states.append(state)
+            source_ids.append(block_idx)
+    source_states.append(partial_block)
+    source_ids.append(current_block_idx)
+    return source_states, source_ids
+
+
 @dataclass
 class ReSkipBaseModelOutputWithPast(BaseModelOutputWithPast):
     routing_info: dict[str, Any] | None = None
@@ -79,11 +107,12 @@ class BlockAttentionResidual(nn.Module):
         return routed, weights if return_weights else None
 
 
-class ReSkipTransformerLayer(nn.Module):
+class ReSkipTransformerLayer(GradientCheckpointingLayer):
     """Standard transformer layer split into attention and MLP phases."""
 
     def __init__(self, config: ReSkipTransformerConfig, layer_idx: int):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         self.attn_router = BlockAttentionResidual(config)
         self.mlp_router = BlockAttentionResidual(config)
@@ -139,6 +168,42 @@ class ReSkipTransformerLayer(nn.Module):
         hidden_states = self.mlp_norm(hidden_states)
         hidden_states = self.mlp(hidden_states, **kwargs)
         return residual + hidden_states
+
+    def forward(
+        self,
+        block_states: list[torch.Tensor | None],
+        current_block_idx: int,
+        partial_block: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        active_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[Any],
+    ) -> tuple[
+        torch.Tensor,
+        Cache | None,
+        list[int],
+        torch.Tensor,
+        list[int],
+        torch.Tensor,
+    ]:
+        attn_sources, attn_source_ids = make_router_sources(block_states, current_block_idx, partial_block)
+        routed_attn, attn_weights = self.attn_router(attn_sources, return_weights=True)
+        updated_partial, past_key_values = self.forward_attention(
+            routed_attn,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        partial_block = blend_states(partial_block, updated_partial, active_mask)
+
+        mlp_sources, mlp_source_ids = make_router_sources(block_states, current_block_idx, partial_block)
+        routed_mlp, mlp_weights = self.mlp_router(mlp_sources, return_weights=True)
+        updated_partial = self.forward_mlp(routed_mlp, **kwargs)
+        partial_block = blend_states(partial_block, updated_partial, active_mask)
+
+        return partial_block, past_key_values, attn_source_ids, attn_weights, mlp_source_ids, mlp_weights
 
 
 class ReSkipBlockGroup(nn.Module):
@@ -290,34 +355,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         mask = attention_mask.to(hidden_states.dtype).unsqueeze(-1)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden_states * mask).sum(dim=1) / denom
-
-    @staticmethod
-    def _blend_states(
-        old_states: torch.Tensor,
-        new_states: torch.Tensor,
-        active_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if active_mask is None:
-            return new_states
-        mask = active_mask[:, None, None].to(dtype=new_states.dtype)
-        return new_states * mask + old_states * (1.0 - mask)
-
-    def _make_router_sources(
-        self,
-        block_states: list[torch.Tensor | None],
-        current_block_idx: int,
-        partial_block: torch.Tensor,
-    ) -> tuple[list[torch.Tensor], list[int]]:
-        source_states = [block_states[0]]
-        source_ids = [-1]
-        for block_idx in range(current_block_idx):
-            state = block_states[block_idx + 1]
-            if state is not None:
-                source_states.append(state)
-                source_ids.append(block_idx)
-        source_states.append(partial_block)
-        source_ids.append(current_block_idx)
-        return source_states, source_ids
 
     def _record_routing(
         self,
@@ -496,24 +533,19 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
 
             partial_block = hidden_states
             current_block = self.layers[block_idx]
-            for layer_offset, layer in enumerate(current_block.layers):
-                attn_sources, attn_source_ids = self._make_router_sources(block_states, position, partial_block)
-                routed_attn, attn_weights = layer.attn_router(attn_sources, return_weights=True)
-                self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
-                updated_partial, next_cache = layer.forward_attention(
-                    routed_attn,
+            for layer in current_block.layers:
+                partial_block, next_cache, attn_source_ids, attn_weights, mlp_source_ids, mlp_weights = layer(
+                    block_states,
+                    position,
+                    partial_block,
                     attention_mask=attention_mask,
                     past_key_values=next_cache,
                     use_cache=use_cache,
+                    active_mask=active_mask,
                     **kwargs,
                 )
-                partial_block = self._blend_states(partial_block, updated_partial, active_mask)
-
-                mlp_sources, mlp_source_ids = self._make_router_sources(block_states, position, partial_block)
-                routed_mlp, mlp_weights = layer.mlp_router(mlp_sources, return_weights=True)
+                self._record_routing(routing_events, position, "attn", attn_source_ids, attn_weights)
                 self._record_routing(routing_events, position, "mlp", mlp_source_ids, mlp_weights)
-                updated_partial = layer.forward_mlp(routed_mlp, **kwargs)
-                partial_block = self._blend_states(partial_block, updated_partial, active_mask)
 
             hidden_states = partial_block
             block_states[position + 1] = hidden_states

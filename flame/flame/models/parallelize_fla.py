@@ -244,6 +244,26 @@ TP_PLAN_MAP = {
 }
 
 
+def iter_execution_blocks(model: nn.Module):
+    real_model = get_model(model)
+    model_type = getattr(getattr(real_model, "config", None), "model_type", None)
+    blocks = get_blocks(model)
+    if blocks is None:
+        return
+
+    if model_type == "reskip_transformer":
+        for block_group in blocks:
+            if not hasattr(block_group, "layers"):
+                logger.warning('reskip block group has no "layers" attribute')
+                continue
+            for layer_id, layer in block_group.layers.named_children():
+                yield block_group.layers, layer_id, layer
+        return
+
+    for layer_id, block in blocks.named_children():
+        yield blocks, layer_id, block
+
+
 def apply_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
@@ -265,7 +285,7 @@ def apply_tp(
     if blocks is None:
         logger.warning("No block found for tensor parallelism")
     else:
-        for _, block in enumerate(blocks):
+        for _, _, block in iter_execution_blocks(model):
             parallelize_module(
                 module=block,
                 device_mesh=tp_mesh,
@@ -358,14 +378,14 @@ def _apply_ac_to_block(module: nn.Module, ac_config):
 
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
-    blocks = get_blocks(model)
-    if blocks is None:
+    execution_blocks = list(iter_execution_blocks(model))
+    if not execution_blocks:
         logger.warning("No block found for activation checkpointing")
         return
 
-    for layer_id, block in blocks.named_children():
+    for container, layer_id, block in execution_blocks:
         block = _apply_ac_to_block(block, ac_config)
-        blocks.register_module(layer_id, block)
+        container.register_module(layer_id, block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
 
@@ -376,13 +396,13 @@ def apply_compile(model: nn.Module):
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
 
-    blocks = get_blocks(model)
-    if blocks is None:
+    execution_blocks = list(iter_execution_blocks(model))
+    if not execution_blocks:
         logger.warning("No block found for torch.compile")
     else:
-        for layer_id, block in blocks.named_children():
+        for container, layer_id, block in execution_blocks:
             block = torch.compile(block)
-            blocks.register_module(layer_id, block)
+            container.register_module(layer_id, block)
         logger.info("Compiling each block with torch.compile")
 
     real_model = get_model(model)
@@ -439,20 +459,12 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    real_model = get_model(model)
-    model_type = getattr(getattr(real_model, "config", None), "model_type", None)
-    blocks = get_blocks(model)
-    if blocks is None:
+    execution_blocks = list(iter_execution_blocks(model))
+    if not execution_blocks:
         logger.warning("No block found for FSDP")
-    elif model_type == "reskip_transformer":
-        logger.info(
-            "Skipping per-block FSDP for reskip_transformer because its forward path "
-            "executes inside block internals without calling the block module itself. "
-            "Applying root-model FSDP only."
-        )
     else:
-        total_blocks = len(blocks)
-        for layer_id, block in enumerate(blocks):
+        total_blocks = len(execution_blocks)
+        for layer_id, (_, _, block) in enumerate(execution_blocks):
             if reshard_after_forward_policy == "always":
                 reshard_after_forward = True
             elif reshard_after_forward_policy == "never":
