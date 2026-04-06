@@ -31,6 +31,22 @@ def parse_csv_bools(text: str) -> list[bool]:
     return [item.strip() in {"1", "true", "True", "yes"} for item in text.split(",") if item.strip()]
 
 
+def parse_torch_dtype(dtype: str | None, device: str) -> torch.dtype | None:
+    if dtype is None or dtype == "auto":
+        return torch.bfloat16 if device.startswith("cuda") else None
+    dtype_map = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    return dtype_map[dtype]
+
+
 def count_valid_tokens(labels: torch.Tensor) -> int:
     valid = (labels != -100).sum().item()
     if valid == 0:
@@ -83,11 +99,17 @@ def build_text_dataloader(
 def load_model_and_tokenizer(
     model_path: str,
     device: str,
+    dtype: str = "auto",
 ):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
+    model_dtype = parse_torch_dtype(dtype, device)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=model_dtype,
+    )
     model = model.to(device)
     model.eval()
     return model, tokenizer

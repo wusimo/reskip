@@ -16,6 +16,7 @@ def main() -> None:
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default="auto")
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=0.95)
@@ -24,7 +25,7 @@ def main() -> None:
     parser.add_argument("--routing_analysis", default="")
     args = parser.parse_args()
 
-    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device)
+    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device, dtype=args.dtype)
     decoder = model.get_decoder()
     if args.keep_mask:
         decoder.set_skip_keep_mask(parse_csv_bools(args.keep_mask))

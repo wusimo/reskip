@@ -30,11 +30,12 @@ def main() -> None:
     parser.add_argument("--thresholds", default="0.0,0.001,0.005,0.01,0.02,0.05,0.1,0.2")
     parser.add_argument("--ppl_tolerance", type=float, default=0.02)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default="auto")
     parser.add_argument("--output_dir", default="outputs/flame_analysis")
     parser.add_argument("--export_best_model_dir", default="")
     args = parser.parse_args()
 
-    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device)
+    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device, dtype=args.dtype)
     dataloader = build_text_dataloader(
         tokenizer=tokenizer,
         dataset=args.dataset,
