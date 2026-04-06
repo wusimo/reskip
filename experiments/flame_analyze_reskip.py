@@ -36,28 +36,35 @@ def main() -> None:
     args = parser.parse_args()
 
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.device, dtype=args.dtype)
-    dataloader = build_text_dataloader(
-        tokenizer=tokenizer,
-        dataset=args.dataset,
-        dataset_name=args.dataset_name,
-        dataset_split=args.dataset_split,
-        data_dir=args.data_dir,
-        data_files=args.data_files,
-        seq_len=args.seq_len,
-        context_len=args.context_len,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        streaming=args.streaming,
-        varlen=args.varlen,
-    )
+
+    def run_eval(*, return_routing_info: bool, enable_skipping: bool | None, skip_keep_mask=None):
+        dataloader = build_text_dataloader(
+            tokenizer=tokenizer,
+            dataset=args.dataset,
+            dataset_name=args.dataset_name,
+            dataset_split=args.dataset_split,
+            data_dir=args.data_dir,
+            data_files=args.data_files,
+            seq_len=args.seq_len,
+            context_len=args.context_len,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            streaming=args.streaming,
+            varlen=args.varlen,
+        )
+        return evaluate_causal_lm(
+            model,
+            dataloader,
+            args.device,
+            num_batches=args.num_batches,
+            return_routing_info=return_routing_info,
+            enable_skipping=enable_skipping,
+            skip_keep_mask=skip_keep_mask,
+        )
 
     decoder = model.get_decoder()
     decoder.clear_skip_keep_mask()
-    full_eval = evaluate_causal_lm(
-        model,
-        dataloader,
-        args.device,
-        num_batches=args.num_batches,
+    full_eval = run_eval(
         return_routing_info=True,
         enable_skipping=False,
     )
@@ -66,11 +73,7 @@ def main() -> None:
     sweep = []
     for threshold in thresholds:
         keep_mask = decoder.build_keep_mask_from_importance(full_eval["block_importance"], threshold)
-        metrics = evaluate_causal_lm(
-            model,
-            dataloader,
-            args.device,
-            num_batches=args.num_batches,
+        metrics = run_eval(
             return_routing_info=True,
             enable_skipping=True,
             skip_keep_mask=keep_mask,
