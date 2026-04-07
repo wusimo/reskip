@@ -89,7 +89,7 @@ def merge_with_partial_block(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     phase1_output, phase1_max, phase1_lse, phase1_weights = phase1
     if partial_block is None:
-        hidden_states = (phase1_output.float() / phase1_lse.unsqueeze(-1)).to(phase1_output.dtype)
+        hidden_states = phase1_output * phase1_lse.reciprocal().to(phase1_output.dtype).unsqueeze(-1)
         return hidden_states, phase1_weights
 
     partial_scores = torch.einsum(
@@ -101,20 +101,23 @@ def merge_with_partial_block(
     phase1_coeff = torch.exp(phase1_max - merged_max)
     partial_coeff = torch.exp(partial_scores - merged_max)
     denom = phase1_coeff * phase1_lse + partial_coeff
+    phase1_weight = (phase1_coeff * phase1_lse / denom).to(partial_block.dtype)
+    partial_weight = (partial_coeff / denom).to(partial_block.dtype)
     hidden_states = (
-        phase1_coeff.unsqueeze(-1) * phase1_output.float()
-        + partial_coeff.unsqueeze(-1) * partial_block.float()
-    ) / denom.unsqueeze(-1)
+        phase1_output * phase1_weight.unsqueeze(-1)
+        + partial_block * partial_weight.unsqueeze(-1)
+    )
 
     if not return_weights:
-        return hidden_states.to(partial_block.dtype), None
+        return hidden_states, None
 
     if phase1_weights is None:
         raise RuntimeError("Phase-1 weights are required when return_weights=True.")
-    completed_mass = (phase1_coeff * phase1_lse / denom).unsqueeze(-1)
-    partial_weight = (partial_coeff / denom).unsqueeze(-1)
-    weights = torch.cat([phase1_weights.float() * completed_mass, partial_weight], dim=-1).to(partial_block.dtype)
-    return hidden_states.to(partial_block.dtype), weights
+    weights = torch.cat(
+        [phase1_weights * phase1_weight.unsqueeze(-1), partial_weight.unsqueeze(-1)],
+        dim=-1,
+    )
+    return hidden_states, weights
 
 
 def collect_completed_blocks(

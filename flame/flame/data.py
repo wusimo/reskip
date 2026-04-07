@@ -15,7 +15,6 @@ from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
 from torchdata.stateful_dataloader import StatefulDataLoader
-from torch.utils.data import get_worker_info
 from transformers import PreTrainedTokenizer
 
 from torchtitan.tools import utils
@@ -55,24 +54,7 @@ class BufferShuffledIterableDataset(IterableDataset):
         self.token_id = 0
         self.rng_state = None
         self._epoch = 0
-        self._worker_data = None
-        self._worker_ctx = None
-
-    def _get_data_iterable(self):
-        worker_info = get_worker_info()
-        if worker_info is None:
-            self._worker_data = None
-            self._worker_ctx = None
-            return self.data
-
-        worker_ctx = (worker_info.id, worker_info.num_workers)
-        if self._worker_data is None or self._worker_ctx != worker_ctx:
-            self._worker_data = self.data.shard(worker_info.num_workers, worker_info.id)
-            self._worker_ctx = worker_ctx
-        return self._worker_data
-
     def __iter__(self):
-        data = self._get_data_iterable()
         g = torch.Generator()
         g.manual_seed(self._epoch + self.rank)
         if self.rng_state is not None:
@@ -80,13 +62,13 @@ class BufferShuffledIterableDataset(IterableDataset):
 
         rand_it = self.randint(0, self.buffer_size, g=g)
         if self.states is not None:
-            data.load_state_dict(self.states)
+            self.data.load_state_dict(self.states)
 
         # max number of tokens allowed in the chunk buffer
         n_tokens = self.buffer_size * self.seq_len
 
         while True:
-            for sample in self.tokenize(data):
+            for sample in self.tokenize(self.data):
                 # keep appending the samples to the token buffer
                 self.tokens += sample
                 # if the token buffer is full, start sampling
@@ -111,7 +93,7 @@ class BufferShuffledIterableDataset(IterableDataset):
         texts, states = [], []
         for sample in data:
             texts.append(sample['text'])
-            states.append(data.state_dict())
+            states.append(self.data.state_dict())
             if len(texts) == batch_size:
                 for s, tokenized in zip(states, self.tokenizer(texts, return_attention_mask=False)['input_ids']):
                     self.states = s
@@ -184,29 +166,12 @@ class OnlineTokenizedIterableDataset(IterableDataset):
 
         self.states = None
         self.tokens = []
-        self._worker_data = None
-        self._worker_ctx = None
-
-    def _get_data_iterable(self):
-        worker_info = get_worker_info()
-        if worker_info is None:
-            self._worker_data = None
-            self._worker_ctx = None
-            return self.data
-
-        worker_ctx = (worker_info.id, worker_info.num_workers)
-        if self._worker_data is None or self._worker_ctx != worker_ctx:
-            self._worker_data = self.data.shard(worker_info.num_workers, worker_info.id)
-            self._worker_ctx = worker_ctx
-        return self._worker_data
-
     def __iter__(self):
-        data = self._get_data_iterable()
         if self.states is not None:
-            data.load_state_dict(self.states)
+            self.data.load_state_dict(self.states)
 
         while True:
-            for sample in self.tokenize(data):
+            for sample in self.tokenize(self.data):
                 # keep appending the samples to the token buffer
                 self.tokens += sample
 
@@ -224,7 +189,7 @@ class OnlineTokenizedIterableDataset(IterableDataset):
                 buffer.append(sample['content'])
             else:
                 raise ValueError(f"No 'text' or 'content' field found in sample:\n{sample}")
-            states.append(data.state_dict())
+            states.append(self.data.state_dict())
             if len(buffer) == buffer_size:
                 for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
                     self.states = s
