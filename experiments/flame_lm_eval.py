@@ -20,7 +20,7 @@ def main() -> None:
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
-    model_args = f"pretrained={args.model_path}"
+    model_args = f"pretrained={args.model_path},dtype='bfloat16'"
     argv = [
         "lm_eval",
         "--model",

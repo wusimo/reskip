@@ -15,6 +15,7 @@ from datasets import Dataset, IterableDataset, interleave_datasets, load_dataset
 from datasets.iterable_dataset import ShufflingConfig
 from torch.distributed.checkpoint.stateful import Stateful
 from torchdata.stateful_dataloader import StatefulDataLoader
+from torch.utils.data import get_worker_info
 from transformers import PreTrainedTokenizer
 
 from torchtitan.tools import utils
@@ -54,8 +55,24 @@ class BufferShuffledIterableDataset(IterableDataset):
         self.token_id = 0
         self.rng_state = None
         self._epoch = 0
+        self._worker_data = None
+        self._worker_ctx = None
+
+    def _get_data_iterable(self):
+        worker_info = get_worker_info()
+        if worker_info is None:
+            self._worker_data = None
+            self._worker_ctx = None
+            return self.data
+
+        worker_ctx = (worker_info.id, worker_info.num_workers)
+        if self._worker_data is None or self._worker_ctx != worker_ctx:
+            self._worker_data = self.data.shard(worker_info.num_workers, worker_info.id)
+            self._worker_ctx = worker_ctx
+        return self._worker_data
 
     def __iter__(self):
+        data = self._get_data_iterable()
         g = torch.Generator()
         g.manual_seed(self._epoch + self.rank)
         if self.rng_state is not None:
@@ -63,13 +80,13 @@ class BufferShuffledIterableDataset(IterableDataset):
 
         rand_it = self.randint(0, self.buffer_size, g=g)
         if self.states is not None:
-            self.data.load_state_dict(self.states)
+            data.load_state_dict(self.states)
 
         # max number of tokens allowed in the chunk buffer
         n_tokens = self.buffer_size * self.seq_len
 
         while True:
-            for sample in self.tokenize(self.data):
+            for sample in self.tokenize(data):
                 # keep appending the samples to the token buffer
                 self.tokens += sample
                 # if the token buffer is full, start sampling
@@ -94,7 +111,7 @@ class BufferShuffledIterableDataset(IterableDataset):
         texts, states = [], []
         for sample in data:
             texts.append(sample['text'])
-            states.append(self.data.state_dict())
+            states.append(data.state_dict())
             if len(texts) == batch_size:
                 for s, tokenized in zip(states, self.tokenizer(texts, return_attention_mask=False)['input_ids']):
                     self.states = s
@@ -167,13 +184,29 @@ class OnlineTokenizedIterableDataset(IterableDataset):
 
         self.states = None
         self.tokens = []
+        self._worker_data = None
+        self._worker_ctx = None
+
+    def _get_data_iterable(self):
+        worker_info = get_worker_info()
+        if worker_info is None:
+            self._worker_data = None
+            self._worker_ctx = None
+            return self.data
+
+        worker_ctx = (worker_info.id, worker_info.num_workers)
+        if self._worker_data is None or self._worker_ctx != worker_ctx:
+            self._worker_data = self.data.shard(worker_info.num_workers, worker_info.id)
+            self._worker_ctx = worker_ctx
+        return self._worker_data
 
     def __iter__(self):
+        data = self._get_data_iterable()
         if self.states is not None:
-            self.data.load_state_dict(self.states)
+            data.load_state_dict(self.states)
 
         while True:
-            for sample in self.tokenize(self.data):
+            for sample in self.tokenize(data):
                 # keep appending the samples to the token buffer
                 self.tokens += sample
 
@@ -191,7 +224,7 @@ class OnlineTokenizedIterableDataset(IterableDataset):
                 buffer.append(sample['content'])
             else:
                 raise ValueError(f"No 'text' or 'content' field found in sample:\n{sample}")
-            states.append(self.data.state_dict())
+            states.append(data.state_dict())
             if len(buffer) == buffer_size:
                 for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
                     self.states = s
@@ -491,8 +524,18 @@ class DataCollatorForLanguageModeling:
                         # Ensure uniqueness and sort, as arange might duplicate the endpoint
                         batch['cu_seqlens'] = torch.unique(batch['cu_seqlens'])
 
-            # Create labels directly from input_ids, NO padding mask needed for varlen
+            # Create labels directly from input_ids.
+            # For packed varlen inputs, ignore the first token of each packed subsequence
+            # so we do not train on artificial cross-sequence transitions after the model
+            # applies its internal next-token shift.
             labels = batch['input_ids'].clone()
+            if 'cu_seqlens' in batch and batch['cu_seqlens'].numel() > 2:
+                boundary_starts = batch['cu_seqlens'][1:-1].to(dtype=torch.long)
+                boundary_starts = boundary_starts[
+                    (boundary_starts >= 0) & (boundary_starts < labels.size(1))
+                ]
+                if boundary_starts.numel() > 0:
+                    labels[:, boundary_starts] = -100
             batch['labels'] = labels
 
         return batch
@@ -738,6 +781,7 @@ def build_dataloader(
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
 ):
+    effective_prefetch_factor = prefetch_factor if num_workers > 0 else None
     dataset = OnlineTokenizedIterableDataset(
         dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
     )
@@ -748,7 +792,7 @@ def build_dataloader(
         collate_fn=DataCollatorForLanguageModeling(tokenizer=tokenizer, context_len=context_len, varlen=varlen),
         num_workers=num_workers,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=effective_prefetch_factor,
         persistent_workers=persistent_workers,
         snapshot_every_n_steps=snapshot_every_n_steps,
     )

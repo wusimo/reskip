@@ -51,7 +51,7 @@ def count_valid_tokens(labels: torch.Tensor) -> int:
     valid = (labels != -100).sum().item()
     if valid == 0:
         valid = labels.numel()
-    return int(valid)
+    return max(int(valid) - labels.size(0), 0)
 
 
 def build_text_dataloader(
@@ -68,6 +68,7 @@ def build_text_dataloader(
     num_workers: int,
     streaming: bool,
     varlen: bool,
+    seed: int = 0,
 ):
     ds = build_dataset(
         dataset=dataset,
@@ -78,7 +79,7 @@ def build_text_dataloader(
         streaming=streaming,
         dp_degree=1,
         num_workers=num_workers,
-        seed=42,
+        seed=seed,
     )
     return build_dataloader(
         dataset=ds,
@@ -137,12 +138,19 @@ def evaluate_causal_lm(
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         attention_mask = batch.get("attention_mask")
+        cu_seqlens = batch.get("cu_seqlens")
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
+            if torch.all(attention_mask):
+                attention_mask = None
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(device)
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            cu_seqlens=cu_seqlens,
+            use_cache=False,
             return_dict=True,
             return_routing_info=return_routing_info,
             enable_skipping=enable_skipping,

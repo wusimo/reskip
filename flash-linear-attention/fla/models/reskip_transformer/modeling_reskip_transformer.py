@@ -841,6 +841,8 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple | ReSkipCausalLMOutputWithPast:
+        if labels is not None and use_cache is None:
+            use_cache = False
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )

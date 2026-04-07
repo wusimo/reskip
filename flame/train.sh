@@ -9,7 +9,7 @@ fi
 # e.g.
 # NNODE=1 NGPU=8 LOG_RANK=0 ./train.sh
 NNODE=${NNODE:-"1"}
-NGPU=${NGPU:-"8"}
+NGPU=${NGPU:-"6"}
 LOG_RANK=${LOG_RANK:-0}
 
 if [[ -z "${MASTER_ADDR}" ]]; then
