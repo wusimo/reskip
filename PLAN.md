@@ -1,384 +1,328 @@
-# ReSkip 统一实验计划
+# ReSkip: Roadmap to Paper-Quality Experiments
 
-## 1. 文档目的
+## Overview of Issues and Solutions
 
-本文件是当前仓库唯一保留的实验规划文档，统一整理以下内容：
-
-- 已实现的模型与训练路径
-- 已确认的问题与修复结论
-- 当前推荐的训练、导出、评测命令
-- 后续实验顺序与记录规范
-
-根目录其余 playbook 已合并进本文件。
+The prototype validates the core mechanism (AttnRes weights as routing signals).
+The reviewer feedback identifies 7 concrete gaps between current state and publishable quality.
+This plan addresses each systematically.
 
 ---
 
-## 2. 当前仓库状态
+## Issue 1: Scale Too Small (Critical)
 
-### 2.1 主要实现
+**Problem:** 55M params on synthetic data. Need 300M+ on natural language.
 
-- `ReSkip LM`
-  路径：`flash-linear-attention/fla/models/reskip_transformer/`
-- `ReLoop LM`
-  路径：`flash-linear-attention/fla/models/reskip_transformer/`
-- `flame + FLA` 训练链路
-  路径：`flame/`
-- `StarVLA + AttnRes`
-  路径：`starVLA/`
+**Plan:**
 
-### 2.2 当前建议使用的训练框架
+### Phase 1: 300M Model on SlimPajama (Primary target)
+- **Model:** d=1024, n_heads=16, n_layers=24, n_blocks=8 (~350M params)
+- **Data:** SlimPajama-627B (sample ~10B tokens for training, standard split)
+- **Tokenizer:** GPT-NeoX tokenizer (vocab 50257) or LLaMA tokenizer (vocab 32000)
+- **Training:**
+  - ~20K steps with batch_size=256, seq_len=2048 (matches Chinchilla-optimal for 350M)
+  - BF16 mixed precision, gradient accumulation 8x
+  - Hardware: 4x A100-80GB or 8x A6000-48GB (estimate ~3-4 days)
+  - Cosine schedule, lr=3e-4, warmup 2000 steps
+- **Eval benchmarks:**
+  - WikiText-103 perplexity
+  - LAMBADA accuracy
+  - HellaSwag (0-shot)
+  - ARC-Easy/Challenge (0-shot)
 
-- 正式训练统一使用当前仓库内的 `flame`
-- 不再使用单独拉下来的 `baseflame`
+### Phase 2: Scaling Law Suite (Nice-to-have)
+- Train at 3 scales: 125M, 350M, 1.3B with matched training tokens
+- Show that optimal skip thresholds and routing patterns scale predictably
+- This directly addresses the "scaling laws" future direction and makes the paper much stronger
 
-原因：
-
-- 当前仓库已经包含 `ReSkip/ReLoop` 的适配与验证结果
-- 训练态与 checkpoint 态不一致的问题已经在当前仓库内修复
-- `baseflame` 只作为对照与定位工具，不再需要继续保留
-
----
-
-## 3. 已解决的关键问题
-
-### 3.1 历史问题
-
-之前 `ReSkip` 训练中出现过明显异常：
-
-- 训练日志中的 loss 很低
-- 导出的 checkpoint 拿出来离线前向时，loss 明显更高
-- 导致无法判断训练是否真实有效
-
-典型表现是：
-
-- 训练过程中日志 loss 接近 `2.x ~ 4.x`
-- checkpoint 离线前向仍在 `6.x ~ 7.x`
-
-### 3.2 最终定位
-
-最终确认根因不在：
-
-- `reskip` 的 forward/loss 公式
-- `HF 导出`
-- `lm-eval` 脚本本身
-
-真正根因在 **TorchTitan checkpoint 保存路径**：
-
-- `ModelWrapper.state_dict()` 在构造时缓存了一次 model state
-- 后续定期保存 checkpoint 时继续使用旧缓存
-- 导致训练时看的 live model 与磁盘里保存的 checkpoint 不是同一份权重
-
-### 3.3 最终修复
-
-修复位置：
-
-- [train.py](/home/user01/Minko/reskip2/reskip/flame/flame/train.py)
-
-修复方式：
-
-- 训练启动时 monkey-patch `torchtitan.components.checkpoint.ModelWrapper.state_dict`
-- 改为每次保存 checkpoint 前都重新从 live model 抽取最新 state dict
-
-### 3.4 修复验证结论
-
-已做 fresh run 验证。
-
-在同一份训练后 microbatch 上：
-
-- 训练后 replay loss
-- 从刚保存的 checkpoint 重新加载后的 replay loss
-
-已经精确对齐，误差约为 `1e-4` 量级。
-
-结论：
-
-- 对 **新训练产生的 checkpoint**，训练态与 checkpoint 态已对齐
-- 旧的异常 checkpoint 不会被自动修复，不再作为正式结果使用
+### Implementation Changes Needed
+1. Replace `StructuredSyntheticLM` with HuggingFace streaming dataloader:
+   ```python
+   from datasets import load_dataset
+   ds = load_dataset("cerebras/SlimPajama-627B", split="train", streaming=True)
+   ```
+2. Switch from learned positional embeddings to RoPE (standard for modern LLMs)
+3. Add gradient accumulation to `train_lm.py`
+4. Add multi-GPU DDP support (torch.distributed)
+5. Add proper eval harness (integrate with `lm-eval-harness` by EleutherAI)
 
 ---
 
-## 4. 当前推荐实验主线
+## Issue 2: Synthetic Data is a Red Flag (Critical)
 
-建议按下面顺序推进。
+**Problem:** Controllable difficulty makes routing results tautological.
 
-### 4.1 主线 A：ReSkip 340M 训练
-
-目标：
-
-- 验证 `ReSkip` 在当前 flame/FLA 链路下的稳定训练
-- 周期性抽 checkpoint 做一致性与 `lm-eval` 检查
-
-### 4.2 主线 B：ReLoop 340M 训练
-
-目标：
-
-- 验证共享块循环版本在相同训练框架下是否稳定
-- 对比 `ReSkip` 与 `ReLoop` 的 loss、评测、导出链路
-
-### 4.3 主线 C：StarVLA + AttnRes
-
-目标：
-
-- 在真实 VLA 骨干中验证 AttnRes 路由与跳块
-- 后续重点放在 rollout 成功率、时延与 skip 策略比较
+**Plan:**
+- **Drop synthetic data entirely** from the main paper. Move to appendix as "controlled experiment demonstrating mechanism" at most.
+- **All main results on natural language** (SlimPajama/C4)
+- For input-dependent routing analysis on natural language:
+  - Stratify by perplexity: compute per-sequence PPL, bin into easy/medium/hard, analyze routing
+  - Stratify by domain: use RedPajama metadata (Wikipedia vs. code vs. books vs. CommonCrawl)
+  - Stratify by sequence length complexity: measure effective depth on short factual sentences vs. long reasoning chains
+  - Use GSM8K with difficulty grading (by number of steps) to show depth correlates with reasoning complexity
 
 ---
 
-## 5. ReSkip 训练方案
+## Issue 3: VLA Table Shows Identical Results (Critical)
 
-### 5.1 配置文件
+**Problem:** All skip modes produce exactly the same L1 errors. The thresholds are too conservative.
 
-- [reskip_transformer_340M.json](/home/user01/Minko/reskip2/reskip/flame/configs/reskip_transformer_340M.json)
+**Plan:**
 
-### 5.2 推荐正式训练命令
+### A. Push thresholds until modes diverge
+- Sweep vision_skip_threshold: [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+- Sweep action_skip_threshold: [0.001, 0.005, 0.01, 0.02, 0.05]
+- Keep language threshold fixed at moderate value
+- The table should show: at aggressive thresholds, uniform skipping hurts action prediction while modality-aware preserves it (because it protects action tokens)
 
-下面这条命令是当前建议的标准模板。
+### B. Report the operating regime
+- Show "blocks actually skipped" per mode (currently all modes keep 5/6 blocks)
+- Plot L1 error vs. effective FLOPs for each mode as separate curves
+- The modality-aware curve should be a better Pareto frontier than uniform
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash train.sh \
-    --model.config /home/user01/Minko/reskip2/reskip/flame/configs/reskip_transformer_340M.json \
-    --model.tokenizer_path /home/user01/Minko/models/gla-tokenizer \
-    --optimizer.name AdamW \
-    --optimizer.eps 1e-15 \
-    --optimizer.lr 0.0007 \
-    --lr_scheduler.warmup_steps 3500 \
-    --lr_scheduler.lr_min 0.00007 \
-    --lr_scheduler.decay_type cosine \
-    --lr_scheduler.decay_ratio 0.2 \
-    --training.batch_size 1 \
-    --training.context_len 2048 \
-    --training.gradient_accumulation_steps 6 \
-    --training.steps 35000 \
-    --training.skip_nan_inf \
-    --training.seq_len 32768 \
-    --training.dataset /home/user01/Minko/datasets/fineweb_edu_100BT \
-    --training.dataset_split train \
-    --training.seed 0 \
-    --checkpoint.interval 5000 \
-    --metrics.log_freq 1 \
-    --checkpoint.folder /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer_340M/checkpoint \
-    --training.num_workers 8 \
-    --training.prefetch_factor 2 \
-    --checkpoint.export_dtype bfloat16 \
-    --checkpoint.enable_checkpoint \
-    --checkpoint.load_step -1 \
-    --training.data_parallel_shard_degree 6 \
-    --activation_checkpoint.mode none \
-    --training.streaming \
-    --training.varlen \
-    --metrics.enable_wandb
-```
-
-### 5.3 说明
-
-- 当前主线更推荐 `6 卡`
-- `seq_len=32768`
-- `context_len=2048`
-- `streaming + varlen`
-- `checkpoint.interval=5000`
+### C. Investigate the "zero contribution" case
+- If blocks truly contribute zero: that's actually interesting
+- Analyze: is this because the model never learned to use those blocks, or because it learned to route around them?
+- Compare: train same model WITHOUT AttnRes (standard residuals), then try removing the same blocks. If PPL degrades, it means AttnRes is learning to make blocks skippable.
 
 ---
 
-## 6. ReLoop 训练方案
+## Issue 4: VLA Architecture is Toy-Scale (Critical)
 
-### 6.1 配置文件
+**Problem:** No real VLA backbone, no standard benchmark, no baselines.
 
-- [reloop_transformer_340M.json](/home/user01/Minko/reskip2/reskip/flame/configs/reloop_transformer_340M.json)
+**Plan:**
 
-### 6.2 推荐训练命令
+### Phase 1: Integrate with StarVLA
+The user's existing StarVLA codebase at `~/Documents/starVLA/` has all the infrastructure:
+- Replace standard residual connections in the StarVLA backbone with BlockAttnRes
+- Keep the existing vision encoder (Qwen2.5-VL ViT) and action heads (flow-matching)
+- Minimal code changes: modify the backbone's forward pass to use AttnRes
 
-与 `ReSkip` 相同，只需要替换配置文件：
+### Phase 2: LIBERO Benchmark
+- **Benchmark:** LIBERO-Long (most challenging, 10 tasks, 50 demos each)
+- **Metrics:** Task success rate (%), average actions to completion
+- **Baselines:**
+  1. StarVLA (standard residuals, full depth)
+  2. StarVLA + AttnRes (full depth, no skipping) — shows AttnRes doesn't hurt
+  3. StarVLA + AttnRes + uniform skip — baseline skip method
+  4. StarVLA + AttnRes + modality-aware skip (ReSkip-VLA) — our method
+  5. OpenVLA (if compute allows) — external baseline
+- **Key measurement:** Success rate vs. inference latency curve
+  - At what speedup does uniform skip start failing while modality-aware maintains?
+  - This is the money figure for the VLA section
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash train.sh \
-    --model.config /home/user01/Minko/reskip2/reskip/flame/configs/reloop_transformer_340M.json \
-    --model.tokenizer_path /home/user01/Minko/models/gla-tokenizer \
-    --optimizer.name AdamW \
-    --optimizer.eps 1e-15 \
-    --optimizer.lr 0.0007 \
-    --lr_scheduler.warmup_steps 3500 \
-    --lr_scheduler.lr_min 0.00007 \
-    --lr_scheduler.decay_type cosine \
-    --lr_scheduler.decay_ratio 0.2 \
-    --training.batch_size 1 \
-    --training.context_len 2048 \
-    --training.gradient_accumulation_steps 6 \
-    --training.steps 35000 \
-    --training.skip_nan_inf \
-    --training.seq_len 32768 \
-    --training.dataset /home/user01/Minko/datasets/fineweb_edu_100BT \
-    --training.dataset_split train \
-    --training.seed 0 \
-    --checkpoint.interval 5000 \
-    --metrics.log_freq 1 \
-    --checkpoint.folder /home/user01/Minko/reskip2/reskip/flame/saves/reloop_transformer_340M/checkpoint \
-    --training.num_workers 8 \
-    --training.prefetch_factor 2 \
-    --checkpoint.export_dtype bfloat16 \
-    --checkpoint.enable_checkpoint \
-    --checkpoint.load_step -1 \
-    --training.data_parallel_shard_degree 6 \
-    --activation_checkpoint.mode none \
-    --training.streaming \
-    --training.varlen \
-    --metrics.enable_wandb
-```
+### Phase 3: SimplerEnv (Optional, strengthens paper)
+- Simulated manipulation benchmark with Google Robot embodiment
+- Can run many trials quickly (no real robot needed)
+- Supports multiple difficulty levels
 
-### 6.3 当前配置内的额外项
-
-`ReLoop` 目前已经支持：
-
-- halting / depth regularization 相关配置
-- 共享块循环
-- routing 统计
+### Implementation Changes
+1. Add `src/starvla_integration.py` that patches StarVLA's backbone with AttnRes
+2. Modify `benchmark_vla.py` to load real LIBERO datasets
+3. Add rollout evaluation loop (not just L1 prediction, but actual closed-loop success)
 
 ---
 
-## 7. checkpoint 导出与一致性检查
+## Issue 5: ReLoop Results Too Thin (Major)
 
-### 7.1 训练结束后的导出
+**Problem:** Only 2 configurations compared, nearly identical PPL.
 
-`train.sh` 会自动把最后一步 checkpoint 导出成 HF 格式。
+**Plan:**
 
-导出的典型内容包括：
+### A. K x M Ablation Grid
+| K (unique blocks) | M (max loops) | Effective depth | Unique params | PPL |
+|---|---|---|---|---|
+| 2 | 6 | 12 | ~90M | ? |
+| 3 | 4 | 12 | ~130M | ? |
+| 4 | 3 | 12 | ~175M | ? |
+| 6 | 2 | 12 | ~260M | ? |
+| 8 | 2 | 16 | ~350M (full) | baseline |
 
-- `model.safetensors`
-- `config.json`
-- `tokenizer.json`
+All at matched total effective depth, showing the tradeoff between parameter efficiency and quality.
 
-### 7.2 单卡离线 loss 检查
+### B. Universal Transformer Comparison
+- Implement naive UT (same weights, no AttnRes, standard residuals) at K=4, M=3
+- Show that AttnRes routing is what makes weight sharing work
+- Expected: UT degrades significantly because it can't differentiate loop iterations; ReLoop maintains quality because pseudo-queries are position-specific
 
-脚本：
+### C. Depth Distribution Histograms
+- On natural language data, plot histogram of effective depth per sequence
+- Show that depth varies meaningfully (not all sequences use the same depth)
+- Stratify by: sequence length, domain, perplexity
+- This is the key evidence that adaptive computation is happening
 
-- [compare_fsdp_loss.py](/home/user01/Minko/reskip2/reskip/experiments/compare_fsdp_loss.py)
-
-用途：
-
-- 对 raw DCP checkpoint 做单卡或指定 rank 的离线前向
-- 检查 checkpoint loss 是否跟训练趋势一致
-
-示例：
-
-```bash
-CUDA_VISIBLE_DEVICES=6 torchrun --nproc_per_node=1 \
-  experiments/compare_fsdp_loss.py \
-  --checkpoint_dir /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer_340M/checkpoint \
-  --config_path /home/user01/Minko/reskip2/reskip/flame/configs/reskip_transformer_340M.json \
-  --tokenizer_path /home/user01/Minko/models/gla-tokenizer \
-  --dataset_path /home/user01/Minko/datasets/fineweb_edu_100BT \
-  --step 5000 \
-  --seq_len 32768 \
-  --context_len 2048 \
-  --data_parallel_degree 6 \
-  --data_parallel_rank 0
-```
-
-### 7.3 推荐检查节奏
-
-每次正式训练建议在以下 checkpoint 做检查：
-
-- `step 200`
-- `step 1000`
-- `step 5000`
-- `step 10000`
-
-检查内容：
-
-- 训练日志 loss
-- raw checkpoint 离线 loss
-- HF 导出后 loss
-- `lm-eval` 小样本 smoke test
+### D. Per-Iteration Routing Analysis
+- For K=4, M=3: show what the model learns in each iteration
+- Iteration 1: expected to capture syntax/local patterns
+- Iteration 2: expected to capture semantics/longer-range dependencies
+- Iteration 3: expected to be used only for hard inputs (and skipped for easy ones)
+- Visualize with attention weight heatmaps per iteration
 
 ---
 
-## 8. lm-eval 评测
+## Issue 6: Missing Baselines (Critical)
 
-脚本：
+**Problem:** No comparison to any existing method.
 
-- [flame_lm_eval.py](/home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py)
+**Plan:**
 
-示例：
+### Methods to Compare Against
+All on the same 350M model, same data, same compute budget:
 
-```bash
-CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
-  --model_path /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer_340M \
-  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
-  --batch_size auto \
-  --device cuda:0 \
-  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M
-```
+1. **Standard Transformer** (no AttnRes, no skipping) — upper bound on quality
+2. **Static Pruning (Gromov et al.)** — prune lowest-BI layers post-training
+   - Implementation: train standard model, compute Block Influence (BI) scores, remove N layers, evaluate
+   - This is the simplest baseline and readily implementable
+3. **CALM (Confident Adaptive Language Modeling)** — early exit with classifiers
+   - Implementation: add MLP classifier at each layer, train with auxiliary confidence loss
+   - Compare Pareto curves (quality vs. FLOPs)
+4. **Mixture-of-Depths (MoD)** — per-token routing with capacity constraint
+   - Implementation: add router at each layer, top-k token selection
+   - Most relevant comparison: also learns routing, but requires auxiliary losses
+5. **LayerSkip** — early exit + self-speculative decoding
+   - Can cite numbers from their paper at matched scale if reimplementation is too costly
 
-建议：
+### Comparison Table Format
+| Method | PPL | FLOPs (%) | Params | Auxiliary Components | Training Cost |
+|--------|-----|-----------|--------|---------------------|---------------|
 
-- 先做小样本 smoke test
-- 确认训练态 / checkpoint 态一致后，再跑完整任务集
+Key selling points to demonstrate:
+- ReSkip matches or beats CALM/MoD quality at same FLOPs without auxiliary losses
+- ReSkip's routing signal is free (no additional parameters or training objectives)
+- ReSkip's Pareto curve is at least competitive, ideally dominant
 
----
-
-## 9. StarVLA + AttnRes 实验线
-
-### 9.1 目标
-
-把 AttnRes / skip 机制迁移到真实 VLA 骨干，比较：
-
-- full depth
-- uniform skip
-- modality-aware skip
-
-### 9.2 主要路径
-
-- [src/starvla_integration.py](/home/user01/Minko/reskip2/reskip/src/starvla_integration.py)
-- [starVLA](/home/user01/Minko/reskip2/reskip/starVLA)
-
-### 9.3 推荐顺序
-
-1. 先训 full-depth AttnRes backbone
-2. 跑 `skip_mode=none` rollout
-3. 跑 `skip_mode=uniform`
-4. 跑 `skip_mode=modality_aware`
-5. 比较 success rate、effective block ratio 与时延
+### Practical Implementation Priority
+1. **Static Pruning** — easiest, just train a standard model and prune (1 day)
+2. **Standard Transformer** — already have this, just remove AttnRes (0.5 days)
+3. **CALM** — moderate effort, add exit classifiers (~3 days)
+4. **MoD** — significant effort, per-token routing changes architecture (~1 week)
+5. **LayerSkip** — cite from paper, don't reimplement unless needed
 
 ---
 
-## 10. 实验记录规范
+## Issue 7: Pareto Curve Too Sparse (Moderate)
 
-建议每条正式实验至少记录以下信息：
+**Problem:** Only 5 threshold values, sharp transition between "fine" and "catastrophic."
 
-- 模型配置文件
-- 训练命令全文
-- 训练起止时间
-- 使用 GPU 编号
-- checkpoint 路径
-- 离线 loss 检查结果
-- `lm-eval` 结果
-- 是否为正式 run 或 smoke run
+**Plan:**
 
-推荐保存位置：
+### A. Dense Threshold Sweep
+- Sweep 20+ thresholds: [0, 0.001, 0.002, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50]
+- With 8 blocks (instead of 6), there are more possible operating points
 
-- 正式结果写入 `PLAN.md` 的对应章节
-- 临时说明写入 [1232.txt](/home/user01/Minko/reskip2/reskip/1232.txt)
+### B. Per-Block Threshold
+- Instead of a single global ε, sweep individual block thresholds
+- This reveals which specific blocks are dispensable at what cost
+- Results in a much smoother Pareto frontier
+
+### C. Calibration-Based Skipping
+- Collect α statistics over a calibration set (1000 sequences)
+- For each block, compute percentile importance scores
+- Skip based on percentile (e.g., "skip if this block's importance is below its 10th percentile")
+- This is more robust than a fixed threshold
+
+### D. Compare Pareto Curves Across Methods
+- Plot ReSkip, static pruning, CALM on the same PPL vs. FLOPs axes
+- This is the most compelling visualization in the paper
 
 ---
 
-## 11. 当前结论
+## Additional Experiment: EVA/Physics Connection (Strengthens Paper)
 
-### 11.1 已确认
+**Problem:** Section 6 is purely speculative.
 
-- `ReSkip` 当前训练链路可正常训练
-- checkpoint 保存态与训练态不一致的问题已修复
-- 新训练生成的 checkpoint 可用于离线前向与 HF 导出
+**Plan:**
+- On LIBERO tasks, compare AttnRes depth utilization:
+  - Simple pick-and-place (rigid objects) vs. cloth folding or deformable manipulation
+  - If depth patterns differ, this supports the physics-iterative-inference interpretation
+- Even one figure showing "rigid objects use depth 4.2 avg, deformable use depth 6.8 avg" would be powerful
+- Can also correlate with BiX-VLA's left/right arm depth patterns if bimanual data is available
 
-### 11.2 不再建议
+---
 
-- 不再使用旧的异常 checkpoint 作为结果依据
-- 不再继续维护根目录多份重复 playbook
-- 不再继续使用单独的 `baseflame`
+## Timeline (Aggressive, for NeurIPS 2026 deadline)
 
-### 11.3 下一步建议
+### Week 1-2: Infrastructure
+- [ ] Multi-GPU training support (DDP)
+- [ ] SlimPajama data pipeline with streaming
+- [ ] RoPE integration
+- [ ] lm-eval-harness integration
+- [ ] StarVLA AttnRes integration
 
-优先级最高的是：
+### Week 3-4: Main LM Experiments
+- [ ] Train 350M standard transformer baseline on SlimPajama
+- [ ] Train 350M AttnRes model
+- [ ] Static pruning baseline (from standard model)
+- [ ] CALM baseline
+- [ ] Full skip threshold sweep (20+ points)
+- [ ] Input-dependent routing analysis on natural language
 
-1. 启动新的正式 `ReSkip 340M` 长训
-2. 在固定 checkpoint 做一致性检查
-3. 再进行完整 `lm-eval`
-4. 然后推进 `ReLoop` 与 `StarVLA` 线
+### Week 5-6: ReLoop + Baselines
+- [ ] K x M ablation grid (at 350M scale)
+- [ ] Vanilla Universal Transformer comparison
+- [ ] Depth distribution histograms
+- [ ] MoD comparison (if time allows)
+
+### Week 7-8: VLA Experiments
+- [ ] StarVLA + AttnRes integration + LIBERO training
+- [ ] LIBERO-Long benchmark (all baselines)
+- [ ] Modality-aware vs. uniform skip divergence experiments
+- [ ] Latency profiling on real hardware
+
+### Week 9-10: Paper Revision
+- [ ] Replace all tables with real results
+- [ ] Dense Pareto curves
+- [ ] Per-domain/difficulty routing analysis figures
+- [ ] Scaling law analysis (if additional compute available)
+
+---
+
+## Compute Requirements Estimate
+
+| Experiment | GPU-Hours | Hardware |
+|-----------|-----------|----------|
+| 350M standard baseline | ~100 | 4x A100 |
+| 350M AttnRes model | ~100 | 4x A100 |
+| 350M ReLoop (K x M grid, 5 configs) | ~400 | 4x A100 |
+| CALM baseline | ~120 | 4x A100 |
+| Static pruning (eval only) | ~10 | 1x A100 |
+| StarVLA + AttnRes (LIBERO) | ~200 | 4x A100 |
+| Scaling law suite (125M, 1.3B) | ~800 | 8x A100 |
+| **Total (minimum for main results)** | **~930** | |
+| **Total (with scaling laws)** | **~1730** | |
+
+At ~$2/GPU-hour (cloud), minimum cost ~$1,860, full suite ~$3,460.
+
+---
+
+## Key Code Changes Needed
+
+### `src/adaptive_transformer.py`
+- Add RoPE support
+- Add gradient checkpointing for large models
+- Add DDP wrapper
+
+### `src/data.py`
+- Add SlimPajama/C4 streaming dataloader
+- Add lm-eval-harness integration for downstream benchmarks
+
+### `src/baselines/`
+- `static_pruning.py` — Gromov et al.'s Block Influence method
+- `calm.py` — CALM early exit with auxiliary classifiers
+- `mod.py` — Mixture-of-Depths per-token routing
+- `universal_transformer.py` — Vanilla UT without AttnRes
+
+### `src/starvla_integration.py`
+- Patch StarVLA backbone with BlockAttnRes
+- Add LIBERO dataset loader and rollout evaluation
+
+### `experiments/train_lm.py`
+- Multi-GPU DDP support
+- Gradient accumulation
+- Streaming data
+- lm-eval integration at each epoch
+
+### `experiments/benchmark_vla.py`
+- LIBERO rollout evaluation (closed-loop, not just L1)
+- Real vision encoder integration
+- Latency profiling on real hardware
