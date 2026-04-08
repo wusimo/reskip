@@ -137,11 +137,19 @@ def collect_completed_blocks(
 @dataclass
 class ReSkipBaseModelOutputWithPast(BaseModelOutputWithPast):
     routing_info: dict[str, Any] | None = None
+    ponder_cost_tensor: torch.Tensor | None = None
+    expected_depth_tensor: torch.Tensor | None = None
+    exit_kl_tensor: torch.Tensor | None = None
+    exit_entropy_tensor: torch.Tensor | None = None
 
 
 @dataclass
 class ReSkipCausalLMOutputWithPast(CausalLMOutputWithPast):
     routing_info: dict[str, Any] | None = None
+    ponder_cost_tensor: torch.Tensor | None = None
+    expected_depth_tensor: torch.Tensor | None = None
+    exit_kl_tensor: torch.Tensor | None = None
+    exit_entropy_tensor: torch.Tensor | None = None
 
 
 class BlockAttentionResidual(nn.Module):
@@ -158,7 +166,9 @@ class BlockAttentionResidual(nn.Module):
         )
 
     def reset_parameters(self, initializer_range: float) -> None:
-        nn.init.zeros_(self.w_query)
+        # Match the paper's pseudo-query initialization: near-uniform routing
+        # with small random asymmetry so routers can specialize early.
+        nn.init.normal_(self.w_query, mean=0.0, std=initializer_range)
         if getattr(self.key_norm, "weight", None) is not None:
             nn.init.ones_(self.key_norm.weight)
 
@@ -385,6 +395,10 @@ class ReSkipTransformerPreTrainedModel(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+            if getattr(module, "_is_loop_halt_head", False):
+                target_bias = self._compute_initial_halt_bias()
+                nn.init.zeros_(module.weight)
+                nn.init.constant_(module.bias, target_bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, BlockAttentionResidual):
@@ -402,6 +416,11 @@ class ReSkipTransformerPreTrainedModel(PreTrainedModel):
                 nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
                 with torch.no_grad():
                     weight /= math.sqrt(num_residuals_per_layer * self.config.num_hidden_layers)
+
+    def _compute_initial_halt_bias(self) -> float:
+        target_prob = self.config.halt_threshold / (self.config.attn_res_num_blocks + 1)
+        target_prob = min(max(target_prob, 1e-4), 1.0 - 1e-4)
+        return math.log(target_prob / (1.0 - target_prob))
 
 
 class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
@@ -430,12 +449,31 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         )
         self.halt_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.halt_head = nn.Linear(config.hidden_size, 1, bias=True)
+        self.halt_head._is_loop_halt_head = True
         self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.gradient_checkpointing = False
         self._skip_keep_mask = self._normalize_keep_mask(config.skip_keep_mask)
         self._last_routing_info: dict[str, Any] | None = None
 
         self.post_init()
+        self._initialize_halt_head()
+        self._freeze_unused_looping_params()
+
+    def _initialize_halt_head(self) -> None:
+        if not self.config.enable_looping:
+            return
+
+        # Start close to full depth so halting learns to shorten computation,
+        # instead of collapsing to shallow execution from random initialization.
+        target_bias = self._compute_initial_halt_bias()
+        nn.init.zeros_(self.halt_head.weight)
+        nn.init.constant_(self.halt_head.bias, target_bias)
+
+    def _freeze_unused_looping_params(self) -> None:
+        if self.config.enable_looping:
+            return
+        for module in (self.halt_norm, self.halt_head):
+            module.requires_grad_(False)
 
     def _build_block_schedule(self) -> list[int]:
         if not self.config.enable_looping:
@@ -557,9 +595,20 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         execution_trace: list[dict[str, Any]],
         keep_mask: list[bool] | None,
         halt_probabilities: list[float] | None,
-        ponder_cost: float,
+        ponder_cost: torch.Tensor,
+        expected_depth: torch.Tensor | None,
     ) -> dict[str, Any]:
-        importance_matrix, block_importance, self_importance = self._aggregate_routing(routing_events)
+        if routing_events:
+            importance_matrix, block_importance, self_importance = self._aggregate_routing(routing_events)
+        else:
+            importance_matrix = torch.zeros(
+                self.num_block_positions,
+                self.num_block_positions,
+                device=self.embeddings.weight.device,
+                dtype=torch.float32,
+            )
+            block_importance = [0.0] * self.num_block_positions
+            self_importance = [0.0] * self.num_block_positions
         num_blocks_executed = sum(entry["executed_fraction"] for entry in execution_trace)
         return {
             "importance_matrix": importance_matrix,
@@ -571,8 +620,12 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             "execution_trace": execution_trace,
             "num_blocks_executed": float(num_blocks_executed),
             "effective_depth": float(num_blocks_executed),
+            "expected_depth": (
+                float(expected_depth.detach().item()) if expected_depth is not None else float(num_blocks_executed)
+            ),
             "halt_probabilities": halt_probabilities,
-            "ponder_cost": float(ponder_cost),
+            "ponder_cost": float(ponder_cost.detach().item()),
+            "ponder_cost_tensor": ponder_cost,
         }
 
     def get_input_embeddings(self):
@@ -594,6 +647,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         return_routing_info: bool = False,
         enable_skipping: bool | None = None,
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
+        min_halt_depth: int | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple | ReSkipBaseModelOutputWithPast:
         if output_attentions:
@@ -624,6 +678,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             inputs_embeds = self.embeddings(input_ids)
 
         collect_routing_info = return_routing_info
+        collect_routing_weights = collect_routing_info and not self.training
         all_hidden_states = () if output_hidden_states else None
         next_cache = past_key_values
         keep_mask = self._resolve_keep_mask(enable_skipping, skip_keep_mask)
@@ -636,8 +691,14 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
 
         batch_size = hidden_states.shape[0]
         halt_cumulative = hidden_states.new_zeros(batch_size)
-        halt_probabilities: list[float] | None = [] if self.config.enable_looping else None
-        ponder_cost = 0.0
+        soft_remaining = hidden_states.new_ones(batch_size) if self.config.enable_looping and self.training else None
+        halt_probabilities: list[float] | None = (
+            [] if self.config.enable_looping and collect_routing_info and not self.training else None
+        )
+        ponder_cost = hidden_states.new_zeros(())
+        expected_depth = hidden_states.new_zeros(()) if self.config.enable_looping else None
+        exit_distribution_terms: list[torch.Tensor] | None = [] if self.config.enable_looping and self.training else None
+        min_halt_depth = None if min_halt_depth is None else max(1, min(int(min_halt_depth), self.num_block_positions))
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
@@ -648,11 +709,33 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             active_mask = None
+            active_gate = None
             executed_fraction = 0.0
+            expected_fraction = None
+            soft_fraction_value = None
             if self.config.enable_looping:
-                active_mask = halt_cumulative < self.config.halt_threshold
-                executed_fraction = float(active_mask.float().mean().item())
-                if not torch.any(active_mask):
+                halt_allowed = min_halt_depth is None or (position + 1) >= min_halt_depth
+                if halt_allowed:
+                    active_mask = halt_cumulative < self.config.halt_threshold
+                    executed_fraction = float(active_mask.float().mean().item())
+                    if self.training:
+                        if soft_remaining is None:
+                            raise RuntimeError("Expected soft halting state during training.")
+                        active_soft = soft_remaining
+                        active_gate = active_soft + (active_mask.to(hidden_states.dtype) - active_soft).detach()
+                        soft_fraction_value = active_soft.mean()
+                        expected_fraction = executed_fraction + soft_fraction_value - soft_fraction_value.detach()
+                    else:
+                        active_gate = active_mask.to(hidden_states.dtype)
+                        soft_fraction_value = active_gate.mean()
+                        expected_fraction = soft_fraction_value
+                else:
+                    active_mask = torch.ones_like(halt_cumulative, dtype=torch.bool)
+                    executed_fraction = 1.0
+                    active_gate = hidden_states.new_ones(batch_size)
+                    soft_fraction_value = active_gate.mean()
+                    expected_fraction = soft_fraction_value
+                if not torch.any(active_mask) and not self.training:
                     if collect_routing_info:
                         execution_trace.append(
                             {
@@ -666,6 +749,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                     continue
             else:
                 executed_fraction = 1.0
+                expected_fraction = hidden_states.new_tensor(1.0)
 
             should_execute = True if keep_mask is None else keep_mask[position]
             if not should_execute:
@@ -688,11 +772,11 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 attention_mask=attention_mask,
                 past_key_values=next_cache,
                 use_cache=use_cache,
-                active_mask=active_mask,
-                return_routing_weights=collect_routing_info,
+                active_mask=active_gate,
+                return_routing_weights=collect_routing_weights,
                 **kwargs,
             )
-            if collect_routing_info:
+            if collect_routing_weights:
                 for source_ids, attn_weights in attn_records:
                     self._record_routing(routing_events, position, "attn", source_ids, attn_weights)
                 for source_ids, mlp_weights in mlp_records:
@@ -703,14 +787,27 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             if self.config.enable_looping:
                 pooled = self._pool_hidden(self.halt_norm(hidden_states), attention_mask)
                 block_halt = torch.sigmoid(self.halt_head(pooled)).squeeze(-1)
-                if active_mask is not None:
-                    block_halt = block_halt * active_mask.to(block_halt.dtype)
-                    halt_cumulative = torch.clamp(halt_cumulative + block_halt, max=1.0)
-                else:
-                    halt_cumulative = torch.clamp(halt_cumulative + block_halt, max=1.0)
-                halt_probability_mean = float(block_halt.mean().item())
-                halt_probabilities.append(halt_probability_mean)
-                ponder_cost += executed_fraction
+                if min_halt_depth is not None and (position + 1) < min_halt_depth:
+                    block_halt = torch.zeros_like(block_halt)
+                hard_block_halt = block_halt if active_mask is None else block_halt * active_mask.to(block_halt.dtype)
+                halt_cumulative = torch.clamp(halt_cumulative + hard_block_halt, max=1.0)
+                if soft_remaining is not None:
+                    if position == self.num_block_positions - 1:
+                        soft_halt = soft_remaining
+                        soft_remaining = torch.zeros_like(soft_remaining)
+                    else:
+                        soft_halt = torch.minimum(soft_remaining, block_halt)
+                        soft_remaining = torch.clamp(soft_remaining - soft_halt, min=0.0)
+                    if exit_distribution_terms is not None:
+                        exit_distribution_terms.append(soft_halt.mean())
+                if halt_probabilities is not None:
+                    halt_probability_mean = float(hard_block_halt.float().mean().detach().cpu())
+                    halt_probabilities.append(halt_probability_mean)
+                if expected_fraction is None:
+                    raise RuntimeError("Expected a differentiable execution fraction in looping mode.")
+                ponder_cost = ponder_cost + expected_fraction
+                if expected_depth is not None and soft_fraction_value is not None:
+                    expected_depth = expected_depth + soft_fraction_value
 
             if collect_routing_info:
                 execution_trace.append(
@@ -728,6 +825,15 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         routing_info = None
+        exit_kl_tensor = None
+        exit_entropy_tensor = None
+        if exit_distribution_terms:
+            exit_distribution = torch.stack(exit_distribution_terms)
+            exit_distribution = exit_distribution / exit_distribution.sum().clamp_min(1e-8)
+            exit_log_probs = torch.log(exit_distribution.clamp_min(1e-8))
+            exit_entropy_tensor = -(exit_distribution * exit_log_probs).sum()
+            uniform_log_prob = -math.log(exit_distribution.numel())
+            exit_kl_tensor = (exit_distribution * (exit_log_probs - uniform_log_prob)).sum()
         if collect_routing_info:
             routing_info = self._build_routing_info(
                 routing_events=routing_events,
@@ -735,11 +841,20 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 keep_mask=keep_mask,
                 halt_probabilities=halt_probabilities,
                 ponder_cost=ponder_cost,
+                expected_depth=expected_depth,
             )
         self._last_routing_info = routing_info
 
         if not return_dict:
-            output = (hidden_states, next_cache, all_hidden_states, None, routing_info if return_routing_info else None)
+            output = (
+                hidden_states,
+                next_cache,
+                all_hidden_states,
+                None,
+                routing_info if return_routing_info else None,
+                ponder_cost if self.config.enable_looping else None,
+                expected_depth if self.config.enable_looping else None,
+            )
             return tuple(item for item in output if item is not None)
 
         return ReSkipBaseModelOutputWithPast(
@@ -748,6 +863,10 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=None,
             routing_info=routing_info if return_routing_info else None,
+            ponder_cost_tensor=ponder_cost if self.config.enable_looping else None,
+            expected_depth_tensor=expected_depth if self.config.enable_looping else None,
+            exit_kl_tensor=exit_kl_tensor,
+            exit_entropy_tensor=exit_entropy_tensor,
         )
 
     @torch.no_grad()
@@ -842,6 +961,8 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
         return_routing_info: bool = False,
         enable_skipping: bool | None = None,
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
+        ponder_loss_weight_override: float | None = None,
+        min_halt_depth: int | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple | ReSkipCausalLMOutputWithPast:
         if labels is not None and use_cache is None:
@@ -850,10 +971,6 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        need_routing_info = return_routing_info or (
-            labels is not None and self.config.enable_looping and self.config.ponder_loss_weight > 0
-        )
-
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -863,9 +980,10 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            return_routing_info=need_routing_info,
+            return_routing_info=return_routing_info,
             enable_skipping=enable_skipping,
             skip_keep_mask=skip_keep_mask,
+            min_halt_depth=min_halt_depth,
             **kwargs,
         )
 
@@ -898,9 +1016,15 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
 
-            routing_info = getattr(outputs, "routing_info", None)
-            if routing_info is not None and self.config.enable_looping and self.config.ponder_loss_weight > 0:
-                loss = loss + self.config.ponder_loss_weight * hidden_states.new_tensor(routing_info["ponder_cost"])
+            ponder_loss_weight = (
+                self.config.ponder_loss_weight
+                if ponder_loss_weight_override is None
+                else ponder_loss_weight_override
+            )
+            if self.config.enable_looping and ponder_loss_weight > 0:
+                ponder_cost_tensor = getattr(outputs, "ponder_cost_tensor", None)
+                if ponder_cost_tensor is not None:
+                    loss = loss + ponder_loss_weight * ponder_cost_tensor
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -913,4 +1037,8 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             routing_info=outputs.routing_info if return_routing_info else None,
+            ponder_cost_tensor=getattr(outputs, "ponder_cost_tensor", None),
+            expected_depth_tensor=getattr(outputs, "expected_depth_tensor", None),
+            exit_kl_tensor=getattr(outputs, "exit_kl_tensor", None),
+            exit_entropy_tensor=getattr(outputs, "exit_entropy_tensor", None),
         )

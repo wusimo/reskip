@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import math
 import os
 import time
 from datetime import timedelta
@@ -14,6 +15,8 @@ import torch
 from fla.modules.fused_linear_cross_entropy import FusedLinearCrossEntropyLoss
 from fla.ops.utils import prepare_position_ids
 from torch.distributed.elastic.multiprocessing.errors import record
+from torch.distributed.checkpoint.state_dict import get_model_state_dict
+from torchtitan.components import checkpoint as tt_checkpoint
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.ft import FTParallelDims, init_ft_manager
 from torchtitan.components.loss import build_cross_entropy_loss
@@ -36,6 +39,18 @@ from flame.data import build_dataloader, build_dataset
 from flame.models.parallelize_fla import parallelize_fla
 from flame.models.pipeline_fla import pipeline_fla
 from flame.tools.utils import get_nparams_and_flops
+
+
+def _refresh_model_wrapper_state_dict(self):
+    # TorchTitan caches the model state dict at construction time. Refresh it on
+    # every save so periodic checkpoints reflect the live post-step weights.
+    self.cache_state_dict = {
+        k: v for sd in map(get_model_state_dict, self.model) for k, v in sd.items()
+    }
+    return self.cache_state_dict
+
+
+tt_checkpoint.ModelWrapper.state_dict = _refresh_model_wrapper_state_dict
 
 
 def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
@@ -183,6 +198,7 @@ def main(job_config: JobConfig):
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
         snapshot_every_n_steps=job_config.checkpoint.interval,
+        seed=job_config.training.seed,
     )
 
     logger.info(f"Loading model config from {job_config.model.config}")
@@ -359,7 +375,6 @@ def main(job_config: JobConfig):
         job_config.training.mixed_precision_param,
         device_type,
     )
-
     # variables used to keep info for metrics logging
     device_memory_monitor.reset_peak_stats()
 
@@ -412,6 +427,64 @@ def main(job_config: JobConfig):
             optimizers.zero_grad()
 
             losses = []
+            routing_metric_values: dict[str, list[float]] = {}
+            collect_routing_metrics = (
+                model_config.model_type == "reskip_transformer"
+                and getattr(model_config, "enable_looping", False)
+                and metric_logger.should_log(train_state.step)
+            )
+            depth_regularizer_weight = None
+            halt_kl_weight = None
+            target_depth = None
+            min_halt_depth = None
+            if model_config.model_type == "reskip_transformer" and getattr(model_config, "enable_looping", False):
+                max_depth = float(model_config.attn_res_num_blocks)
+                base_halt_kl_weight = float(getattr(model_config, "halt_kl_weight", 0.0))
+                halt_kl_min_weight = float(getattr(model_config, "halt_kl_min_weight", 0.0))
+                halt_kl_decay_steps = int(getattr(model_config, "halt_kl_decay_steps", 0))
+                if base_halt_kl_weight > 0:
+                    if halt_kl_decay_steps > 0:
+                        halt_kl_progress = min(train_state.step / halt_kl_decay_steps, 1.0)
+                        halt_kl_weight = base_halt_kl_weight + (
+                            halt_kl_min_weight - base_halt_kl_weight
+                        ) * halt_kl_progress
+                    else:
+                        halt_kl_weight = halt_kl_min_weight if halt_kl_min_weight > 0 else base_halt_kl_weight
+                else:
+                    halt_kl_weight = 0.0
+
+                base_ponder_weight = float(getattr(model_config, "ponder_loss_weight", 0.0))
+                ponder_warmup_steps = int(getattr(model_config, "ponder_loss_warmup_steps", 0))
+                ponder_budget_start_step = int(getattr(model_config, "ponder_budget_start_step", 0))
+                target_depth_ratio = float(getattr(model_config, "ponder_target_depth_ratio", 1.0))
+                target_depth_steps = int(getattr(model_config, "ponder_target_steps", 0))
+                if base_ponder_weight > 0 and train_state.step > ponder_budget_start_step:
+                    budget_step = train_state.step - ponder_budget_start_step
+                    warmup_progress = 1.0
+                    if ponder_warmup_steps > 0:
+                        warmup_progress = min(budget_step / ponder_warmup_steps, 1.0)
+                    depth_regularizer_weight = base_ponder_weight * warmup_progress
+                else:
+                    depth_regularizer_weight = 0.0
+                if train_state.step <= ponder_budget_start_step:
+                    target_depth = max_depth
+                else:
+                    target_depth_progress = 1.0
+                    if target_depth_steps > 0:
+                        target_depth_progress = min(
+                            (train_state.step - ponder_budget_start_step) / target_depth_steps, 1.0
+                        )
+                    target_depth = max_depth * (
+                        1.0 - (1.0 - target_depth_ratio) * target_depth_progress
+                    )
+                min_halt_depth = max(1, math.floor(target_depth))
+                if collect_routing_metrics:
+                    routing_metric_values.setdefault("model/halt_kl_weight", []).append(halt_kl_weight)
+                    routing_metric_values.setdefault("model/ponder_loss_weight", []).append(
+                        depth_regularizer_weight
+                    )
+                    routing_metric_values.setdefault("model/target_depth", []).append(target_depth)
+                    routing_metric_values.setdefault("model/min_halt_depth", []).append(float(min_halt_depth))
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -499,11 +572,56 @@ def main(job_config: JobConfig):
                                 labels=labels,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
-                        )
-                        loss = (
-                            output.loss
-                            / job_config.training.gradient_accumulation_steps
-                        )
+                                return_routing_info=collect_routing_metrics,
+                                ponder_loss_weight_override=0.0,
+                                min_halt_depth=min_halt_depth,
+                            )
+                        loss = output.loss
+                        expected_depth_tensor = getattr(output, "expected_depth_tensor", None)
+                        exit_kl_tensor = getattr(output, "exit_kl_tensor", None)
+                        exit_entropy_tensor = getattr(output, "exit_entropy_tensor", None)
+                        if halt_kl_weight is not None and halt_kl_weight > 0 and exit_kl_tensor is not None:
+                            loss = loss + halt_kl_weight * exit_kl_tensor
+                            if collect_routing_metrics:
+                                routing_metric_values.setdefault("model/halt_kl", []).append(
+                                    float(exit_kl_tensor.detach())
+                                )
+                                if exit_entropy_tensor is not None:
+                                    routing_metric_values.setdefault("model/exit_entropy", []).append(
+                                        float(exit_entropy_tensor.detach())
+                                    )
+                        if (
+                            target_depth is not None
+                            and depth_regularizer_weight is not None
+                            and depth_regularizer_weight > 0
+                            and expected_depth_tensor is not None
+                        ):
+                            depth_regularizer = torch.relu(expected_depth_tensor - target_depth)
+                            loss = loss + depth_regularizer_weight * depth_regularizer
+                            if collect_routing_metrics:
+                                routing_metric_values.setdefault("model/depth_regularizer", []).append(
+                                    float(depth_regularizer.detach())
+                                )
+                        loss = loss / job_config.training.gradient_accumulation_steps
+                        routing_info = getattr(output, "routing_info", None)
+                        if routing_info is not None:
+                            routing_metric_values.setdefault("model/effective_depth", []).append(
+                                float(routing_info["effective_depth"])
+                            )
+                            routing_metric_values.setdefault("model/expected_depth", []).append(
+                                float(routing_info.get("expected_depth", routing_info["effective_depth"]))
+                            )
+                            routing_metric_values.setdefault("model/depth_ratio", []).append(
+                                float(routing_info["effective_depth"]) / float(model_config.attn_res_num_blocks)
+                            )
+                            routing_metric_values.setdefault("model/ponder_cost", []).append(
+                                float(routing_info["ponder_cost"])
+                            )
+                            halt_probabilities = routing_info.get("halt_probabilities")
+                            if halt_probabilities:
+                                routing_metric_values.setdefault("model/halt_prob_mean", []).append(
+                                    float(sum(halt_probabilities) / len(halt_probabilities))
+                                )
                         loss.backward()
 
                 losses.append(loss)
@@ -584,8 +702,41 @@ def main(job_config: JobConfig):
                         "optimizer/lr": last_lr,
                         "optimizer/grad_norm": grad_norm.item(),
                         "optimizer/skipped_step": train_state.skipped_step,
+                        **{
+                            metric_name: (
+                                dist_utils.dist_mean(
+                                    torch.tensor(
+                                        sum(metric_values) / len(metric_values),
+                                        device=device_type,
+                                    ),
+                                    world_mesh["dp_cp"],
+                                )
+                                if (
+                                    metric_values
+                                    and (
+                                        parallel_dims.dp_replicate_enabled
+                                        or parallel_dims.dp_shard_enabled
+                                        or parallel_dims.cp_enabled
+                                    )
+                                )
+                                else (
+                                    sum(metric_values) / len(metric_values)
+                                    if metric_values
+                                    else 0.0
+                                )
+                            )
+                            for metric_name, metric_values in routing_metric_values.items()
+                        },
                     },
                 )
+
+                if routing_metric_values:
+                    routing_summary = " ".join(
+                        f"{metric_name.split('/')[-1]}: {sum(metric_values) / len(metric_values):5.2f}"
+                        for metric_name, metric_values in routing_metric_values.items()
+                        if metric_values
+                    )
+                    logger.info(f"{color.cyan}{routing_summary}{color.reset}")
 
                 logger.info(
                     f"{color.blue}lr: {last_lr:.4e} gnorm: {grad_norm:5.2f} "

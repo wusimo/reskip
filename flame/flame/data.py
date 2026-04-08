@@ -93,15 +93,15 @@ class BufferShuffledIterableDataset(IterableDataset):
         texts, states = [], []
         for sample in data:
             texts.append(sample['text'])
-            states.append(self.data.state_dict())
+            states.append(deepcopy(self.data.state_dict()))
             if len(texts) == batch_size:
                 for s, tokenized in zip(states, self.tokenizer(texts, return_attention_mask=False)['input_ids']):
-                    self.states = s
+                    self.states = deepcopy(s)
                     yield tokenized
                 texts, states = [], []
         if len(texts) > 0:
             for s, tokenized in zip(states, self.tokenizer(texts, return_attention_mask=False)['input_ids']):
-                self.states = s
+                self.states = deepcopy(s)
                 yield tokenized
 
     def sample(self, indices):
@@ -133,7 +133,7 @@ class BufferShuffledIterableDataset(IterableDataset):
 
     def state_dict(self):
         return {
-            'states': self.states,
+            'states': deepcopy(self.states),
             'buffer': self.buffer.clone(),
             'tokens': deepcopy(self.tokens),
             'rand_id': self.rand_id,
@@ -143,7 +143,7 @@ class BufferShuffledIterableDataset(IterableDataset):
         }
 
     def load_state_dict(self, state_dict):
-        self.states = state_dict['states']
+        self.states = deepcopy(state_dict['states'])
         self.buffer = state_dict['buffer'].clone()
         self.tokens = deepcopy(state_dict['tokens'])
         self.rand_id = state_dict['rand_id']
@@ -153,26 +153,36 @@ class BufferShuffledIterableDataset(IterableDataset):
 
 
 class OnlineTokenizedIterableDataset(IterableDataset):
+    MAX_TOKENIZE_CHARS = 1_000_000
+
     def __init__(
-        self, dataset: Dataset, tokenizer: PreTrainedTokenizer, seq_len: int = 2048, rank: int = 0, world_size: int = 1
+        self,
+        dataset: Dataset,
+        tokenizer: PreTrainedTokenizer,
+        seq_len: int = 2048,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: Optional[int] = None,
     ) -> OnlineTokenizedIterableDataset:
         self.dataset = dataset
         self.tokenizer = tokenizer
 
         self.data = dataset.shard(world_size, rank)
+        if seed is not None:
+            self.data = shuffle(self.data, seed=seed)
         self.seq_len = seq_len
         self.rank = rank
         self.world_size = world_size
 
         self.states = None
         self.tokens = []
+
     def __iter__(self):
         if self.states is not None:
             self.data.load_state_dict(self.states)
 
         while True:
             for sample in self.tokenize(self.data):
-                # keep appending the samples to the token buffer
                 self.tokens += sample
 
                 while len(self.tokens) >= self.seq_len:
@@ -182,29 +192,33 @@ class OnlineTokenizedIterableDataset(IterableDataset):
 
     def tokenize(self, data, buffer_size: int = 64):
         buffer, states = [], []
+        total_chars = 0
         for sample in data:
             if sample.get('text', None) is not None:
-                buffer.append(sample['text'])
+                text = sample['text']
             elif sample.get('content', None) is not None:
-                buffer.append(sample['content'])
+                text = sample['content']
             else:
                 raise ValueError(f"No 'text' or 'content' field found in sample:\n{sample}")
-            states.append(self.data.state_dict())
-            if len(buffer) == buffer_size:
+            buffer.append(text)
+            total_chars += len(text)
+            states.append(deepcopy(self.data.state_dict()))
+            if len(buffer) == buffer_size or total_chars >= self.MAX_TOKENIZE_CHARS:
                 for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
-                    self.states = s
+                    self.states = deepcopy(s)
                     yield tokenized
                 buffer, states = [], []
+                total_chars = 0
         if len(buffer) > 0:
             for s, tokenized in zip(states, self.tokenizer(buffer, return_attention_mask=False)['input_ids']):
-                self.states = s
+                self.states = deepcopy(s)
                 yield tokenized
 
     def state_dict(self):
-        return {'states': self.states, 'tokens': deepcopy(self.tokens)}
+        return {'states': deepcopy(self.states), 'tokens': deepcopy(self.tokens)}
 
     def load_state_dict(self, state_dict):
-        self.states = state_dict['states']
+        self.states = deepcopy(state_dict['states'])
         self.tokens = deepcopy(state_dict['tokens'])
 
 
@@ -604,8 +618,9 @@ def build_dataset(
                     dataset = dataset.shuffle(seed=seed)
                 dataset = dataset.to_iterable_dataset(num_shards=min_num_shards)
             else:
-                if seed is not None:
-                    dataset = shuffle(dataset, seed=seed)
+                # Delay shuffling until after per-rank sharding so the streaming
+                # shuffle buffer state can be checkpointed and restored exactly.
+                pass
     else:
         datasets = dataset.split(",")
         if dataset_name is not None:
@@ -704,7 +719,6 @@ def build_dataset(
                         subset = subset.shuffle(seed=seed)
                     subset = subset.to_iterable_dataset(num_shards=min_num_shards)
                 else:
-                    # we set relatively small buffer size here as interleaving could provide some randomness
                     if seed is not None:
                         subset = shuffle(subset, seed=seed, buffer_size=max(128, 1024 // len(datasets)))
 
@@ -745,10 +759,16 @@ def build_dataloader(
     prefetch_factor: int = 2,
     persistent_workers: bool = False,
     snapshot_every_n_steps: Optional[int] = 1,
+    seed: Optional[int] = None,
 ):
     effective_prefetch_factor = prefetch_factor if num_workers > 0 else None
     dataset = OnlineTokenizedIterableDataset(
-        dataset=dataset, tokenizer=tokenizer, seq_len=seq_len, rank=rank, world_size=world_size
+        dataset=dataset,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        rank=rank,
+        world_size=world_size,
+        seed=seed,
     )
     return ParallelAwareDataLoader(
         rank=rank,

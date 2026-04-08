@@ -43,7 +43,14 @@ class ReSkipTransformerConfig(PretrainedConfig):
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
         halt_threshold: float = 0.99,
+        halt_kl_weight: float = 0.0,
+        halt_kl_min_weight: float = 0.0,
+        halt_kl_decay_steps: int = 0,
         ponder_loss_weight: float = 0.0,
+        ponder_loss_warmup_steps: int = 0,
+        ponder_budget_start_step: int = 0,
+        ponder_target_depth_ratio: float = 0.5,
+        ponder_target_steps: int = 0,
         **kwargs,
     ):
         self.hidden_size = hidden_size
@@ -76,7 +83,14 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
         self.halt_threshold = halt_threshold
+        self.halt_kl_weight = halt_kl_weight
+        self.halt_kl_min_weight = halt_kl_min_weight
+        self.halt_kl_decay_steps = halt_kl_decay_steps
         self.ponder_loss_weight = ponder_loss_weight
+        self.ponder_loss_warmup_steps = ponder_loss_warmup_steps
+        self.ponder_budget_start_step = ponder_budget_start_step
+        self.ponder_target_depth_ratio = ponder_target_depth_ratio
+        self.ponder_target_steps = ponder_target_steps
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
@@ -98,8 +112,20 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 raise ValueError("`num_recurrent_blocks` and `max_loops` must be positive.")
             if not 0.0 < halt_threshold <= 1.0:
                 raise ValueError("`halt_threshold` must be in (0, 1].")
+            if halt_kl_weight < 0 or halt_kl_min_weight < 0:
+                raise ValueError("`halt_kl_weight` and `halt_kl_min_weight` must be non-negative.")
+            if halt_kl_decay_steps < 0:
+                raise ValueError("`halt_kl_decay_steps` must be non-negative.")
             if ponder_loss_weight < 0:
                 raise ValueError("`ponder_loss_weight` must be non-negative.")
+            if ponder_loss_warmup_steps < 0:
+                raise ValueError("`ponder_loss_warmup_steps` must be non-negative.")
+            if ponder_budget_start_step < 0:
+                raise ValueError("`ponder_budget_start_step` must be non-negative.")
+            if not 0.0 < ponder_target_depth_ratio <= 1.0:
+                raise ValueError("`ponder_target_depth_ratio` must be in (0, 1].")
+            if ponder_target_steps < 0:
+                raise ValueError("`ponder_target_steps` must be non-negative.")
             if attn_res_num_blocks != num_recurrent_blocks * max_loops:
                 raise ValueError(
                     "`attn_res_num_blocks` must equal `num_recurrent_blocks * max_loops` in looping mode."
