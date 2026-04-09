@@ -23,5 +23,6 @@
   "enable_skip_inference": false,
   "skip_keep_mask": null,
   "halt_threshold": 0.99,
-  "ponder_loss_weight": 0.0
+  "ponder_loss_weight": 0.0,
+  "routing_regularization_weight": 0.0
 }

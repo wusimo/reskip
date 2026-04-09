@@ -126,6 +126,7 @@ def evaluate_causal_lm(
     return_routing_info: bool = False,
     enable_skipping: bool | None = None,
     skip_keep_mask: list[bool] | None = None,
+    return_batch_metrics: bool = False,
 ) -> dict[str, Any]:
     total_loss = 0.0
     total_tokens = 0
@@ -133,6 +134,7 @@ def evaluate_causal_lm(
     n_batches = 0
     importance_matrix = None
     block_importance_sum = None
+    batch_metrics = []
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -170,6 +172,15 @@ def evaluate_causal_lm(
             else:
                 importance_matrix += routing_info["importance_matrix"].float().cpu()
                 block_importance_sum += torch.tensor(routing_info["block_importance"], dtype=torch.float32)
+        if return_batch_metrics:
+            payload = {
+                "loss": outputs.loss.item(),
+                "tokens": valid_tokens,
+            }
+            if routing_info is not None:
+                payload["avg_blocks"] = float(routing_info["num_blocks_executed"])
+                payload["block_importance"] = list(routing_info["block_importance"])
+            batch_metrics.append(payload)
 
         if num_batches is not None and n_batches >= num_batches:
             break
@@ -185,6 +196,8 @@ def evaluate_causal_lm(
         result["avg_blocks"] = total_blocks / max(n_batches, 1)
         result["importance_matrix"] = (importance_matrix / max(n_batches, 1)).tolist()
         result["block_importance"] = (block_importance_sum / max(n_batches, 1)).tolist()
+    if return_batch_metrics:
+        result["batch_metrics"] = batch_metrics
     return result
 
 
