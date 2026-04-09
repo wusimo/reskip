@@ -59,7 +59,7 @@ def batch_attend_completed_blocks(
     routers: list["BlockAttentionResidual"],
     completed_blocks: list[torch.Tensor],
     return_weights: bool,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
     values = torch.stack(completed_blocks, dim=0)
     base_keys = _rms_norm_base(values, routers[0].key_norm.eps)
     queries = torch.stack([_router_effective_query(router) for router in routers], dim=0)
@@ -69,28 +69,39 @@ def batch_attend_completed_blocks(
     exp_scores = torch.exp(scores - max_scores.unsqueeze(1))
     lse = exp_scores.sum(dim=1)
     outputs = torch.einsum("qnbt,nbtd->qbtd", exp_scores, values.float()).to(values.dtype)
+    probs = exp_scores / lse.unsqueeze(1)
+    log_probs = scores - max_scores.unsqueeze(1) - torch.log(lse).unsqueeze(1)
+    entropies = -(probs * log_probs).sum(dim=1)
 
     if return_weights:
-        weights = (exp_scores / lse.unsqueeze(1)).permute(0, 2, 3, 1).to(values.dtype)
+        weights = probs.permute(0, 2, 3, 1).to(values.dtype)
     else:
         weights = None
 
     result = []
     for idx in range(len(routers)):
-        result.append((outputs[idx], max_scores[idx], lse[idx], None if weights is None else weights[idx]))
+        result.append(
+            (
+                outputs[idx],
+                max_scores[idx],
+                lse[idx],
+                entropies[idx],
+                None if weights is None else weights[idx],
+            )
+        )
     return result
 
 
 def merge_with_partial_block(
     router: "BlockAttentionResidual",
-    phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+    phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
     partial_block: torch.Tensor | None,
     return_weights: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    phase1_output, phase1_max, phase1_lse, phase1_weights = phase1
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    phase1_output, phase1_max, phase1_lse, phase1_entropy, phase1_weights = phase1
     if partial_block is None:
         hidden_states = phase1_output * phase1_lse.reciprocal().to(phase1_output.dtype).unsqueeze(-1)
-        return hidden_states, phase1_weights
+        return hidden_states, phase1_entropy, phase1_weights
 
     partial_scores = torch.einsum(
         "d,btd->bt",
@@ -107,9 +118,16 @@ def merge_with_partial_block(
         phase1_output * phase1_weight.unsqueeze(-1)
         + partial_block * partial_weight.unsqueeze(-1)
     )
+    phase1_weight_fp32 = phase1_weight.float().clamp_min(1e-8)
+    partial_weight_fp32 = partial_weight.float().clamp_min(1e-8)
+    entropy = (
+        phase1_weight_fp32 * phase1_entropy.float()
+        - phase1_weight_fp32 * torch.log(phase1_weight_fp32)
+        - partial_weight_fp32 * torch.log(partial_weight_fp32)
+    ).to(hidden_states.dtype)
 
     if not return_weights:
-        return hidden_states, None
+        return hidden_states, entropy, None
 
     if phase1_weights is None:
         raise RuntimeError("Phase-1 weights are required when return_weights=True.")
@@ -117,7 +135,14 @@ def merge_with_partial_block(
         [phase1_weights * phase1_weight.unsqueeze(-1), partial_weight.unsqueeze(-1)],
         dim=-1,
     )
-    return hidden_states, weights
+    return hidden_states, entropy, weights
+
+
+def normalize_router_entropy(entropy: torch.Tensor, num_sources: int) -> torch.Tensor:
+    if num_sources <= 1:
+        return torch.zeros_like(entropy)
+    max_entropy = math.log(float(num_sources))
+    return (entropy.float() / max_entropy).clamp_(0.0, 1.0).to(entropy.dtype)
 
 
 def collect_completed_blocks(
@@ -141,6 +166,7 @@ class ReSkipBaseModelOutputWithPast(BaseModelOutputWithPast):
     expected_depth_tensor: torch.Tensor | None = None
     exit_kl_tensor: torch.Tensor | None = None
     exit_entropy_tensor: torch.Tensor | None = None
+    routing_entropy_tensor: torch.Tensor | None = None
 
 
 @dataclass
@@ -150,6 +176,7 @@ class ReSkipCausalLMOutputWithPast(CausalLMOutputWithPast):
     expected_depth_tensor: torch.Tensor | None = None
     exit_kl_tensor: torch.Tensor | None = None
     exit_entropy_tensor: torch.Tensor | None = None
+    routing_entropy_tensor: torch.Tensor | None = None
 
 
 class BlockAttentionResidual(nn.Module):
@@ -271,8 +298,10 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         Cache | None,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
-        attn_input, attn_weights = merge_with_partial_block(
+        attn_input, attn_entropy, attn_weights = merge_with_partial_block(
             self.attn_router,
             attn_phase1,
             partial_block,
@@ -293,7 +322,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
             active_mask,
         )
 
-        mlp_input, mlp_weights = merge_with_partial_block(
+        mlp_input, mlp_entropy, mlp_weights = merge_with_partial_block(
             self.mlp_router,
             mlp_phase1,
             partial_block,
@@ -304,7 +333,7 @@ class ReSkipTransformerLayer(GradientCheckpointingLayer):
         partial_block = partial_block + mlp_out
         partial_block = blend_states(old_partial, partial_block, active_mask)
 
-        return partial_block, past_key_values, attn_weights, mlp_weights
+        return partial_block, past_key_values, attn_weights, mlp_weights, attn_entropy, mlp_entropy
 
 
 class ReSkipBlockGroup(nn.Module):
@@ -336,6 +365,7 @@ class ReSkipBlockGroup(nn.Module):
         Cache | None,
         list[tuple[list[int], torch.Tensor | None]],
         list[tuple[list[int], torch.Tensor | None]],
+        list[torch.Tensor],
     ]:
         block_input = block_states[current_block_idx]
         if block_input is None:
@@ -355,12 +385,13 @@ class ReSkipBlockGroup(nn.Module):
         next_cache = past_key_values
         attn_records: list[tuple[list[int], torch.Tensor | None]] = []
         mlp_records: list[tuple[list[int], torch.Tensor | None]] = []
+        router_entropies: list[torch.Tensor] = []
 
         for layer_idx, layer in enumerate(self.layers):
             attn_phase1 = phase1_outputs[2 * layer_idx]
             mlp_phase1 = phase1_outputs[2 * layer_idx + 1]
             attn_source_ids = list(completed_source_ids) if partial_block is None else [*completed_source_ids, current_block_idx]
-            partial_block, next_cache, attn_weights, mlp_weights = layer(
+            partial_block, next_cache, attn_weights, mlp_weights, attn_entropy, mlp_entropy = layer(
                 block_input=block_input,
                 partial_block=partial_block,
                 attn_phase1=attn_phase1,
@@ -374,8 +405,16 @@ class ReSkipBlockGroup(nn.Module):
             )
             attn_records.append((attn_source_ids, attn_weights))
             mlp_records.append(([*completed_source_ids, current_block_idx], mlp_weights))
+            attn_num_sources = len(attn_source_ids)
+            mlp_num_sources = len(completed_source_ids) + 1
+            router_entropies.extend(
+                [
+                    normalize_router_entropy(attn_entropy, attn_num_sources).mean(),
+                    normalize_router_entropy(mlp_entropy, mlp_num_sources).mean(),
+                ]
+            )
 
-        return partial_block, next_cache, attn_records, mlp_records
+        return partial_block, next_cache, attn_records, mlp_records, router_entropies
 
 
 class ReSkipTransformerPreTrainedModel(PreTrainedModel):
@@ -684,6 +723,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         keep_mask = self._resolve_keep_mask(enable_skipping, skip_keep_mask)
         routing_events: list[dict[str, Any]] = []
         execution_trace: list[dict[str, Any]] = []
+        routing_entropy_terms: list[torch.Tensor] = []
 
         block_states: list[torch.Tensor | None] = [None] * (self.num_block_positions + 1)
         block_states[0] = inputs_embeds
@@ -753,6 +793,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
 
             should_execute = True if keep_mask is None else keep_mask[position]
             if not should_execute:
+                block_states[position + 1] = hidden_states
                 if collect_routing_info:
                     execution_trace.append(
                         {
@@ -766,7 +807,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 continue
 
             current_block = self.layers[block_idx]
-            hidden_states, next_cache, attn_records, mlp_records = current_block(
+            hidden_states, next_cache, attn_records, mlp_records, router_entropies = current_block(
                 block_states=block_states,
                 current_block_idx=position,
                 attention_mask=attention_mask,
@@ -776,6 +817,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 return_routing_weights=collect_routing_weights,
                 **kwargs,
             )
+            routing_entropy_terms.extend(router_entropies)
             if collect_routing_weights:
                 for source_ids, attn_weights in attn_records:
                     self._record_routing(routing_events, position, "attn", source_ids, attn_weights)
@@ -827,6 +869,9 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         routing_info = None
         exit_kl_tensor = None
         exit_entropy_tensor = None
+        routing_entropy_tensor = None
+        if routing_entropy_terms:
+            routing_entropy_tensor = torch.stack(routing_entropy_terms).mean()
         if exit_distribution_terms:
             exit_distribution = torch.stack(exit_distribution_terms)
             exit_distribution = exit_distribution / exit_distribution.sum().clamp_min(1e-8)
@@ -843,6 +888,8 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 ponder_cost=ponder_cost,
                 expected_depth=expected_depth,
             )
+            if routing_entropy_tensor is not None:
+                routing_info["routing_entropy"] = float(routing_entropy_tensor.detach().item())
         self._last_routing_info = routing_info
 
         if not return_dict:
@@ -854,6 +901,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 routing_info if return_routing_info else None,
                 ponder_cost if self.config.enable_looping else None,
                 expected_depth if self.config.enable_looping else None,
+                routing_entropy_tensor,
             )
             return tuple(item for item in output if item is not None)
 
@@ -867,6 +915,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             expected_depth_tensor=expected_depth if self.config.enable_looping else None,
             exit_kl_tensor=exit_kl_tensor,
             exit_entropy_tensor=exit_entropy_tensor,
+            routing_entropy_tensor=routing_entropy_tensor,
         )
 
     @torch.no_grad()
@@ -1041,4 +1090,5 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             expected_depth_tensor=getattr(outputs, "expected_depth_tensor", None),
             exit_kl_tensor=getattr(outputs, "exit_kl_tensor", None),
             exit_entropy_tensor=getattr(outputs, "exit_entropy_tensor", None),
+            routing_entropy_tensor=getattr(outputs, "routing_entropy_tensor", None),
         )

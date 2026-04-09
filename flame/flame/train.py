@@ -430,13 +430,15 @@ def main(job_config: JobConfig):
             routing_metric_values: dict[str, list[float]] = {}
             collect_routing_metrics = (
                 model_config.model_type == "reskip_transformer"
-                and getattr(model_config, "enable_looping", False)
                 and metric_logger.should_log(train_state.step)
             )
             depth_regularizer_weight = None
             halt_kl_weight = None
             target_depth = None
             min_halt_depth = None
+            routing_regularization_weight = 0.0
+            routing_entropy_target = 0.0
+            use_legacy_routing_entropy = False
             if model_config.model_type == "reskip_transformer" and getattr(model_config, "enable_looping", False):
                 max_depth = float(model_config.attn_res_num_blocks)
                 base_halt_kl_weight = float(getattr(model_config, "halt_kl_weight", 0.0))
@@ -485,6 +487,28 @@ def main(job_config: JobConfig):
                     )
                     routing_metric_values.setdefault("model/target_depth", []).append(target_depth)
                     routing_metric_values.setdefault("model/min_halt_depth", []).append(float(min_halt_depth))
+            if model_config.model_type == "reskip_transformer":
+                base_routing_regularization_weight = float(
+                    getattr(model_config, "routing_regularization_weight", 0.0)
+                )
+                if base_routing_regularization_weight > 0:
+                    warmup_steps = max(1, math.ceil(job_config.training.steps * 0.1))
+                    warmup_progress = min(train_state.step / warmup_steps, 1.0)
+                    routing_regularization_weight = base_routing_regularization_weight * warmup_progress
+                else:
+                    base_routing_entropy_weight = float(getattr(model_config, "routing_entropy_weight", 0.0))
+                    routing_entropy_target = float(getattr(model_config, "routing_entropy_target", 0.0))
+                    routing_entropy_warmup_steps = int(getattr(model_config, "routing_entropy_warmup_steps", 0))
+                    if base_routing_entropy_weight > 0:
+                        warmup_progress = 1.0
+                        if routing_entropy_warmup_steps > 0:
+                            warmup_progress = min(train_state.step / routing_entropy_warmup_steps, 1.0)
+                        routing_regularization_weight = base_routing_entropy_weight * warmup_progress
+                        use_legacy_routing_entropy = True
+                if collect_routing_metrics:
+                    routing_metric_values.setdefault("model/routing_regularization_weight", []).append(
+                        routing_regularization_weight
+                    )
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -580,6 +604,7 @@ def main(job_config: JobConfig):
                         expected_depth_tensor = getattr(output, "expected_depth_tensor", None)
                         exit_kl_tensor = getattr(output, "exit_kl_tensor", None)
                         exit_entropy_tensor = getattr(output, "exit_entropy_tensor", None)
+                        routing_entropy_tensor = getattr(output, "routing_entropy_tensor", None)
                         if halt_kl_weight is not None and halt_kl_weight > 0 and exit_kl_tensor is not None:
                             loss = loss + halt_kl_weight * exit_kl_tensor
                             if collect_routing_metrics:
@@ -602,8 +627,24 @@ def main(job_config: JobConfig):
                                 routing_metric_values.setdefault("model/depth_regularizer", []).append(
                                     float(depth_regularizer.detach())
                                 )
+                        if routing_regularization_weight > 0 and routing_entropy_tensor is not None:
+                            if use_legacy_routing_entropy:
+                                routing_regularization_penalty = torch.relu(
+                                    routing_entropy_tensor - routing_entropy_target
+                                )
+                            else:
+                                routing_regularization_penalty = routing_entropy_tensor
+                            loss = loss + routing_regularization_weight * routing_regularization_penalty
+                            if collect_routing_metrics:
+                                routing_metric_values.setdefault("model/routing_regularization_penalty", []).append(
+                                    float(routing_regularization_penalty.detach())
+                                )
                         loss = loss / job_config.training.gradient_accumulation_steps
                         routing_info = getattr(output, "routing_info", None)
+                        if routing_entropy_tensor is not None and collect_routing_metrics:
+                            routing_metric_values.setdefault("model/routing_entropy", []).append(
+                                float(routing_entropy_tensor.detach())
+                            )
                         if routing_info is not None:
                             routing_metric_values.setdefault("model/effective_depth", []).append(
                                 float(routing_info["effective_depth"])
