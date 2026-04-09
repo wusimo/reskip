@@ -325,6 +325,17 @@ CUDA_VISIBLE_DEVICES=6 python experiments/flame_analyze_reskip.py \
 
 因此后续直接拿这个目录跑分即可。
 
+注意这里有 3 种 dynamic 选择：
+
+- `best_dynamic_ppl`
+  质量最优，但通常跳得不深
+- `best_dynamic_skip`
+  跳得最深，但可能明显掉分
+- `best_dynamic_tolerated`
+  在允许的 `ppl_tolerance` 以内，跳得最深
+
+现在推荐把第三种作为默认部署/跑分方案。
+
 ### 8.5 动态 skip 直接跑分
 
 ```bash
@@ -343,7 +354,7 @@ CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
 ```bash
 CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
   --analysis_json /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis_dynamic/routing_analysis.json \
-  --prepare_mode best_dynamic_skip \
+  --dynamic_mode tolerated \
   --prepared_model_dir /tmp/reskip_eval_dynamic \
   --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
   --batch_size auto \
@@ -356,6 +367,17 @@ CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
 1. 读取 `routing_analysis.json`
 2. 自动准备一个带默认动态 skip 配置的 HF 模型目录
 3. 直接调用 `lm-eval`
+
+其中：
+
+- `--dynamic_mode quality`
+  选择质量最好的 dynamic 配置
+- `--dynamic_mode tolerated`
+  选择在 `ppl_tolerance` 内跳得最深的 dynamic 配置
+- `--dynamic_mode deepest`
+  选择跳得最深的 dynamic 配置，不保证质量
+- `--dynamic_mode static`
+  走静态 keep-mask 配置，但仍复用同一个评测入口
 
 ### 8.7 建议顺序
 

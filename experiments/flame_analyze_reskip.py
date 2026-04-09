@@ -268,6 +268,18 @@ def main() -> None:
                 item["perplexity"],
             ),
         )
+        best_dynamic_tolerated = min(
+            [
+                item
+                for item in dynamic_results
+                if item["perplexity"] <= dynamic_eval_full["perplexity"] * (1.0 + args.ppl_tolerance)
+            ],
+            key=lambda item: (
+                item.get("avg_blocks", float("inf")),
+                item["perplexity"],
+            ),
+            default=best_dynamic_ppl,
+        )
         dynamic_skip_analysis = {
             "strategy": args.dynamic_skip_strategy,
             "calibration_eval": dynamic_calibration,
@@ -275,6 +287,7 @@ def main() -> None:
             "results": dynamic_results,
             "best_ppl_metrics": best_dynamic_ppl,
             "best_skip_metrics": best_dynamic_skip,
+            "best_tolerated_metrics": best_dynamic_tolerated,
         }
 
     best = min(
@@ -315,12 +328,12 @@ def main() -> None:
     if args.export_best_dynamic_model_dir and dynamic_skip_analysis is not None:
         export_dir = Path(args.export_best_dynamic_model_dir)
         export_dir.mkdir(parents=True, exist_ok=True)
-        best_dynamic_skip = dynamic_skip_analysis["best_skip_metrics"]
+        best_dynamic_deploy = dynamic_skip_analysis["best_tolerated_metrics"]
         decoder.clear_skip_keep_mask()
         decoder.set_dynamic_skip_policy(
             strategy=args.dynamic_skip_strategy,
-            position_thresholds=best_dynamic_skip["position_thresholds"],
-            max_skips=best_dynamic_skip["max_skips"],
+            position_thresholds=best_dynamic_deploy["position_thresholds"],
+            max_skips=best_dynamic_deploy["max_skips"],
         )
         model.save_pretrained(export_dir)
         tokenizer.save_pretrained(export_dir)
@@ -336,10 +349,16 @@ def main() -> None:
     if dynamic_skip_analysis is not None:
         best_dynamic_ppl = dynamic_skip_analysis["best_ppl_metrics"]
         best_dynamic_skip = dynamic_skip_analysis["best_skip_metrics"]
+        best_dynamic_tolerated = dynamic_skip_analysis["best_tolerated_metrics"]
         print(
             f"Best dynamic skip quality: q={best_dynamic_ppl['quantile']:.3f} "
             f"max_skips={best_dynamic_ppl['max_skips']} "
             f"ppl={best_dynamic_ppl['perplexity']:.4f} avg_blocks={best_dynamic_ppl.get('avg_blocks', 0):.2f}"
+        )
+        print(
+            f"Best dynamic skip tolerated: q={best_dynamic_tolerated['quantile']:.3f} "
+            f"max_skips={best_dynamic_tolerated['max_skips']} "
+            f"ppl={best_dynamic_tolerated['perplexity']:.4f} avg_blocks={best_dynamic_tolerated.get('avg_blocks', 0):.2f}"
         )
         print(
             f"Best dynamic skip depth: q={best_dynamic_skip['quantile']:.3f} "

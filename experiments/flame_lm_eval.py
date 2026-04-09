@@ -38,6 +38,7 @@ def prepare_model_from_analysis(
             raise ValueError("`analysis_json` does not contain `dynamic_skip_analysis`.")
         metric_key = {
             "best_dynamic_ppl": "best_ppl_metrics",
+            "best_dynamic_tolerated": "best_tolerated_metrics",
             "best_dynamic_skip": "best_skip_metrics",
         }[prepare_mode]
         metrics = dynamic[metric_key]
@@ -69,12 +70,35 @@ def main() -> None:
     parser.add_argument("--analysis_json", default="")
     parser.add_argument(
         "--prepare_mode",
-        choices=("none", "best_static", "best_dynamic_ppl", "best_dynamic_skip"),
+        choices=("none", "best_static", "best_dynamic_ppl", "best_dynamic_tolerated", "best_dynamic_skip"),
         default="none",
+    )
+    parser.add_argument(
+        "--dynamic_mode",
+        choices=("none", "quality", "tolerated", "deepest", "static"),
+        default="none",
+        help=(
+            "User-facing alias for analysis-based model preparation: "
+            "'quality' -> best_dynamic_ppl, "
+            "'tolerated' -> best_dynamic_tolerated, "
+            "'deepest' -> best_dynamic_skip, "
+            "'static' -> best_static."
+        ),
     )
     parser.add_argument("--prepared_model_dir", default="")
     parser.add_argument("extra", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+
+    if args.dynamic_mode != "none":
+        alias_map = {
+            "quality": "best_dynamic_ppl",
+            "tolerated": "best_dynamic_tolerated",
+            "deepest": "best_dynamic_skip",
+            "static": "best_static",
+        }
+        if args.prepare_mode != "none":
+            raise ValueError("Use either `--prepare_mode` or `--dynamic_mode`, not both.")
+        args.prepare_mode = alias_map[args.dynamic_mode]
 
     resolved_model_path = args.model_path
     if args.prepare_mode != "none":
