@@ -59,7 +59,7 @@ def batch_attend_completed_blocks(
     routers: list["BlockAttentionResidual"],
     completed_blocks: list[torch.Tensor],
     return_weights: bool,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]]:
     values = torch.stack(completed_blocks, dim=0)
     base_keys = _rms_norm_base(values, routers[0].key_norm.eps)
     queries = torch.stack([_router_effective_query(router) for router in routers], dim=0)
@@ -87,6 +87,7 @@ def batch_attend_completed_blocks(
                 lse[idx],
                 entropies[idx],
                 None if weights is None else weights[idx],
+                probs[idx].mean(dim=(1, 2)).to(values.dtype),
             )
         )
     return result
@@ -94,11 +95,11 @@ def batch_attend_completed_blocks(
 
 def merge_with_partial_block(
     router: "BlockAttentionResidual",
-    phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+    phase1: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor],
     partial_block: torch.Tensor | None,
     return_weights: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    phase1_output, phase1_max, phase1_lse, phase1_entropy, phase1_weights = phase1
+    phase1_output, phase1_max, phase1_lse, phase1_entropy, phase1_weights, _phase1_source_means = phase1
     if partial_block is None:
         hidden_states = phase1_output * phase1_lse.reciprocal().to(phase1_output.dtype).unsqueeze(-1)
         return hidden_states, phase1_entropy, phase1_weights
@@ -350,6 +351,50 @@ class ReSkipBlockGroup(nn.Module):
             [ReSkipTransformerLayer(config, first_layer_idx + offset) for offset in range(layers_per_block)]
         )
 
+    def prepare_phase1(
+        self,
+        block_states: list[torch.Tensor | None],
+        current_block_idx: int,
+        return_routing_weights: bool = False,
+    ) -> tuple[
+        list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]],
+        list[int],
+    ]:
+        completed_blocks, completed_source_ids = collect_completed_blocks(block_states, current_block_idx)
+        routers = []
+        for layer in self.layers:
+            routers.extend([layer.attn_router, layer.mlp_router])
+        phase1_outputs = batch_attend_completed_blocks(
+            routers=routers,
+            completed_blocks=completed_blocks,
+            return_weights=return_routing_weights,
+        )
+        return phase1_outputs, completed_source_ids
+
+    def summarize_phase1(
+        self,
+        phase1_outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]],
+        completed_source_ids: list[int],
+    ) -> dict[str, float | None]:
+        entropies = []
+        embed_weights = []
+        recent_weights = []
+        for phase1_output in phase1_outputs:
+            _output, _max, _lse, entropy, _weights, source_means = phase1_output
+            entropies.append(normalize_router_entropy(entropy, len(completed_source_ids)).mean().float())
+            embed_weights.append(source_means[0].float())
+            if len(completed_source_ids) > 1:
+                recent_weights.append(source_means[-1].float())
+        avg_entropy = torch.stack(entropies).mean().item() if entropies else None
+        avg_embed = torch.stack(embed_weights).mean().item() if embed_weights else None
+        avg_recent = torch.stack(recent_weights).mean().item() if recent_weights else None
+        return {
+            "avg_phase1_entropy": avg_entropy,
+            "avg_phase1_embed_weight": avg_embed,
+            "avg_phase1_recent_weight": avg_recent,
+            "num_completed_sources": float(len(completed_source_ids)),
+        }
+
     def forward(
         self,
         block_states: list[torch.Tensor | None],
@@ -359,6 +404,8 @@ class ReSkipBlockGroup(nn.Module):
         use_cache: bool | None = False,
         active_mask: torch.Tensor | None = None,
         return_routing_weights: bool = False,
+        phase1_outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]] | None = None,
+        completed_source_ids: list[int] | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple[
         torch.Tensor,
@@ -371,15 +418,12 @@ class ReSkipBlockGroup(nn.Module):
         if block_input is None:
             raise RuntimeError("Expected the current block input to be available in block_states.")
 
-        completed_blocks, completed_source_ids = collect_completed_blocks(block_states, current_block_idx)
-        routers = []
-        for layer in self.layers:
-            routers.extend([layer.attn_router, layer.mlp_router])
-        phase1_outputs = batch_attend_completed_blocks(
-            routers=routers,
-            completed_blocks=completed_blocks,
-            return_weights=return_routing_weights,
-        )
+        if phase1_outputs is None or completed_source_ids is None:
+            phase1_outputs, completed_source_ids = self.prepare_phase1(
+                block_states=block_states,
+                current_block_idx=current_block_idx,
+                return_routing_weights=return_routing_weights,
+            )
 
         partial_block = None
         next_cache = past_key_values
@@ -492,6 +536,9 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.gradient_checkpointing = False
         self._skip_keep_mask = self._normalize_keep_mask(config.skip_keep_mask)
+        self._dynamic_skip_position_thresholds = self._normalize_dynamic_skip_position_thresholds(
+            config.dynamic_skip_position_thresholds
+        )
         self._last_routing_info: dict[str, Any] | None = None
 
         self.post_init()
@@ -519,6 +566,52 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             return list(range(self.config.attn_res_num_blocks))
         return [position % self.config.num_recurrent_blocks for position in range(self.config.attn_res_num_blocks)]
 
+    def _should_skip_dynamic(
+        self,
+        strategy: str | None,
+        threshold: float | None,
+        position_thresholds: list[float] | None,
+        phase1_stats: dict[str, float | None],
+        position: int,
+        skipped_so_far: int,
+        max_skips: int | None,
+    ) -> bool:
+        if strategy is None:
+            return False
+        if threshold is None and position_thresholds is None:
+            return False
+        if position <= 0 or position >= self.num_block_positions - 1:
+            return False
+        if max_skips is not None and skipped_so_far >= max_skips:
+            return False
+        effective_threshold = threshold
+        if position_thresholds is not None:
+            if position >= len(position_thresholds):
+                raise ValueError(
+                    f"dynamic_skip_position_thresholds length {len(position_thresholds)} is too short for position {position}."
+                )
+            effective_threshold = position_thresholds[position]
+        if effective_threshold is None:
+            return False
+        recent_weight = phase1_stats.get("avg_phase1_recent_weight")
+        embed_weight = phase1_stats.get("avg_phase1_embed_weight")
+        entropy = phase1_stats.get("avg_phase1_entropy")
+        if strategy == "recent_weight_lt":
+            return recent_weight is not None and recent_weight < effective_threshold
+        if strategy == "recent_weight_gt":
+            return recent_weight is not None and recent_weight > effective_threshold
+        if strategy == "embed_weight_gt":
+            return embed_weight is not None and embed_weight > effective_threshold
+        if strategy == "entropy_lt":
+            return entropy is not None and entropy < effective_threshold
+        if strategy == "recent_x_entropy_lt":
+            return (
+                recent_weight is not None
+                and entropy is not None
+                and (recent_weight * max(1.0 - entropy, 0.0)) < effective_threshold
+            )
+        raise ValueError(f"Unsupported dynamic skip strategy: {strategy}")
+
     def _normalize_keep_mask(
         self,
         keep_mask: list[int] | list[bool] | torch.Tensor | None,
@@ -544,6 +637,43 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         self._skip_keep_mask = None
         self.config.skip_keep_mask = None
         self.config.enable_skip_inference = False
+
+    def _normalize_dynamic_skip_position_thresholds(
+        self,
+        thresholds: list[float] | torch.Tensor | None,
+    ) -> list[float] | None:
+        if thresholds is None:
+            return None
+        if isinstance(thresholds, torch.Tensor):
+            thresholds = thresholds.tolist()
+        thresholds = [float(value) for value in thresholds]
+        if len(thresholds) != self.num_block_positions:
+            raise ValueError(
+                f"Expected dynamic position thresholds of length {self.num_block_positions}, got {len(thresholds)}."
+            )
+        return thresholds
+
+    def set_dynamic_skip_policy(
+        self,
+        *,
+        strategy: str,
+        threshold: float | None = None,
+        position_thresholds: list[float] | torch.Tensor | None = None,
+        max_skips: int | None = None,
+    ) -> None:
+        normalized_thresholds = self._normalize_dynamic_skip_position_thresholds(position_thresholds)
+        self.config.dynamic_skip_strategy = strategy
+        self.config.dynamic_skip_threshold = None if threshold is None else float(threshold)
+        self._dynamic_skip_position_thresholds = normalized_thresholds
+        self.config.dynamic_skip_position_thresholds = normalized_thresholds
+        self.config.dynamic_skip_max_skips = None if max_skips is None else int(max_skips)
+
+    def clear_dynamic_skip_policy(self) -> None:
+        self.config.dynamic_skip_strategy = None
+        self.config.dynamic_skip_threshold = None
+        self._dynamic_skip_position_thresholds = None
+        self.config.dynamic_skip_position_thresholds = None
+        self.config.dynamic_skip_max_skips = None
 
     def _resolve_keep_mask(
         self,
@@ -686,6 +816,10 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         return_routing_info: bool = False,
         enable_skipping: bool | None = None,
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
+        dynamic_skip_strategy: str | None = None,
+        dynamic_skip_threshold: float | None = None,
+        dynamic_skip_position_thresholds: list[float] | torch.Tensor | None = None,
+        dynamic_skip_max_skips: int | None = None,
         min_halt_depth: int | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple | ReSkipBaseModelOutputWithPast:
@@ -700,6 +834,14 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if dynamic_skip_strategy is None:
+            dynamic_skip_strategy = getattr(self.config, "dynamic_skip_strategy", None)
+        if dynamic_skip_threshold is None:
+            dynamic_skip_threshold = getattr(self.config, "dynamic_skip_threshold", None)
+        if dynamic_skip_position_thresholds is None:
+            dynamic_skip_position_thresholds = self._dynamic_skip_position_thresholds
+        if dynamic_skip_max_skips is None:
+            dynamic_skip_max_skips = getattr(self.config, "dynamic_skip_max_skips", None)
 
         if self.config.enable_looping and use_cache:
             logger.warning_once("Looping mode disables KV cache because shared blocks reuse logical layer indices.")
@@ -739,6 +881,10 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         expected_depth = hidden_states.new_zeros(()) if self.config.enable_looping else None
         exit_distribution_terms: list[torch.Tensor] | None = [] if self.config.enable_looping and self.training else None
         min_halt_depth = None if min_halt_depth is None else max(1, min(int(min_halt_depth), self.num_block_positions))
+        dynamic_skip_position_thresholds = self._normalize_dynamic_skip_position_thresholds(
+            dynamic_skip_position_thresholds
+        )
+        dynamic_skips_taken = 0
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
@@ -791,22 +937,47 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 executed_fraction = 1.0
                 expected_fraction = hidden_states.new_tensor(1.0)
 
+            current_block = self.layers[block_idx]
+            phase1_stats: dict[str, float | None] | None = None
+            phase1_outputs = None
+            completed_source_ids = None
+            if dynamic_skip_strategy is not None or collect_routing_info:
+                phase1_outputs, completed_source_ids = current_block.prepare_phase1(
+                    block_states=block_states,
+                    current_block_idx=position,
+                    return_routing_weights=collect_routing_weights,
+                )
+                phase1_stats = current_block.summarize_phase1(phase1_outputs, completed_source_ids)
+
             should_execute = True if keep_mask is None else keep_mask[position]
+            if should_execute and dynamic_skip_strategy is not None:
+                should_execute = not self._should_skip_dynamic(
+                    dynamic_skip_strategy,
+                    dynamic_skip_threshold,
+                    dynamic_skip_position_thresholds,
+                    phase1_stats if phase1_stats is not None else {},
+                    position,
+                    dynamic_skips_taken,
+                    dynamic_skip_max_skips,
+                )
             if not should_execute:
+                dynamic_skips_taken += 1
                 block_states[position + 1] = hidden_states
                 if collect_routing_info:
+                    payload = {
+                        "position": position,
+                        "block_idx": block_idx,
+                        "status": "skipped",
+                        "executed_fraction": 0.0,
+                        "halt_probability": 0.0,
+                    }
+                    if phase1_stats is not None:
+                        payload.update(phase1_stats)
                     execution_trace.append(
-                        {
-                            "position": position,
-                            "block_idx": block_idx,
-                            "status": "skipped",
-                            "executed_fraction": 0.0,
-                            "halt_probability": 0.0,
-                        }
+                        payload
                     )
                 continue
 
-            current_block = self.layers[block_idx]
             hidden_states, next_cache, attn_records, mlp_records, router_entropies = current_block(
                 block_states=block_states,
                 current_block_idx=position,
@@ -815,6 +986,8 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 use_cache=use_cache,
                 active_mask=active_gate,
                 return_routing_weights=collect_routing_weights,
+                phase1_outputs=phase1_outputs,
+                completed_source_ids=completed_source_ids,
                 **kwargs,
             )
             routing_entropy_terms.extend(router_entropies)
@@ -852,14 +1025,17 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                     expected_depth = expected_depth + soft_fraction_value
 
             if collect_routing_info:
+                payload = {
+                    "position": position,
+                    "block_idx": block_idx,
+                    "status": "executed",
+                    "executed_fraction": executed_fraction,
+                    "halt_probability": halt_probability_mean,
+                }
+                if phase1_stats is not None:
+                    payload.update(phase1_stats)
                 execution_trace.append(
-                    {
-                        "position": position,
-                        "block_idx": block_idx,
-                        "status": "executed",
-                        "executed_fraction": executed_fraction,
-                        "halt_probability": halt_probability_mean,
-                    }
+                    payload
                 )
 
         hidden_states = self.norm(hidden_states)
@@ -1010,6 +1186,10 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
         return_routing_info: bool = False,
         enable_skipping: bool | None = None,
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
+        dynamic_skip_strategy: str | None = None,
+        dynamic_skip_threshold: float | None = None,
+        dynamic_skip_position_thresholds: list[float] | torch.Tensor | None = None,
+        dynamic_skip_max_skips: int | None = None,
         ponder_loss_weight_override: float | None = None,
         min_halt_depth: int | None = None,
         **kwargs: Unpack[Any],
@@ -1032,6 +1212,10 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             return_routing_info=return_routing_info,
             enable_skipping=enable_skipping,
             skip_keep_mask=skip_keep_mask,
+            dynamic_skip_strategy=dynamic_skip_strategy,
+            dynamic_skip_threshold=dynamic_skip_threshold,
+            dynamic_skip_position_thresholds=dynamic_skip_position_thresholds,
+            dynamic_skip_max_skips=dynamic_skip_max_skips,
             min_halt_depth=min_halt_depth,
             **kwargs,
         )

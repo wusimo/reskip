@@ -15,6 +15,25 @@ from flame_reskip_common import (
 )
 
 
+def dynamic_metric_from_trace(entry: dict, strategy: str) -> float | None:
+    recent = entry.get("avg_phase1_recent_weight")
+    embed = entry.get("avg_phase1_embed_weight")
+    entropy = entry.get("avg_phase1_entropy")
+    if strategy == "recent_weight_gt":
+        return recent
+    if strategy == "recent_weight_lt":
+        return recent
+    if strategy == "embed_weight_gt":
+        return embed
+    if strategy == "entropy_lt":
+        return entropy
+    if strategy == "recent_x_entropy_lt":
+        if recent is None or entropy is None:
+            return None
+        return float(recent) * max(1.0 - float(entropy), 0.0)
+    raise ValueError(f"Unsupported dynamic skip strategy: {strategy}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze routing and export skip-ready ReSkip flame checkpoints.")
     parser.add_argument("--model_path", required=True)
@@ -37,6 +56,13 @@ def main() -> None:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--output_dir", default="outputs/flame_analysis")
     parser.add_argument("--export_best_model_dir", default="")
+    parser.add_argument("--export_best_dynamic_model_dir", default="")
+    parser.add_argument("--dynamic_skip_strategy", default="")
+    parser.add_argument("--dynamic_skip_quantiles", default="0.8,0.85,0.9,0.92,0.95,0.97,0.99")
+    parser.add_argument("--dynamic_skip_max_skips_options", default="1,2")
+    parser.add_argument("--dynamic_skip_calibration_batches", type=int, default=0)
+    parser.add_argument("--dynamic_skip_calibration_seed", type=int, default=0)
+    parser.add_argument("--dynamic_skip_eval_seed", type=int, default=1)
     args = parser.parse_args()
 
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.device, dtype=args.dtype)
@@ -47,6 +73,9 @@ def main() -> None:
         enable_skipping: bool | None,
         skip_keep_mask=None,
         return_batch_metrics: bool = False,
+        seed: int = 0,
+        num_batches: int | None = None,
+        **model_forward_kwargs,
     ):
         dataloader = build_text_dataloader(
             tokenizer=tokenizer,
@@ -61,16 +90,18 @@ def main() -> None:
             num_workers=args.num_workers,
             streaming=args.streaming,
             varlen=args.varlen,
+            seed=seed,
         )
         return evaluate_causal_lm(
             model,
             dataloader,
             args.device,
-            num_batches=args.num_batches,
+            num_batches=args.num_batches if num_batches is None else num_batches,
             return_routing_info=return_routing_info,
             enable_skipping=enable_skipping,
             skip_keep_mask=skip_keep_mask,
             return_batch_metrics=return_batch_metrics,
+            **model_forward_kwargs,
         )
 
     decoder = model.get_decoder()
@@ -164,6 +195,88 @@ def main() -> None:
                 }
             )
 
+    dynamic_skip_analysis = None
+    if args.dynamic_skip_strategy:
+        calibration_batches = (
+            args.dynamic_skip_calibration_batches
+            if args.dynamic_skip_calibration_batches > 0
+            else args.num_batches
+        )
+        dynamic_calibration = run_eval(
+            return_routing_info=True,
+            enable_skipping=False,
+            return_batch_metrics=True,
+            seed=args.dynamic_skip_calibration_seed,
+            num_batches=calibration_batches,
+        )
+        num_positions = len(dynamic_calibration.get("block_importance", []))
+        per_position_values: list[list[float]] = [[] for _ in range(num_positions)]
+        for batch in dynamic_calibration.get("batch_metrics", []):
+            for trace_entry in batch.get("execution_trace", []):
+                position = int(trace_entry["position"])
+                value = dynamic_metric_from_trace(trace_entry, args.dynamic_skip_strategy)
+                if value is None:
+                    continue
+                per_position_values[position].append(float(value))
+
+        dynamic_results = []
+        dynamic_quantiles = parse_csv_floats(args.dynamic_skip_quantiles)
+        dynamic_max_skips_options = [
+            int(item.strip()) for item in args.dynamic_skip_max_skips_options.split(",") if item.strip()
+        ]
+        dynamic_eval_full = run_eval(
+            return_routing_info=True,
+            enable_skipping=False,
+            return_batch_metrics=True,
+            seed=args.dynamic_skip_eval_seed,
+        )
+        for max_skips in dynamic_max_skips_options:
+            for quantile in dynamic_quantiles:
+                thresholds = []
+                for position, values in enumerate(per_position_values):
+                    if position == 0 or position == num_positions - 1 or not values:
+                        thresholds.append(1e9 if args.dynamic_skip_strategy.endswith("_gt") else -1e9)
+                        continue
+                    tensor = torch.tensor(values, dtype=torch.float32)
+                    thresholds.append(float(torch.quantile(tensor, quantile).item()))
+
+                metrics = run_eval(
+                    return_routing_info=True,
+                    enable_skipping=False,
+                    return_batch_metrics=True,
+                    seed=args.dynamic_skip_eval_seed,
+                    dynamic_skip_strategy=args.dynamic_skip_strategy,
+                    dynamic_skip_position_thresholds=thresholds,
+                    dynamic_skip_max_skips=max_skips,
+                )
+                metrics["quantile"] = quantile
+                metrics["max_skips"] = max_skips
+                metrics["position_thresholds"] = thresholds
+                dynamic_results.append(metrics)
+
+        best_dynamic_ppl = min(
+            dynamic_results,
+            key=lambda item: (
+                item["perplexity"],
+                -item.get("avg_blocks", 0.0),
+            ),
+        )
+        best_dynamic_skip = min(
+            dynamic_results,
+            key=lambda item: (
+                item.get("avg_blocks", 0.0),
+                item["perplexity"],
+            ),
+        )
+        dynamic_skip_analysis = {
+            "strategy": args.dynamic_skip_strategy,
+            "calibration_eval": dynamic_calibration,
+            "eval_full": dynamic_eval_full,
+            "results": dynamic_results,
+            "best_ppl_metrics": best_dynamic_ppl,
+            "best_skip_metrics": best_dynamic_skip,
+        }
+
     best = min(
         [
             entry
@@ -181,6 +294,7 @@ def main() -> None:
         "percentile_sweep": percentile_sweep,
         "block_ablation": block_ablation,
         "difficulty_buckets": difficulty_buckets,
+        "dynamic_skip_analysis": dynamic_skip_analysis,
         "best_threshold": best["threshold"],
         "best_keep_mask": best["keep_mask"],
         "best_metrics": best,
@@ -196,6 +310,22 @@ def main() -> None:
         model.save_pretrained(export_dir)
         tokenizer.save_pretrained(export_dir)
         save_json(export_dir / "routing_analysis.json", payload)
+        decoder.clear_skip_keep_mask()
+
+    if args.export_best_dynamic_model_dir and dynamic_skip_analysis is not None:
+        export_dir = Path(args.export_best_dynamic_model_dir)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        best_dynamic_skip = dynamic_skip_analysis["best_skip_metrics"]
+        decoder.clear_skip_keep_mask()
+        decoder.set_dynamic_skip_policy(
+            strategy=args.dynamic_skip_strategy,
+            position_thresholds=best_dynamic_skip["position_thresholds"],
+            max_skips=best_dynamic_skip["max_skips"],
+        )
+        model.save_pretrained(export_dir)
+        tokenizer.save_pretrained(export_dir)
+        save_json(export_dir / "routing_analysis.json", payload)
+        decoder.clear_dynamic_skip_policy()
 
     print(f"Full-depth perplexity: {full_eval['perplexity']:.4f}")
     print(
@@ -203,6 +333,19 @@ def main() -> None:
         f"ppl={best['perplexity']:.4f} | avg_blocks={best.get('avg_blocks', 0):.2f}"
     )
     print(f"Best keep mask: {best['keep_mask']}")
+    if dynamic_skip_analysis is not None:
+        best_dynamic_ppl = dynamic_skip_analysis["best_ppl_metrics"]
+        best_dynamic_skip = dynamic_skip_analysis["best_skip_metrics"]
+        print(
+            f"Best dynamic skip quality: q={best_dynamic_ppl['quantile']:.3f} "
+            f"max_skips={best_dynamic_ppl['max_skips']} "
+            f"ppl={best_dynamic_ppl['perplexity']:.4f} avg_blocks={best_dynamic_ppl.get('avg_blocks', 0):.2f}"
+        )
+        print(
+            f"Best dynamic skip depth: q={best_dynamic_skip['quantile']:.3f} "
+            f"max_skips={best_dynamic_skip['max_skips']} "
+            f"ppl={best_dynamic_skip['perplexity']:.4f} avg_blocks={best_dynamic_skip.get('avg_blocks', 0):.2f}"
+        )
 
 
 if __name__ == "__main__":

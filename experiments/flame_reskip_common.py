@@ -127,6 +127,7 @@ def evaluate_causal_lm(
     enable_skipping: bool | None = None,
     skip_keep_mask: list[bool] | None = None,
     return_batch_metrics: bool = False,
+    **model_forward_kwargs,
 ) -> dict[str, Any]:
     total_loss = 0.0
     total_tokens = 0
@@ -157,6 +158,7 @@ def evaluate_causal_lm(
             return_routing_info=return_routing_info,
             enable_skipping=enable_skipping,
             skip_keep_mask=skip_keep_mask,
+            **model_forward_kwargs,
         )
         valid_tokens = count_valid_tokens(labels)
         total_loss += outputs.loss.item() * valid_tokens
@@ -180,6 +182,7 @@ def evaluate_causal_lm(
             if routing_info is not None:
                 payload["avg_blocks"] = float(routing_info["num_blocks_executed"])
                 payload["block_importance"] = list(routing_info["block_importance"])
+                payload["execution_trace"] = routing_info.get("execution_trace", [])
             batch_metrics.append(payload)
 
         if num_batches is not None and n_batches >= num_batches:

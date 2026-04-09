@@ -15,6 +15,9 @@ Implemented behavior:
 - Block AttnRes now follows the paper implementation more closely: routing uses the paper's learned pseudo-query plus RMS-normalized block states, without the extra router-side `key_proj` that the paper does not use.
 - ReSkip now uses the paper's two-phase block execution path during training: completed-block routing for all sites in a block is batched first, then each site merges that result with the current `partial_block` online.
 - ReSkip uses the draft’s block importance definition `I(n) = max_{l>n} α_{n→l)` aggregated from downstream block-routing events, while deployment/eval still uses the calibration-based keep-mask path.
+- ReSkip deployment/eval now supports two skip modes:
+  - static calibrated keep-mask skipping
+  - no-train runtime dynamic skipping based on AttnRes phase-1 routing statistics
 - ReLoop now uses shared block groups, depth-position-specific AttnRes routers, and ACT-style halting with optional ponder-cost regularization.
 - Skip-ready checkpoints can be exported after routing analysis and then used directly for generation or `lm_eval`.
 
@@ -79,7 +82,7 @@ with:
 
 After `train.sh` finishes, flame will export a HuggingFace-format checkpoint under the dump folder.
 
-Run routing analysis and export a calibrated skip-ready checkpoint:
+Run routing analysis and export a calibrated static skip-ready checkpoint:
 
 ```bash
 python experiments/flame_analyze_reskip.py \
@@ -101,6 +104,35 @@ This produces:
 
 - `outputs/reskip_analysis/routing_analysis.json`
 - `outputs/reskip_340M_skip_ready/` as a new HF checkpoint with `skip_keep_mask` written into config
+
+Run routing analysis and export a calibrated dynamic skip-ready checkpoint:
+
+```bash
+python experiments/flame_analyze_reskip.py \
+  --model_path exp/reskip-transformer-340M \
+  --dataset /home/user01/Minko/datasets/fineweb_edu_100BT \
+  --dataset_split train \
+  --seq_len 8192 \
+  --context_len 2048 \
+  --batch_size 1 \
+  --num_batches 32 \
+  --num_workers 2 \
+  --streaming \
+  --varlen \
+  --dynamic_skip_strategy recent_weight_gt \
+  --dynamic_skip_quantiles 0.9,0.95,0.97 \
+  --dynamic_skip_max_skips_options 1 \
+  --output_dir outputs/reskip_analysis_dynamic \
+  --export_best_dynamic_model_dir outputs/reskip_340M_dynamic_skip_ready \
+  --device cuda
+```
+
+This produces:
+
+- `outputs/reskip_analysis_dynamic/routing_analysis.json`
+- `outputs/reskip_340M_dynamic_skip_ready/` as a new HF checkpoint with
+  `dynamic_skip_strategy`, `dynamic_skip_position_thresholds`, and
+  `dynamic_skip_max_skips` written into config
 
 ## Inference
 
@@ -125,6 +157,17 @@ python experiments/flame_generate.py \
   --device cuda
 ```
 
+If you exported a dynamic skip-ready checkpoint, generation uses the dynamic
+policy from config automatically:
+
+```bash
+python experiments/flame_generate.py \
+  --model_path outputs/reskip_340M_dynamic_skip_ready \
+  --prompt "The capital of France is" \
+  --max_new_tokens 32 \
+  --device cuda
+```
+
 ## lm_eval
 
 Use the wrapper so `fla` gets imported before `lm_eval` instantiates the HF model:
@@ -138,11 +181,39 @@ python experiments/flame_lm_eval.py \
   --output_path outputs/lm_eval_reskip_340M
 ```
 
+Dynamic skip can be evaluated in two ways.
+
+If you already exported a dynamic skip-ready checkpoint:
+
+```bash
+python experiments/flame_lm_eval.py \
+  --model_path outputs/reskip_340M_dynamic_skip_ready \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto \
+  --device cuda:0 \
+  --output_path outputs/lm_eval_reskip_340M_dynamic
+```
+
+Or let `flame_lm_eval.py` read `routing_analysis.json`, prepare the dynamic
+checkpoint automatically, and then run `lm_eval`:
+
+```bash
+python experiments/flame_lm_eval.py \
+  --analysis_json outputs/reskip_analysis_dynamic/routing_analysis.json \
+  --prepare_mode best_dynamic_skip \
+  --prepared_model_dir /tmp/reskip_eval_dynamic \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto \
+  --device cuda:0 \
+  --output_path outputs/lm_eval_reskip_340M_dynamic
+```
+
 ## Notes
 
 - `reskip_transformer_340M.json` is the main pretraining config. The filename is kept for continuity with earlier experiments, but after removing the non-paper router projection the exact parameter count is lower than the historical name suggests; use the training log as the source of truth.
 - `reloop_transformer_340M.json` is the weight-shared loop variant for the loop ablation line and enables ACT halting.
 - In looping mode, KV cache is disabled intentionally because shared blocks reuse logical layer positions.
 - Activation checkpointing, per-block compile, and FSDP for `reskip_transformer` now follow the block-group boundary, because the two-phase AttnRes work is executed at the block level rather than at individual layer-call boundaries.
-- The skip path used for deployment/eval is calibrated keep-mask skipping, which matches the draft’s practical implementation section.
+- The skip path used for deployment/eval now has two supported modes: static calibrated keep-mask skipping and dynamic runtime AttnRes-based skipping.
+- For current language-model checkpoints, dynamic skip is the preferred deployment/eval path because it is consistently smoother than deleting a fixed block globally.
 - `ponder_loss_weight` controls the ACT depth penalty in looping mode.

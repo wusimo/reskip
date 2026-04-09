@@ -42,6 +42,10 @@ class ReSkipTransformerConfig(PretrainedConfig):
         max_loops: int = 1,
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
+        dynamic_skip_strategy: str | None = None,
+        dynamic_skip_threshold: float | None = None,
+        dynamic_skip_position_thresholds: list[float] | None = None,
+        dynamic_skip_max_skips: int | None = None,
         halt_threshold: float = 0.99,
         halt_kl_weight: float = 0.0,
         halt_kl_min_weight: float = 0.0,
@@ -86,6 +90,12 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.max_loops = max_loops
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
+        self.dynamic_skip_strategy = dynamic_skip_strategy
+        self.dynamic_skip_threshold = dynamic_skip_threshold
+        self.dynamic_skip_position_thresholds = (
+            list(dynamic_skip_position_thresholds) if dynamic_skip_position_thresholds is not None else None
+        )
+        self.dynamic_skip_max_skips = dynamic_skip_max_skips
         self.halt_threshold = halt_threshold
         self.halt_kl_weight = halt_kl_weight
         self.halt_kl_min_weight = halt_kl_min_weight
@@ -162,6 +172,16 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 f"`skip_keep_mask` length ({len(self.skip_keep_mask)}) must match "
                 f"`attn_res_num_blocks` ({attn_res_num_blocks})."
             )
+        if (
+            self.dynamic_skip_position_thresholds is not None
+            and len(self.dynamic_skip_position_thresholds) != attn_res_num_blocks
+        ):
+            raise ValueError(
+                f"`dynamic_skip_position_thresholds` length ({len(self.dynamic_skip_position_thresholds)}) must match "
+                f"`attn_res_num_blocks` ({attn_res_num_blocks})."
+            )
+        if self.dynamic_skip_max_skips is not None and self.dynamic_skip_max_skips < 0:
+            raise ValueError("`dynamic_skip_max_skips` must be non-negative.")
 
         super().__init__(
             pad_token_id=pad_token_id,
