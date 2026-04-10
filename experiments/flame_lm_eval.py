@@ -32,6 +32,7 @@ def prepare_model_from_analysis(
     if prepare_mode == "best_static":
         keep_mask = payload["best_keep_mask"]
         decoder.set_skip_keep_mask(keep_mask)
+        print("Preparing static skip model from analysis: best_static")
     else:
         dynamic = payload.get("dynamic_skip_analysis")
         if dynamic is None:
@@ -40,10 +41,27 @@ def prepare_model_from_analysis(
             "best_dynamic_ppl": "best_ppl_metrics",
             "best_dynamic_tolerated": "best_tolerated_metrics",
             "best_dynamic_skip": "best_skip_metrics",
+            "best_dynamic_recommended": "best_recommended_metrics",
+            "best_dynamic_fast": "best_speed_metrics",
         }[prepare_mode]
         metrics = dynamic[metric_key]
+        if metrics is None:
+            raise ValueError(f"`analysis_json` does not contain `{metric_key}`.")
+        if prepare_mode == "best_dynamic_tolerated" and not dynamic.get("has_tolerated_candidate", False):
+            print(
+                "Warning: analysis contains no dynamic candidate within ppl_tolerance; "
+                "best_dynamic_tolerated falls back to best_dynamic_ppl."
+            )
+        print(
+            f"Preparing dynamic skip model from analysis: mode={prepare_mode} "
+            f"strategy={dynamic['strategy']} probe_mode={metrics.get('probe_mode', 'all')} "
+            f"position_mode={metrics.get('position_mode', 'unknown')} "
+            f"max_skips={metrics['max_skips']} "
+            f"avg_blocks={metrics.get('avg_blocks', 0):.4f} ppl={metrics['perplexity']:.4f}"
+        )
         decoder.set_dynamic_skip_policy(
             strategy=dynamic["strategy"],
+            probe_mode=metrics.get("probe_mode", "all"),
             position_thresholds=metrics["position_thresholds"],
             max_skips=metrics["max_skips"],
         )
@@ -70,17 +88,19 @@ def main() -> None:
     parser.add_argument("--analysis_json", default="")
     parser.add_argument(
         "--prepare_mode",
-        choices=("none", "best_static", "best_dynamic_ppl", "best_dynamic_tolerated", "best_dynamic_skip"),
+        choices=("none", "best_static", "best_dynamic_ppl", "best_dynamic_tolerated", "best_dynamic_recommended", "best_dynamic_skip", "best_dynamic_fast"),
         default="none",
     )
     parser.add_argument(
         "--dynamic_mode",
-        choices=("none", "quality", "tolerated", "deepest", "static"),
+        choices=("none", "quality", "tolerated", "recommended", "deepest", "fast", "static"),
         default="none",
         help=(
             "User-facing alias for analysis-based model preparation: "
             "'quality' -> best_dynamic_ppl, "
             "'tolerated' -> best_dynamic_tolerated, "
+            "'recommended' -> best_dynamic_recommended, "
+            "'fast' -> best_dynamic_fast, "
             "'deepest' -> best_dynamic_skip, "
             "'static' -> best_static."
         ),
@@ -93,6 +113,8 @@ def main() -> None:
         alias_map = {
             "quality": "best_dynamic_ppl",
             "tolerated": "best_dynamic_tolerated",
+            "recommended": "best_dynamic_recommended",
+            "fast": "best_dynamic_fast",
             "deepest": "best_dynamic_skip",
             "static": "best_static",
         }

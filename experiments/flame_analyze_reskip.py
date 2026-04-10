@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import torch
 
 from flame_reskip_common import (
+    count_valid_tokens,
     evaluate_causal_lm,
     load_model_and_tokenizer,
     parse_csv_floats,
@@ -27,11 +29,142 @@ def dynamic_metric_from_trace(entry: dict, strategy: str) -> float | None:
         return embed
     if strategy == "entropy_lt":
         return entropy
+    if strategy == "recent_minus_embed_gt":
+        if recent is None or embed is None:
+            return None
+        return float(recent) - float(embed)
+    if strategy == "recent_over_embed_gt":
+        if recent is None or embed is None or float(embed) <= 1e-8:
+            return None
+        return float(recent) / float(embed)
+    if strategy == "recent_confidence_gt":
+        if recent is None or entropy is None:
+            return None
+        return float(recent) * max(1.0 - float(entropy), 0.0)
+    if strategy == "recent_margin_confidence_gt":
+        if recent is None or embed is None or entropy is None:
+            return None
+        return (float(recent) - float(embed)) * max(1.0 - float(entropy), 0.0)
     if strategy == "recent_x_entropy_lt":
         if recent is None or entropy is None:
             return None
         return float(recent) * max(1.0 - float(entropy), 0.0)
     raise ValueError(f"Unsupported dynamic skip strategy: {strategy}")
+
+
+def dynamic_disable_threshold(strategy: str) -> float:
+    if strategy.endswith("_lt"):
+        return -1e9
+    return 1e9
+
+
+def dynamic_probe_cost_rank(probe_mode: str) -> int:
+    order = {
+        "first_attn": 0,
+        "attn_only": 1,
+        "first_layer": 2,
+        "all": 3,
+    }
+    return order.get(probe_mode, 99)
+
+
+def summarize_dynamic_metric_coverage(
+    per_position_values: list[list[float]],
+) -> dict[str, float | int]:
+    covered_positions = sum(1 for values in per_position_values if values)
+    num_values = sum(len(values) for values in per_position_values)
+    return {
+        "covered_positions": covered_positions,
+        "num_values": num_values,
+    }
+
+
+def build_dynamic_position_modes(
+    *,
+    num_positions: int,
+    block_importance: list[float],
+    mode_spec: str,
+) -> list[tuple[str, list[int]]]:
+    interior = [idx for idx in range(1, max(num_positions - 1, 1))]
+    if not mode_spec.strip():
+        return [("all", interior)]
+
+    by_importance = sorted(interior, key=lambda idx: block_importance[idx])
+    tail = interior[len(interior) // 2 :]
+    tail_by_importance = sorted(tail, key=lambda idx: block_importance[idx])
+    median_importance = None
+    if interior:
+        ordered = sorted(block_importance[idx] for idx in interior)
+        median_importance = ordered[len(ordered) // 2]
+    modes: list[tuple[str, list[int]]] = []
+    for raw in mode_spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if token == "auto":
+            for expanded in ("recommended", "all", "low1", "low2", "low3", "late2", "late3", "taillow1", "taillow2", "taillow3"):
+                raw = expanded
+                token = raw.strip()
+                if token in {name for name, _ in modes}:
+                    continue
+                if token == "recommended":
+                    positions = [idx for idx in tail if median_importance is not None and block_importance[idx] <= median_importance]
+                    if not positions and tail_by_importance:
+                        positions = tail_by_importance[:1]
+                    modes.append((token, positions))
+                    continue
+                if token == "all":
+                    modes.append(("all", interior))
+                    continue
+                if token.startswith("low"):
+                    count = int(token[3:])
+                    positions = by_importance[: max(0, min(count, len(by_importance)))]
+                    modes.append((token, positions))
+                    continue
+                if token.startswith("late"):
+                    count = int(token[4:])
+                    positions = interior[-max(0, min(count, len(interior))) :]
+                    modes.append((token, positions))
+                    continue
+                if token.startswith("taillow"):
+                    count = int(token[7:])
+                    positions = sorted(tail_by_importance[: max(0, min(count, len(tail_by_importance)))])
+                    modes.append((token, positions))
+                    continue
+            continue
+        if token == "all":
+            modes.append(("all", interior))
+            continue
+        if token == "recommended":
+            positions = [idx for idx in tail if median_importance is not None and block_importance[idx] <= median_importance]
+            if not positions and tail_by_importance:
+                positions = tail_by_importance[:1]
+            modes.append((token, positions))
+            continue
+        if token.startswith("low"):
+            count = int(token[3:])
+            positions = by_importance[: max(0, min(count, len(by_importance)))]
+            modes.append((token, positions))
+            continue
+        if token.startswith("late"):
+            count = int(token[4:])
+            positions = interior[-max(0, min(count, len(interior))) :]
+            modes.append((token, positions))
+            continue
+        if token.startswith("taillow"):
+            count = int(token[7:])
+            positions = sorted(tail_by_importance[: max(0, min(count, len(tail_by_importance)))])
+            modes.append((token, positions))
+            continue
+        if token.startswith("custom:"):
+            positions = [int(item) for item in token.split(":", 1)[1].split("|") if item.strip()]
+            positions = [idx for idx in positions if 0 < idx < num_positions - 1]
+            modes.append((token, positions))
+            continue
+        raise ValueError(f"Unsupported dynamic position mode: {token}")
+    if not modes:
+        modes.append(("all", interior))
+    return modes
 
 
 def main() -> None:
@@ -58,14 +191,31 @@ def main() -> None:
     parser.add_argument("--export_best_model_dir", default="")
     parser.add_argument("--export_best_dynamic_model_dir", default="")
     parser.add_argument("--dynamic_skip_strategy", default="")
-    parser.add_argument("--dynamic_skip_quantiles", default="0.8,0.85,0.9,0.92,0.95,0.97,0.99")
+    parser.add_argument(
+        "--dynamic_skip_probe_modes",
+        default="all,first_attn",
+        help="Comma-separated probe modes for dynamic skip: all, attn_only, first_layer, first_attn",
+    )
+    parser.add_argument("--dynamic_skip_quantiles", default="0.5,0.6,0.7,0.8,0.9,0.95,0.97,0.99")
     parser.add_argument("--dynamic_skip_max_skips_options", default="1,2")
+    parser.add_argument(
+        "--dynamic_skip_position_modes",
+        default="auto",
+        help=(
+            "Comma-separated dynamic skip candidate position sets. "
+            "Supported tokens: auto, recommended, all, lowK, lateK, taillowK, custom:i|j|k"
+        ),
+    )
     parser.add_argument("--dynamic_skip_calibration_batches", type=int, default=0)
     parser.add_argument("--dynamic_skip_calibration_seed", type=int, default=0)
     parser.add_argument("--dynamic_skip_eval_seed", type=int, default=1)
+    parser.add_argument("--dynamic_skip_speed_ppl_tolerance", type=float, default=0.05)
+    parser.add_argument("--dynamic_skip_latency_num_batches", type=int, default=16)
+    parser.add_argument("--dynamic_skip_latency_top_k", type=int, default=8)
     args = parser.parse_args()
 
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.device, dtype=args.dtype)
+    latency_batches_cache: list[dict[str, torch.Tensor]] | None = None
 
     def run_eval(
         *,
@@ -103,6 +253,85 @@ def main() -> None:
             return_batch_metrics=return_batch_metrics,
             **model_forward_kwargs,
         )
+
+    def run_latency_eval(
+        *,
+        seed: int = 0,
+        num_batches: int | None = None,
+        **model_forward_kwargs,
+    ):
+        nonlocal latency_batches_cache
+        if latency_batches_cache is None:
+            dataloader = build_text_dataloader(
+                tokenizer=tokenizer,
+                dataset=args.dataset,
+                dataset_name=args.dataset_name,
+                dataset_split=args.dataset_split,
+                data_dir=args.data_dir,
+                data_files=args.data_files,
+                seq_len=args.seq_len,
+                context_len=args.context_len,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                streaming=args.streaming,
+                varlen=args.varlen,
+                seed=seed,
+            )
+            latency_batches_cache = []
+            for batch_idx, batch in enumerate(dataloader):
+                latency_batches_cache.append(batch)
+                if num_batches is not None and (batch_idx + 1) >= num_batches:
+                    break
+        total_loss = 0.0
+        total_tokens = 0
+        total_time = 0.0
+        measured_batches = 0
+        warmup_batches = 2
+        measured_total = num_batches if num_batches is not None else len(latency_batches_cache)
+        for batch_idx, batch in enumerate(latency_batches_cache[:measured_total]):
+            input_ids = batch["input_ids"].to(args.device)
+            labels = batch["labels"].to(args.device)
+            attention_mask = batch.get("attention_mask")
+            cu_seqlens = batch.get("cu_seqlens")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(args.device)
+                if torch.all(attention_mask):
+                    attention_mask = None
+            if cu_seqlens is not None:
+                cu_seqlens = cu_seqlens.to(args.device)
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                cu_seqlens=cu_seqlens,
+                use_cache=False,
+                return_dict=True,
+                return_routing_info=False,
+                enable_skipping=False,
+                skip_keep_mask=None,
+                **model_forward_kwargs,
+            )
+            torch.cuda.synchronize()
+            duration = time.perf_counter() - start
+            valid_tokens = count_valid_tokens(labels)
+            total_loss += outputs.loss.item() * valid_tokens
+            total_tokens += valid_tokens
+            if batch_idx >= warmup_batches:
+                total_time += duration
+                measured_batches += 1
+        avg_loss = total_loss / max(total_tokens, 1)
+        mean_batch_s = total_time / max(measured_batches, 1)
+        return {
+            "loss": avg_loss,
+            "perplexity": math.exp(min(avg_loss, 20)),
+            "tokens": total_tokens,
+            "num_batches": measured_total,
+            "measured_batches": measured_batches,
+            "mean_batch_s": mean_batch_s,
+            "tokens_per_s": (total_tokens * measured_batches / max(measured_total, 1)) / max(total_time, 1e-8),
+        }
 
     decoder = model.get_decoder()
     decoder.clear_skip_keep_mask()
@@ -202,57 +431,100 @@ def main() -> None:
             if args.dynamic_skip_calibration_batches > 0
             else args.num_batches
         )
-        dynamic_calibration = run_eval(
-            return_routing_info=True,
-            enable_skipping=False,
-            return_batch_metrics=True,
-            seed=args.dynamic_skip_calibration_seed,
-            num_batches=calibration_batches,
-        )
-        num_positions = len(dynamic_calibration.get("block_importance", []))
-        per_position_values: list[list[float]] = [[] for _ in range(num_positions)]
-        for batch in dynamic_calibration.get("batch_metrics", []):
-            for trace_entry in batch.get("execution_trace", []):
-                position = int(trace_entry["position"])
-                value = dynamic_metric_from_trace(trace_entry, args.dynamic_skip_strategy)
-                if value is None:
-                    continue
-                per_position_values[position].append(float(value))
+        disabled_thresholds = [dynamic_disable_threshold(args.dynamic_skip_strategy)] * decoder.num_block_positions
+        dynamic_probe_modes = [item.strip() for item in args.dynamic_skip_probe_modes.split(",") if item.strip()]
+        if not dynamic_probe_modes:
+            raise ValueError("`--dynamic_skip_probe_modes` must contain at least one probe mode.")
+        calibration_by_probe_mode = {}
+        num_positions = 0
+        for probe_mode in dynamic_probe_modes:
+            probe_calibration = run_eval(
+                return_routing_info=True,
+                enable_skipping=False,
+                return_batch_metrics=True,
+                seed=args.dynamic_skip_calibration_seed,
+                num_batches=calibration_batches,
+                dynamic_skip_strategy=args.dynamic_skip_strategy,
+                dynamic_skip_probe_mode=probe_mode,
+                dynamic_skip_position_thresholds=disabled_thresholds,
+                dynamic_skip_max_skips=0,
+            )
+            probe_num_positions = len(probe_calibration.get("block_importance", []))
+            num_positions = max(num_positions, probe_num_positions)
+            per_position_values: list[list[float]] = [[] for _ in range(probe_num_positions)]
+            for batch in probe_calibration.get("batch_metrics", []):
+                for trace_entry in batch.get("execution_trace", []):
+                    position = int(trace_entry["position"])
+                    if position >= probe_num_positions:
+                        continue
+                    value = dynamic_metric_from_trace(trace_entry, args.dynamic_skip_strategy)
+                    if value is None:
+                        continue
+                    per_position_values[position].append(float(value))
+            calibration_by_probe_mode[probe_mode] = {
+                "calibration_eval": probe_calibration,
+                "per_position_values": per_position_values,
+                "metric_coverage": summarize_dynamic_metric_coverage(per_position_values),
+            }
 
+        reference_probe_mode = dynamic_probe_modes[0]
+        reference_calibration = calibration_by_probe_mode[reference_probe_mode]["calibration_eval"]
         dynamic_results = []
         dynamic_quantiles = parse_csv_floats(args.dynamic_skip_quantiles)
         dynamic_max_skips_options = [
             int(item.strip()) for item in args.dynamic_skip_max_skips_options.split(",") if item.strip()
         ]
+        position_modes = build_dynamic_position_modes(
+            num_positions=num_positions,
+            block_importance=reference_calibration.get("block_importance", []),
+            mode_spec=args.dynamic_skip_position_modes,
+        )
         dynamic_eval_full = run_eval(
             return_routing_info=True,
             enable_skipping=False,
             return_batch_metrics=True,
             seed=args.dynamic_skip_eval_seed,
+            dynamic_skip_strategy=args.dynamic_skip_strategy,
+            dynamic_skip_position_thresholds=disabled_thresholds,
+            dynamic_skip_max_skips=0,
         )
-        for max_skips in dynamic_max_skips_options:
-            for quantile in dynamic_quantiles:
-                thresholds = []
-                for position, values in enumerate(per_position_values):
-                    if position == 0 or position == num_positions - 1 or not values:
-                        thresholds.append(1e9 if args.dynamic_skip_strategy.endswith("_gt") else -1e9)
-                        continue
-                    tensor = torch.tensor(values, dtype=torch.float32)
-                    thresholds.append(float(torch.quantile(tensor, quantile).item()))
+        for probe_mode in dynamic_probe_modes:
+            probe_calibration = calibration_by_probe_mode[probe_mode]
+            per_position_values = probe_calibration["per_position_values"]
+            for mode_name, allowed_positions in position_modes:
+                allowed_set = set(allowed_positions)
+                for max_skips in dynamic_max_skips_options:
+                    for quantile in dynamic_quantiles:
+                        thresholds = []
+                        for position, values in enumerate(per_position_values):
+                            if (
+                                position == 0
+                                or position == num_positions - 1
+                                or position not in allowed_set
+                                or not values
+                            ):
+                                thresholds.append(disabled_thresholds[position])
+                                continue
+                            tensor = torch.tensor(values, dtype=torch.float32)
+                            thresholds.append(float(torch.quantile(tensor, quantile).item()))
 
-                metrics = run_eval(
-                    return_routing_info=True,
-                    enable_skipping=False,
-                    return_batch_metrics=True,
-                    seed=args.dynamic_skip_eval_seed,
-                    dynamic_skip_strategy=args.dynamic_skip_strategy,
-                    dynamic_skip_position_thresholds=thresholds,
-                    dynamic_skip_max_skips=max_skips,
-                )
-                metrics["quantile"] = quantile
-                metrics["max_skips"] = max_skips
-                metrics["position_thresholds"] = thresholds
-                dynamic_results.append(metrics)
+                        metrics = run_eval(
+                            return_routing_info=True,
+                            enable_skipping=False,
+                            return_batch_metrics=True,
+                            seed=args.dynamic_skip_eval_seed,
+                            dynamic_skip_strategy=args.dynamic_skip_strategy,
+                            dynamic_skip_probe_mode=probe_mode,
+                            dynamic_skip_position_thresholds=thresholds,
+                            dynamic_skip_max_skips=max_skips,
+                        )
+                        metrics["probe_mode"] = probe_mode
+                        metrics["quantile"] = quantile
+                        metrics["max_skips"] = max_skips
+                        metrics["position_mode"] = mode_name
+                        metrics["allowed_positions"] = sorted(allowed_set)
+                        metrics["position_thresholds"] = thresholds
+                        dynamic_results.append(metrics)
 
         best_dynamic_ppl = min(
             dynamic_results,
@@ -268,26 +540,97 @@ def main() -> None:
                 item["perplexity"],
             ),
         )
+        tolerated_candidates = [
+            item
+            for item in dynamic_results
+            if item["perplexity"] <= dynamic_eval_full["perplexity"] * (1.0 + args.ppl_tolerance)
+        ]
         best_dynamic_tolerated = min(
-            [
-                item
-                for item in dynamic_results
-                if item["perplexity"] <= dynamic_eval_full["perplexity"] * (1.0 + args.ppl_tolerance)
-            ],
+            tolerated_candidates,
             key=lambda item: (
                 item.get("avg_blocks", float("inf")),
                 item["perplexity"],
             ),
             default=best_dynamic_ppl,
         )
+        recommended_candidates = [item for item in dynamic_results if item.get("position_mode") == "recommended"]
+        best_dynamic_recommended = min(
+            recommended_candidates,
+            key=lambda item: (
+                item["perplexity"],
+                -item.get("avg_blocks", 0.0),
+            ),
+            default=best_dynamic_tolerated,
+        )
+        latency_baseline = None
+        latency_candidates = []
+        best_dynamic_speed = None
+        if args.dynamic_skip_latency_num_batches > 0:
+            speed_candidates = [
+                item
+                for item in dynamic_results
+                if item["perplexity"] <= dynamic_eval_full["perplexity"] * (1.0 + args.dynamic_skip_speed_ppl_tolerance)
+            ]
+            speed_candidates = sorted(
+                speed_candidates,
+                key=lambda item: (
+                    item.get("avg_blocks", float("inf")),
+                    dynamic_probe_cost_rank(item.get("probe_mode", "all")),
+                    item["perplexity"],
+                ),
+            )[: max(args.dynamic_skip_latency_top_k, 1)]
+            latency_baseline = run_latency_eval(
+                seed=args.dynamic_skip_eval_seed,
+                num_batches=args.dynamic_skip_latency_num_batches,
+            )
+            for item in speed_candidates:
+                latency = run_latency_eval(
+                    seed=args.dynamic_skip_eval_seed,
+                    num_batches=args.dynamic_skip_latency_num_batches,
+                    dynamic_skip_strategy=args.dynamic_skip_strategy,
+                    dynamic_skip_probe_mode=item.get("probe_mode", "all"),
+                    dynamic_skip_position_thresholds=item["position_thresholds"],
+                    dynamic_skip_max_skips=item["max_skips"],
+                )
+                candidate_payload = dict(item)
+                candidate_payload["latency"] = latency
+                candidate_payload["speedup_vs_full"] = latency_baseline["mean_batch_s"] / max(
+                    latency["mean_batch_s"], 1e-8
+                )
+                latency_candidates.append(candidate_payload)
+            if latency_candidates:
+                best_dynamic_speed = min(
+                    latency_candidates,
+                    key=lambda item: (
+                        item["latency"]["mean_batch_s"],
+                        item["perplexity"],
+                    ),
+                )
+
         dynamic_skip_analysis = {
             "strategy": args.dynamic_skip_strategy,
-            "calibration_eval": dynamic_calibration,
+            "reference_probe_mode": reference_probe_mode,
+            "metric_coverage": {
+                probe_mode: probe_calibration["metric_coverage"]
+                for probe_mode, probe_calibration in calibration_by_probe_mode.items()
+            },
+            "calibration_eval": reference_calibration,
+            "calibration_by_probe_mode": {
+                probe_mode: probe_calibration["calibration_eval"]
+                for probe_mode, probe_calibration in calibration_by_probe_mode.items()
+            },
             "eval_full": dynamic_eval_full,
             "results": dynamic_results,
+            "tolerated_candidate_count": len(tolerated_candidates),
+            "has_tolerated_candidate": bool(tolerated_candidates),
             "best_ppl_metrics": best_dynamic_ppl,
             "best_skip_metrics": best_dynamic_skip,
             "best_tolerated_metrics": best_dynamic_tolerated,
+            "best_recommended_metrics": best_dynamic_recommended,
+            "speed_ppl_tolerance": args.dynamic_skip_speed_ppl_tolerance,
+            "latency_baseline": latency_baseline,
+            "latency_candidates": latency_candidates,
+            "best_speed_metrics": best_dynamic_speed,
         }
 
     best = min(
@@ -350,21 +693,57 @@ def main() -> None:
         best_dynamic_ppl = dynamic_skip_analysis["best_ppl_metrics"]
         best_dynamic_skip = dynamic_skip_analysis["best_skip_metrics"]
         best_dynamic_tolerated = dynamic_skip_analysis["best_tolerated_metrics"]
+        best_dynamic_recommended = dynamic_skip_analysis["best_recommended_metrics"]
+        coverage = dynamic_skip_analysis.get("metric_coverage", {})
+        if coverage and isinstance(next(iter(coverage.values())), dict):
+            coverage_text = ", ".join(
+                f"{probe}:pos={stats.get('covered_positions', 0)} values={stats.get('num_values', 0)}"
+                for probe, stats in coverage.items()
+            )
+            print(f"Dynamic metric coverage: {coverage_text}")
+        else:
+            print(
+                f"Dynamic metric coverage: positions={coverage.get('covered_positions', 0)} "
+                f"values={coverage.get('num_values', 0)}"
+            )
         print(
-            f"Best dynamic skip quality: q={best_dynamic_ppl['quantile']:.3f} "
+            f"Best dynamic skip quality: probe={best_dynamic_ppl['probe_mode']} mode={best_dynamic_ppl['position_mode']} "
+            f"q={best_dynamic_ppl['quantile']:.3f} "
             f"max_skips={best_dynamic_ppl['max_skips']} "
             f"ppl={best_dynamic_ppl['perplexity']:.4f} avg_blocks={best_dynamic_ppl.get('avg_blocks', 0):.2f}"
         )
         print(
-            f"Best dynamic skip tolerated: q={best_dynamic_tolerated['quantile']:.3f} "
+            f"Best dynamic skip tolerated: probe={best_dynamic_tolerated['probe_mode']} mode={best_dynamic_tolerated['position_mode']} "
+            f"q={best_dynamic_tolerated['quantile']:.3f} "
             f"max_skips={best_dynamic_tolerated['max_skips']} "
             f"ppl={best_dynamic_tolerated['perplexity']:.4f} avg_blocks={best_dynamic_tolerated.get('avg_blocks', 0):.2f}"
         )
+        if not dynamic_skip_analysis.get("has_tolerated_candidate", False):
+            print(
+                "Warning: no dynamic skip candidate satisfied ppl_tolerance; "
+                "the tolerated export falls back to the best-quality dynamic configuration."
+            )
         print(
-            f"Best dynamic skip depth: q={best_dynamic_skip['quantile']:.3f} "
+            f"Best dynamic skip recommended: probe={best_dynamic_recommended['probe_mode']} mode={best_dynamic_recommended['position_mode']} "
+            f"q={best_dynamic_recommended['quantile']:.3f} "
+            f"max_skips={best_dynamic_recommended['max_skips']} "
+            f"ppl={best_dynamic_recommended['perplexity']:.4f} avg_blocks={best_dynamic_recommended.get('avg_blocks', 0):.2f}"
+        )
+        print(
+            f"Best dynamic skip depth: probe={best_dynamic_skip['probe_mode']} mode={best_dynamic_skip['position_mode']} "
+            f"q={best_dynamic_skip['quantile']:.3f} "
             f"max_skips={best_dynamic_skip['max_skips']} "
             f"ppl={best_dynamic_skip['perplexity']:.4f} avg_blocks={best_dynamic_skip.get('avg_blocks', 0):.2f}"
         )
+        if dynamic_skip_analysis.get("best_speed_metrics") is not None:
+            best_dynamic_speed = dynamic_skip_analysis["best_speed_metrics"]
+            latency = best_dynamic_speed["latency"]
+            print(
+                f"Best dynamic skip speed: probe={best_dynamic_speed['probe_mode']} mode={best_dynamic_speed['position_mode']} "
+                f"q={best_dynamic_speed['quantile']:.3f} max_skips={best_dynamic_speed['max_skips']} "
+                f"ppl={best_dynamic_speed['perplexity']:.4f} avg_blocks={best_dynamic_speed.get('avg_blocks', 0):.2f} "
+                f"mean_batch_s={latency['mean_batch_s']:.6f} speedup={best_dynamic_speed['speedup_vs_full']:.3f}x"
+            )
 
 
 if __name__ == "__main__":
