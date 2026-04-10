@@ -54,13 +54,15 @@ def prepare_model_from_analysis(
             )
         print(
             f"Preparing dynamic skip model from analysis: mode={prepare_mode} "
-            f"strategy={dynamic['strategy']} probe_mode={metrics.get('probe_mode', 'all')} "
+            f"strategy={dynamic['strategy']} granularity={dynamic.get('granularity', 'block')} "
+            f"probe_mode={metrics.get('probe_mode', 'all')} "
             f"position_mode={metrics.get('position_mode', 'unknown')} "
             f"max_skips={metrics['max_skips']} "
             f"avg_blocks={metrics.get('avg_blocks', 0):.4f} ppl={metrics['perplexity']:.4f}"
         )
         decoder.set_dynamic_skip_policy(
             strategy=dynamic["strategy"],
+            granularity=dynamic.get("granularity", "block"),
             probe_mode=metrics.get("probe_mode", "all"),
             position_thresholds=metrics["position_thresholds"],
             max_skips=metrics["max_skips"],

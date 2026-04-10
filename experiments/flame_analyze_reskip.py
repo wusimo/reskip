@@ -18,6 +18,8 @@ from flame_reskip_common import (
 
 
 def dynamic_metric_from_trace(entry: dict, strategy: str) -> float | None:
+    if strategy.startswith("prev_"):
+        strategy = strategy[5:]
     recent = entry.get("avg_phase1_recent_weight")
     embed = entry.get("avg_phase1_embed_weight")
     entropy = entry.get("avg_phase1_entropy")
@@ -60,6 +62,7 @@ def dynamic_disable_threshold(strategy: str) -> float:
 
 def dynamic_probe_cost_rank(probe_mode: str) -> int:
     order = {
+        "cached_prev": 0,
         "first_attn": 0,
         "attn_only": 1,
         "first_layer": 2,
@@ -167,6 +170,79 @@ def build_dynamic_position_modes(
     return modes
 
 
+def expand_block_importance_to_layers(
+    block_importance: list[float],
+    layers_per_block: int,
+) -> list[float]:
+    if layers_per_block <= 0:
+        return []
+    expanded: list[float] = []
+    for value in block_importance:
+        expanded.extend([float(value)] * layers_per_block)
+    return expanded
+
+
+def select_fast_latency_candidates(
+    dynamic_results: list[dict],
+    *,
+    full_perplexity: float,
+    speed_ppl_tolerance: float,
+    granularity: str,
+    top_k: int,
+) -> list[dict]:
+    candidates = [
+        item
+        for item in dynamic_results
+        if item["perplexity"] <= full_perplexity * (1.0 + speed_ppl_tolerance)
+    ]
+    if not candidates:
+        return []
+
+    depth_key_name = "avg_compute_units" if granularity == "mlp" else "avg_blocks"
+
+    def item_key(item: dict) -> tuple[float, int, float]:
+        return (
+            float(item.get(depth_key_name, float("inf"))),
+            dynamic_probe_cost_rank(item.get("probe_mode", "all")),
+            float(item["perplexity"]),
+        )
+
+    frontier: list[dict] = []
+    probe_modes = sorted({item.get("probe_mode", "all") for item in candidates}, key=dynamic_probe_cost_rank)
+    for probe_mode in probe_modes:
+        probe_items = sorted(
+            [item for item in candidates if item.get("probe_mode", "all") == probe_mode],
+            key=lambda item: (
+                float(item.get(depth_key_name, float("inf"))),
+                float(item["perplexity"]),
+            ),
+        )
+        best_ppl_so_far = float("inf")
+        for item in probe_items:
+            ppl = float(item["perplexity"])
+            if ppl + 1e-9 < best_ppl_so_far:
+                frontier.append(item)
+                best_ppl_so_far = ppl
+        if probe_items:
+            frontier.append(min(probe_items, key=lambda item: float(item["perplexity"])))
+            frontier.append(min(probe_items, key=lambda item: float(item.get(depth_key_name, float("inf")))))
+
+    unique_candidates: dict[tuple, dict] = {}
+    for item in frontier:
+        key = (
+            item.get("probe_mode", "all"),
+            item.get("position_mode", "unknown"),
+            float(item.get("quantile", 0.0)),
+            int(item.get("max_skips", 0)),
+        )
+        current = unique_candidates.get(key)
+        if current is None or item_key(item) < item_key(current):
+            unique_candidates[key] = item
+
+    ranked = sorted(unique_candidates.values(), key=item_key)
+    return ranked[: max(top_k, 1)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze routing and export skip-ready ReSkip flame checkpoints.")
     parser.add_argument("--model_path", required=True)
@@ -191,6 +267,12 @@ def main() -> None:
     parser.add_argument("--export_best_model_dir", default="")
     parser.add_argument("--export_best_dynamic_model_dir", default="")
     parser.add_argument("--dynamic_skip_strategy", default="")
+    parser.add_argument(
+        "--dynamic_skip_granularity",
+        choices=("block", "mlp"),
+        default="block",
+        help="Apply dynamic skip at the block level or the per-layer MLP sublayer level.",
+    )
     parser.add_argument(
         "--dynamic_skip_probe_modes",
         default="all,first_attn",
@@ -426,13 +508,21 @@ def main() -> None:
 
     dynamic_skip_analysis = None
     if args.dynamic_skip_strategy:
+        dynamic_trace_field = "mlp_execution_trace" if args.dynamic_skip_granularity == "mlp" else "execution_trace"
         calibration_batches = (
             args.dynamic_skip_calibration_batches
             if args.dynamic_skip_calibration_batches > 0
             else args.num_batches
         )
-        disabled_thresholds = [dynamic_disable_threshold(args.dynamic_skip_strategy)] * decoder.num_block_positions
+        dynamic_num_positions = (
+            decoder.config.num_hidden_layers if args.dynamic_skip_granularity == "mlp" else decoder.num_block_positions
+        )
+        disabled_thresholds = [dynamic_disable_threshold(args.dynamic_skip_strategy)] * dynamic_num_positions
         dynamic_probe_modes = [item.strip() for item in args.dynamic_skip_probe_modes.split(",") if item.strip()]
+        if args.dynamic_skip_strategy.startswith("prev_"):
+            dynamic_probe_modes = ["cached_prev"]
+        if args.dynamic_skip_granularity == "mlp":
+            dynamic_probe_modes = ["all"]
         if not dynamic_probe_modes:
             raise ValueError("`--dynamic_skip_probe_modes` must contain at least one probe mode.")
         calibration_by_probe_mode = {}
@@ -445,15 +535,16 @@ def main() -> None:
                 seed=args.dynamic_skip_calibration_seed,
                 num_batches=calibration_batches,
                 dynamic_skip_strategy=args.dynamic_skip_strategy,
+                dynamic_skip_granularity=args.dynamic_skip_granularity,
                 dynamic_skip_probe_mode=probe_mode,
                 dynamic_skip_position_thresholds=disabled_thresholds,
                 dynamic_skip_max_skips=0,
             )
-            probe_num_positions = len(probe_calibration.get("block_importance", []))
+            probe_num_positions = dynamic_num_positions
             num_positions = max(num_positions, probe_num_positions)
             per_position_values: list[list[float]] = [[] for _ in range(probe_num_positions)]
             for batch in probe_calibration.get("batch_metrics", []):
-                for trace_entry in batch.get("execution_trace", []):
+                for trace_entry in batch.get(dynamic_trace_field, []):
                     position = int(trace_entry["position"])
                     if position >= probe_num_positions:
                         continue
@@ -476,7 +567,11 @@ def main() -> None:
         ]
         position_modes = build_dynamic_position_modes(
             num_positions=num_positions,
-            block_importance=reference_calibration.get("block_importance", []),
+            block_importance=(
+                expand_block_importance_to_layers(reference_calibration.get("block_importance", []), decoder.layers_per_block)
+                if args.dynamic_skip_granularity == "mlp"
+                else reference_calibration.get("block_importance", [])
+            ),
             mode_spec=args.dynamic_skip_position_modes,
         )
         dynamic_eval_full = run_eval(
@@ -485,9 +580,16 @@ def main() -> None:
             return_batch_metrics=True,
             seed=args.dynamic_skip_eval_seed,
             dynamic_skip_strategy=args.dynamic_skip_strategy,
+            dynamic_skip_granularity=args.dynamic_skip_granularity,
             dynamic_skip_position_thresholds=disabled_thresholds,
             dynamic_skip_max_skips=0,
         )
+
+        def dynamic_depth_key(item: dict) -> float:
+            if args.dynamic_skip_granularity == "mlp":
+                return item.get("avg_compute_units", float("inf"))
+            return item.get("avg_blocks", float("inf"))
+
         for probe_mode in dynamic_probe_modes:
             probe_calibration = calibration_by_probe_mode[probe_mode]
             per_position_values = probe_calibration["per_position_values"]
@@ -514,6 +616,7 @@ def main() -> None:
                             return_batch_metrics=True,
                             seed=args.dynamic_skip_eval_seed,
                             dynamic_skip_strategy=args.dynamic_skip_strategy,
+                            dynamic_skip_granularity=args.dynamic_skip_granularity,
                             dynamic_skip_probe_mode=probe_mode,
                             dynamic_skip_position_thresholds=thresholds,
                             dynamic_skip_max_skips=max_skips,
@@ -530,13 +633,13 @@ def main() -> None:
             dynamic_results,
             key=lambda item: (
                 item["perplexity"],
-                -item.get("avg_blocks", 0.0),
+                -item.get("avg_compute_units", 0.0) if args.dynamic_skip_granularity == "mlp" else -item.get("avg_blocks", 0.0),
             ),
         )
         best_dynamic_skip = min(
             dynamic_results,
             key=lambda item: (
-                item.get("avg_blocks", 0.0),
+                dynamic_depth_key(item),
                 item["perplexity"],
             ),
         )
@@ -548,7 +651,7 @@ def main() -> None:
         best_dynamic_tolerated = min(
             tolerated_candidates,
             key=lambda item: (
-                item.get("avg_blocks", float("inf")),
+                dynamic_depth_key(item),
                 item["perplexity"],
             ),
             default=best_dynamic_ppl,
@@ -558,7 +661,7 @@ def main() -> None:
             recommended_candidates,
             key=lambda item: (
                 item["perplexity"],
-                -item.get("avg_blocks", 0.0),
+                -item.get("avg_compute_units", 0.0) if args.dynamic_skip_granularity == "mlp" else -item.get("avg_blocks", 0.0),
             ),
             default=best_dynamic_tolerated,
         )
@@ -566,19 +669,13 @@ def main() -> None:
         latency_candidates = []
         best_dynamic_speed = None
         if args.dynamic_skip_latency_num_batches > 0:
-            speed_candidates = [
-                item
-                for item in dynamic_results
-                if item["perplexity"] <= dynamic_eval_full["perplexity"] * (1.0 + args.dynamic_skip_speed_ppl_tolerance)
-            ]
-            speed_candidates = sorted(
-                speed_candidates,
-                key=lambda item: (
-                    item.get("avg_blocks", float("inf")),
-                    dynamic_probe_cost_rank(item.get("probe_mode", "all")),
-                    item["perplexity"],
-                ),
-            )[: max(args.dynamic_skip_latency_top_k, 1)]
+            speed_candidates = select_fast_latency_candidates(
+                dynamic_results,
+                full_perplexity=dynamic_eval_full["perplexity"],
+                speed_ppl_tolerance=args.dynamic_skip_speed_ppl_tolerance,
+                granularity=args.dynamic_skip_granularity,
+                top_k=args.dynamic_skip_latency_top_k,
+            )
             latency_baseline = run_latency_eval(
                 seed=args.dynamic_skip_eval_seed,
                 num_batches=args.dynamic_skip_latency_num_batches,
@@ -588,6 +685,7 @@ def main() -> None:
                     seed=args.dynamic_skip_eval_seed,
                     num_batches=args.dynamic_skip_latency_num_batches,
                     dynamic_skip_strategy=args.dynamic_skip_strategy,
+                    dynamic_skip_granularity=args.dynamic_skip_granularity,
                     dynamic_skip_probe_mode=item.get("probe_mode", "all"),
                     dynamic_skip_position_thresholds=item["position_thresholds"],
                     dynamic_skip_max_skips=item["max_skips"],
@@ -609,6 +707,7 @@ def main() -> None:
 
         dynamic_skip_analysis = {
             "strategy": args.dynamic_skip_strategy,
+            "granularity": args.dynamic_skip_granularity,
             "reference_probe_mode": reference_probe_mode,
             "metric_coverage": {
                 probe_mode: probe_calibration["metric_coverage"]
@@ -675,6 +774,7 @@ def main() -> None:
         decoder.clear_skip_keep_mask()
         decoder.set_dynamic_skip_policy(
             strategy=args.dynamic_skip_strategy,
+            granularity=args.dynamic_skip_granularity,
             position_thresholds=best_dynamic_deploy["position_thresholds"],
             max_skips=best_dynamic_deploy["max_skips"],
         )
@@ -710,13 +810,17 @@ def main() -> None:
             f"Best dynamic skip quality: probe={best_dynamic_ppl['probe_mode']} mode={best_dynamic_ppl['position_mode']} "
             f"q={best_dynamic_ppl['quantile']:.3f} "
             f"max_skips={best_dynamic_ppl['max_skips']} "
-            f"ppl={best_dynamic_ppl['perplexity']:.4f} avg_blocks={best_dynamic_ppl.get('avg_blocks', 0):.2f}"
+            f"ppl={best_dynamic_ppl['perplexity']:.4f} "
+            f"{'avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks'}="
+            f"{best_dynamic_ppl.get('avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks', 0):.2f}"
         )
         print(
             f"Best dynamic skip tolerated: probe={best_dynamic_tolerated['probe_mode']} mode={best_dynamic_tolerated['position_mode']} "
             f"q={best_dynamic_tolerated['quantile']:.3f} "
             f"max_skips={best_dynamic_tolerated['max_skips']} "
-            f"ppl={best_dynamic_tolerated['perplexity']:.4f} avg_blocks={best_dynamic_tolerated.get('avg_blocks', 0):.2f}"
+            f"ppl={best_dynamic_tolerated['perplexity']:.4f} "
+            f"{'avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks'}="
+            f"{best_dynamic_tolerated.get('avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks', 0):.2f}"
         )
         if not dynamic_skip_analysis.get("has_tolerated_candidate", False):
             print(
@@ -727,13 +831,17 @@ def main() -> None:
             f"Best dynamic skip recommended: probe={best_dynamic_recommended['probe_mode']} mode={best_dynamic_recommended['position_mode']} "
             f"q={best_dynamic_recommended['quantile']:.3f} "
             f"max_skips={best_dynamic_recommended['max_skips']} "
-            f"ppl={best_dynamic_recommended['perplexity']:.4f} avg_blocks={best_dynamic_recommended.get('avg_blocks', 0):.2f}"
+            f"ppl={best_dynamic_recommended['perplexity']:.4f} "
+            f"{'avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks'}="
+            f"{best_dynamic_recommended.get('avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks', 0):.2f}"
         )
         print(
             f"Best dynamic skip depth: probe={best_dynamic_skip['probe_mode']} mode={best_dynamic_skip['position_mode']} "
             f"q={best_dynamic_skip['quantile']:.3f} "
             f"max_skips={best_dynamic_skip['max_skips']} "
-            f"ppl={best_dynamic_skip['perplexity']:.4f} avg_blocks={best_dynamic_skip.get('avg_blocks', 0):.2f}"
+            f"ppl={best_dynamic_skip['perplexity']:.4f} "
+            f"{'avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks'}="
+            f"{best_dynamic_skip.get('avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks', 0):.2f}"
         )
         if dynamic_skip_analysis.get("best_speed_metrics") is not None:
             best_dynamic_speed = dynamic_skip_analysis["best_speed_metrics"]
@@ -741,7 +849,9 @@ def main() -> None:
             print(
                 f"Best dynamic skip speed: probe={best_dynamic_speed['probe_mode']} mode={best_dynamic_speed['position_mode']} "
                 f"q={best_dynamic_speed['quantile']:.3f} max_skips={best_dynamic_speed['max_skips']} "
-                f"ppl={best_dynamic_speed['perplexity']:.4f} avg_blocks={best_dynamic_speed.get('avg_blocks', 0):.2f} "
+                f"ppl={best_dynamic_speed['perplexity']:.4f} "
+                f"{'avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks'}="
+                f"{best_dynamic_speed.get('avg_compute_units' if args.dynamic_skip_granularity == 'mlp' else 'avg_blocks', 0):.2f} "
                 f"mean_batch_s={latency['mean_batch_s']:.6f} speedup={best_dynamic_speed['speedup_vs_full']:.3f}x"
             )
 

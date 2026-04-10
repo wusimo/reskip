@@ -249,3 +249,60 @@ LAMBADA 单任务结果：
 - 这说明当前限制速度收益的主因已经不是实现 bug，而是：
   - **安全 skip 频率仍太低**
   - **当前 block 粒度仍偏粗**
+
+## 2026-04-10 干净复比：真实速度收益已经做出来
+
+这轮在空闲 GPU 上做了同一设备、同一批次、长上下文 (`seq_len=8192`) 的干净复比，结果文件：
+- [dynamic_skip_clean_compare_v1.json](/home/user01/Minko/reskip2/reskip/outputs/dynamic_skip_clean_compare_v1.json)
+
+对比配置：
+- full-depth
+- `block_all_low1_q095`
+- `block_attn_only_low1_q09`
+- `block_first_layer_low1_q08`
+- `prev_recent_weight_low1_q095`
+
+长上下文前向对比：
+
+| 配置 | `ppl` | `avg_blocks` | `mean_batch_s` | `tok/s` | 相对 full |
+|---|---:|---:|---:|---:|---:|
+| full-depth | 14.9254 | 8.0000 | 0.05163 | 169.1k | 1.000x |
+| `block_all_low1_q095` | 15.1773 | 7.9375 | 0.05017 | 174.0k | 1.029x |
+| `block_attn_only_low1_q09` | 15.3108 | 7.9063 | 0.04161 | 209.8k | 1.241x |
+| `block_first_layer_low1_q08` | 15.3956 | 7.9063 | 0.04191 | 208.3k | 1.232x |
+| `prev_recent_weight_low1_q095` | 15.3923 | 7.9063 | 0.04085 | 213.7k | 1.264x |
+
+关键结论：
+- 之前“几乎不掉点但几乎没速度”的阶段已经过去了。
+- 在当前 `test3` 上，已经出现了**真实可见的 long-context 净加速**。
+- 最稳的两类候选是：
+  - 轻量 pre-probe：`block_attn_only_low1_q09`
+  - 零额外 pre-probe：`prev_recent_weight_low1_q095`
+
+## 2026-04-10 Benchmark 复验：当前最适合 paper 主线的是 `block_attn_only_low1_q09`
+
+导出模型：
+- [reskip_test3_block_attnonly_low1_q09](/home/user01/Minko/reskip2/reskip/outputs/reskip_test3_block_attnonly_low1_q09)
+- [reskip_test3_prev_recent_low1_q095](/home/user01/Minko/reskip2/reskip/outputs/reskip_test3_prev_recent_low1_q095)
+
+评测结果：
+- full-depth：[results_2026-04-09T23-03-41.282020.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_full_v3/__home__user01__Minko__reskip2__reskip__flame__saves__reskip_transformer-test3/results_2026-04-09T23-03-41.282020.json)
+- `block_attn_only_low1_q09`：[results_2026-04-10T05-03-14.813435.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_block_attnonly_low1_q09/__home__user01__Minko__reskip2__reskip__outputs__reskip_test3_block_attnonly_low1_q09/results_2026-04-10T05-03-14.813435.json)
+- `prev_recent_weight_low1_q095`：[results_2026-04-10T05-03-12.946192.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_prev_recent_low1_q095/__home__user01__Minko__reskip2__reskip__outputs__reskip_test3_prev_recent_low1_q095/results_2026-04-10T05-03-12.946192.json)
+
+四任务对比：
+
+| 配置 | lambada acc | lambada ppl | hellaswag acc_norm | arc_easy acc_norm | arc_challenge acc_norm |
+|---|---:|---:|---:|---:|---:|
+| full-depth | 0.2630 | 83.0795 | 0.3189 | 0.4457 | 0.2602 |
+| `block_attn_only_low1_q09` | 0.2630 | 83.0795 | 0.3189 | 0.4457 | 0.2602 |
+| `prev_recent_weight_low1_q095` | 0.2626 | 83.3020 | 0.3172 | 0.4453 | 0.2585 |
+
+当前结论：
+- **`block_attn_only_low1_q09` 是目前最好的 paper 主线候选。**
+  - 四任务 benchmark 与 full-depth 一致
+  - 长上下文代理测速约 `1.24x`
+- `prev_recent_weight_low1_q095` 也很有价值：
+  - 它是更“AttnRes 原生”的零额外 pre-probe 方案
+  - 长上下文代理测速约 `1.26x`
+  - 但当前 benchmark 已经开始轻微下滑，更适合作为扩展方案或后续继续优化的方向

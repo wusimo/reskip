@@ -43,6 +43,7 @@ class ReSkipTransformerConfig(PretrainedConfig):
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
         dynamic_skip_strategy: str | None = None,
+        dynamic_skip_granularity: str = "block",
         dynamic_skip_probe_mode: str | None = "all",
         dynamic_skip_threshold: float | None = None,
         dynamic_skip_position_thresholds: list[float] | None = None,
@@ -88,6 +89,7 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
         self.dynamic_skip_strategy = dynamic_skip_strategy
+        self.dynamic_skip_granularity = dynamic_skip_granularity
         self.dynamic_skip_probe_mode = dynamic_skip_probe_mode
         self.dynamic_skip_threshold = dynamic_skip_threshold
         self.dynamic_skip_position_thresholds = (
@@ -150,13 +152,19 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 f"`skip_keep_mask` length ({len(self.skip_keep_mask)}) must match "
                 f"`attn_res_num_blocks` ({attn_res_num_blocks})."
             )
+        if self.dynamic_skip_granularity not in {"block", "mlp"}:
+            raise ValueError("`dynamic_skip_granularity` must be either 'block' or 'mlp'.")
+        expected_dynamic_positions = (
+            attn_res_num_blocks if self.dynamic_skip_granularity == "block" else num_hidden_layers
+        )
         if (
             self.dynamic_skip_position_thresholds is not None
-            and len(self.dynamic_skip_position_thresholds) != attn_res_num_blocks
+            and len(self.dynamic_skip_position_thresholds) != expected_dynamic_positions
         ):
             raise ValueError(
                 f"`dynamic_skip_position_thresholds` length ({len(self.dynamic_skip_position_thresholds)}) must match "
-                f"`attn_res_num_blocks` ({attn_res_num_blocks})."
+                f"the expected dynamic skip positions ({expected_dynamic_positions}) for "
+                f"`dynamic_skip_granularity={self.dynamic_skip_granularity}`."
             )
         if self.dynamic_skip_max_skips is not None and self.dynamic_skip_max_skips < 0:
             raise ValueError("`dynamic_skip_max_skips` must be non-negative.")
