@@ -306,3 +306,75 @@ LAMBADA 单任务结果：
   - 它是更“AttnRes 原生”的零额外 pre-probe 方案
   - 长上下文代理测速约 `1.26x`
   - 但当前 benchmark 已经开始轻微下滑，更适合作为扩展方案或后续继续优化的方向
+
+## 最新可复现实验指令
+
+### 1. 主线分析：`block_attn_only_low1_q09`
+
+用于在 `test3` 上重新做最新版动态分析：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
+  /home/user01/Minko/reskip2/reskip/experiments/flame_analyze_reskip.py \
+  --model_path /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer-test3 \
+  --dataset /home/user01/Minko/datasets/fineweb_edu_100BT \
+  --dataset_split train \
+  --seq_len 8192 \
+  --context_len 2048 \
+  --batch_size 1 \
+  --num_workers 2 \
+  --num_batches 32 \
+  --streaming \
+  --varlen \
+  --device cuda \
+  --dtype bf16 \
+  --output_dir /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis_test3_v7 \
+  --dynamic_skip_strategy recent_weight_gt \
+  --dynamic_skip_probe_modes all,attn_only,first_layer,first_attn \
+  --dynamic_skip_position_modes auto \
+  --dynamic_skip_quantiles 0.5,0.6,0.7,0.8,0.9,0.95,0.97,0.99 \
+  --dynamic_skip_max_skips_options 1,2 \
+  --dynamic_skip_latency_num_batches 16 \
+  --dynamic_skip_latency_top_k 16 \
+  --dynamic_skip_speed_ppl_tolerance 0.05
+```
+
+当前 paper 主线推荐从分析结果中选用：
+- `probe_mode = attn_only`
+- `position_mode = low1`
+- `quantile = 0.9`
+- `max_skips = 1`
+
+对应导出模型目录：
+- [reskip_test3_block_attnonly_low1_q09](/home/user01/Minko/reskip2/reskip/outputs/reskip_test3_block_attnonly_low1_q09)
+
+### 2. 主线跑分：`block_attn_only_low1_q09`
+
+```bash
+CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
+  /home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py \
+  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_test3_block_attnonly_low1_q09 \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto \
+  --device cuda:0 \
+  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_block_attnonly_low1_q09
+```
+
+### 3. 扩展方向：`prev_recent_weight_low1_q095`
+
+这是更 AttnRes 原生的“上一已执行 block 决策下一 block”版本。当前 benchmark 略掉点，但速度更激进。
+
+导出模型目录：
+- [reskip_test3_prev_recent_low1_q095](/home/user01/Minko/reskip2/reskip/outputs/reskip_test3_prev_recent_low1_q095)
+
+跑分命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
+  /home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py \
+  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_test3_prev_recent_low1_q095 \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto \
+  --device cuda:0 \
+  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_prev_recent_low1_q095
+```
