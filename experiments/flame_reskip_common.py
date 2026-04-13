@@ -132,6 +132,9 @@ def evaluate_causal_lm(
     total_loss = 0.0
     total_tokens = 0
     total_blocks = 0
+    total_compute_units = 0.0
+    total_compute_ratio = 0.0
+    total_mlp_skips = 0.0
     n_batches = 0
     importance_matrix = None
     block_importance_sum = None
@@ -168,6 +171,9 @@ def evaluate_causal_lm(
         routing_info = getattr(outputs, "routing_info", None)
         if routing_info is not None:
             total_blocks += routing_info["num_blocks_executed"]
+            total_compute_units += float(routing_info.get("num_compute_units_executed", routing_info["num_blocks_executed"]))
+            total_compute_ratio += float(routing_info.get("compute_ratio", 1.0))
+            total_mlp_skips += float(routing_info.get("num_mlp_skipped", 0.0))
             if importance_matrix is None:
                 importance_matrix = routing_info["importance_matrix"].float().cpu()
                 block_importance_sum = torch.tensor(routing_info["block_importance"], dtype=torch.float32)
@@ -181,8 +187,12 @@ def evaluate_causal_lm(
             }
             if routing_info is not None:
                 payload["avg_blocks"] = float(routing_info["num_blocks_executed"])
+                payload["avg_compute_units"] = float(routing_info.get("num_compute_units_executed", routing_info["num_blocks_executed"]))
+                payload["compute_ratio"] = float(routing_info.get("compute_ratio", 1.0))
+                payload["num_mlp_skipped"] = float(routing_info.get("num_mlp_skipped", 0.0))
                 payload["block_importance"] = list(routing_info["block_importance"])
                 payload["execution_trace"] = routing_info.get("execution_trace", [])
+                payload["mlp_execution_trace"] = routing_info.get("mlp_execution_trace", [])
             batch_metrics.append(payload)
 
         if num_batches is not None and n_batches >= num_batches:
@@ -197,6 +207,9 @@ def evaluate_causal_lm(
     }
     if importance_matrix is not None:
         result["avg_blocks"] = total_blocks / max(n_batches, 1)
+        result["avg_compute_units"] = total_compute_units / max(n_batches, 1)
+        result["avg_compute_ratio"] = total_compute_ratio / max(n_batches, 1)
+        result["avg_mlp_skips"] = total_mlp_skips / max(n_batches, 1)
         result["importance_matrix"] = (importance_matrix / max(n_batches, 1)).tolist()
         result["block_importance"] = (block_importance_sum / max(n_batches, 1)).tolist()
     if return_batch_metrics:

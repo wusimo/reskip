@@ -134,6 +134,13 @@ This produces:
   `dynamic_skip_strategy`, `dynamic_skip_position_thresholds`, and
   `dynamic_skip_max_skips` written into config
 
+Important:
+
+- `best_dynamic_ppl`: quality-first dynamic setting
+- `best_dynamic_skip`: deepest dynamic setting
+- `export_best_dynamic_model_dir`: now exports the recommended deployment setting,
+  i.e. the deepest dynamic skip that still stays within the configured PPL tolerance
+
 ## Inference
 
 Full-depth or skip-ready generation:
@@ -183,7 +190,8 @@ python experiments/flame_lm_eval.py \
 
 Dynamic skip can be evaluated in two ways.
 
-If you already exported a dynamic skip-ready checkpoint:
+If you already exported a dynamic skip-ready checkpoint, it will run with the
+dynamic policy that was already baked into that checkpoint:
 
 ```bash
 python experiments/flame_lm_eval.py \
@@ -200,13 +208,20 @@ checkpoint automatically, and then run `lm_eval`:
 ```bash
 python experiments/flame_lm_eval.py \
   --analysis_json outputs/reskip_analysis_dynamic/routing_analysis.json \
-  --prepare_mode best_dynamic_skip \
+  --dynamic_mode tolerated \
   --prepared_model_dir /tmp/reskip_eval_dynamic \
   --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
   --batch_size auto \
   --device cuda:0 \
   --output_path outputs/lm_eval_reskip_340M_dynamic
 ```
+
+Available dynamic modes:
+
+- `--dynamic_mode quality`: choose the best-PPL dynamic configuration
+- `--dynamic_mode tolerated`: choose the deepest dynamic configuration within the configured PPL tolerance
+- `--dynamic_mode deepest`: choose the deepest dynamic configuration regardless of quality loss
+- `--dynamic_mode static`: evaluate the best static keep-mask configuration through the same entrypoint
 
 ## Notes
 

@@ -43,6 +43,8 @@ class ReSkipTransformerConfig(PretrainedConfig):
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
         dynamic_skip_strategy: str | None = None,
+        dynamic_skip_granularity: str = "block",
+        dynamic_skip_probe_mode: str | None = "all",
         dynamic_skip_threshold: float | None = None,
         dynamic_skip_position_thresholds: list[float] | None = None,
         dynamic_skip_max_skips: int | None = None,
@@ -51,10 +53,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
         halt_kl_min_weight: float = 0.0,
         halt_kl_decay_steps: int = 0,
         ponder_loss_weight: float = 0.0,
-        routing_regularization_weight: float = 0.0,
-        routing_entropy_weight: float = 0.0,
-        routing_entropy_target: float = 0.0,
-        routing_entropy_warmup_steps: int = 0,
         ponder_loss_warmup_steps: int = 0,
         ponder_budget_start_step: int = 0,
         ponder_target_depth_ratio: float = 0.5,
@@ -91,6 +89,8 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
         self.dynamic_skip_strategy = dynamic_skip_strategy
+        self.dynamic_skip_granularity = dynamic_skip_granularity
+        self.dynamic_skip_probe_mode = dynamic_skip_probe_mode
         self.dynamic_skip_threshold = dynamic_skip_threshold
         self.dynamic_skip_position_thresholds = (
             list(dynamic_skip_position_thresholds) if dynamic_skip_position_thresholds is not None else None
@@ -101,10 +101,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.halt_kl_min_weight = halt_kl_min_weight
         self.halt_kl_decay_steps = halt_kl_decay_steps
         self.ponder_loss_weight = ponder_loss_weight
-        self.routing_regularization_weight = routing_regularization_weight
-        self.routing_entropy_weight = routing_entropy_weight
-        self.routing_entropy_target = routing_entropy_target
-        self.routing_entropy_warmup_steps = routing_entropy_warmup_steps
         self.ponder_loss_warmup_steps = ponder_loss_warmup_steps
         self.ponder_budget_start_step = ponder_budget_start_step
         self.ponder_target_depth_ratio = ponder_target_depth_ratio
@@ -122,22 +118,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
             raise ValueError(
                 f"`num_hidden_layers` ({num_hidden_layers}) must be divisible by "
                 f"`attn_res_num_blocks` ({attn_res_num_blocks})."
-            )
-        if routing_entropy_weight < 0:
-            raise ValueError("`routing_entropy_weight` must be non-negative.")
-        if routing_entropy_target < 0:
-            raise ValueError("`routing_entropy_target` must be non-negative.")
-        if routing_entropy_warmup_steps < 0:
-            raise ValueError("`routing_entropy_warmup_steps` must be non-negative.")
-        if routing_regularization_weight < 0:
-            raise ValueError("`routing_regularization_weight` must be non-negative.")
-        if (
-            routing_regularization_weight > 0
-            and (routing_entropy_weight > 0 or routing_entropy_target > 0 or routing_entropy_warmup_steps > 0)
-        ):
-            warnings.warn(
-                "`routing_regularization_weight` is enabled, so legacy routing entropy target/warmup settings "
-                "will be ignored during training."
             )
         if enable_looping:
             if num_recurrent_blocks is None:
@@ -172,13 +152,19 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 f"`skip_keep_mask` length ({len(self.skip_keep_mask)}) must match "
                 f"`attn_res_num_blocks` ({attn_res_num_blocks})."
             )
+        if self.dynamic_skip_granularity not in {"block", "mlp"}:
+            raise ValueError("`dynamic_skip_granularity` must be either 'block' or 'mlp'.")
+        expected_dynamic_positions = (
+            attn_res_num_blocks if self.dynamic_skip_granularity == "block" else num_hidden_layers
+        )
         if (
             self.dynamic_skip_position_thresholds is not None
-            and len(self.dynamic_skip_position_thresholds) != attn_res_num_blocks
+            and len(self.dynamic_skip_position_thresholds) != expected_dynamic_positions
         ):
             raise ValueError(
                 f"`dynamic_skip_position_thresholds` length ({len(self.dynamic_skip_position_thresholds)}) must match "
-                f"`attn_res_num_blocks` ({attn_res_num_blocks})."
+                f"the expected dynamic skip positions ({expected_dynamic_positions}) for "
+                f"`dynamic_skip_granularity={self.dynamic_skip_granularity}`."
             )
         if self.dynamic_skip_max_skips is not None and self.dynamic_skip_max_skips < 0:
             raise ValueError("`dynamic_skip_max_skips` must be non-negative.")
