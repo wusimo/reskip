@@ -233,6 +233,99 @@ def summarize_phase1_output(
     }
 
 
+def dynamic_skip_required_features(strategy: str | None) -> tuple[bool, bool, bool]:
+    strategy = normalize_dynamic_skip_strategy(strategy)
+    if strategy is None:
+        return False, False, False
+    if strategy in {"recent_weight_lt", "recent_weight_gt"}:
+        return True, False, False
+    if strategy == "embed_weight_gt":
+        return False, True, False
+    if strategy == "entropy_lt":
+        return False, False, True
+    if strategy in {"recent_minus_embed_gt", "recent_over_embed_gt"}:
+        return True, True, False
+    if strategy in {"recent_confidence_gt", "recent_x_entropy_lt"}:
+        return True, False, True
+    if strategy == "recent_margin_confidence_gt":
+        return True, True, True
+    raise ValueError(f"Unsupported dynamic skip strategy: {strategy}")
+
+
+def summarize_probe_only_phase1(
+    routers: list["BlockAttentionResidual"],
+    completed_blocks: list[torch.Tensor],
+    source_ids: list[int],
+    *,
+    strategy: str | None,
+) -> dict[str, float | None]:
+    need_recent, need_embed, need_entropy = dynamic_skip_required_features(strategy)
+
+    if not completed_blocks:
+        raise ValueError("Expected at least one completed block.")
+    if len(completed_blocks) == 1:
+        return {
+            "avg_phase1_entropy": 0.0 if need_entropy else None,
+            "avg_phase1_embed_weight": 1.0 if need_embed else None,
+            "avg_phase1_recent_weight": None,
+            "num_completed_sources": float(len(source_ids)),
+        }
+
+    if any(_is_dtensor(_router_effective_query(router)) for router in routers):
+        phase1_outputs = batch_attend_completed_blocks(
+            routers=routers,
+            completed_blocks=completed_blocks,
+            return_weights=False,
+        )
+        per_router = [summarize_phase1_output(item, source_ids) for item in phase1_outputs]
+        avg_entropy = (
+            sum(item["avg_phase1_entropy"] for item in per_router if item["avg_phase1_entropy"] is not None)
+            / max(sum(1 for item in per_router if item["avg_phase1_entropy"] is not None), 1)
+            if need_entropy
+            else None
+        )
+        avg_embed = (
+            sum(item["avg_phase1_embed_weight"] for item in per_router if item["avg_phase1_embed_weight"] is not None)
+            / max(sum(1 for item in per_router if item["avg_phase1_embed_weight"] is not None), 1)
+            if need_embed
+            else None
+        )
+        avg_recent = (
+            sum(item["avg_phase1_recent_weight"] for item in per_router if item["avg_phase1_recent_weight"] is not None)
+            / max(sum(1 for item in per_router if item["avg_phase1_recent_weight"] is not None), 1)
+            if need_recent
+            else None
+        )
+        return {
+            "avg_phase1_entropy": avg_entropy,
+            "avg_phase1_embed_weight": avg_embed,
+            "avg_phase1_recent_weight": avg_recent,
+            "num_completed_sources": float(len(source_ids)),
+        }
+
+    values = torch.stack(completed_blocks, dim=0)
+    base_keys = _rms_norm_base(values, routers[0].key_norm.eps)
+    queries = torch.stack([_router_effective_query(router) for router in routers], dim=0)
+    scale = math.sqrt(values.shape[-1]) * routers[0].temperature
+    scores = torch.einsum("qd,nbtd->qnbt", queries, base_keys) / scale
+    probs = torch.softmax(scores, dim=1)
+    source_means = probs.mean(dim=(2, 3))
+
+    avg_embed = float(source_means[:, 0].float().mean().item()) if need_embed else None
+    avg_recent = float(source_means[:, -1].float().mean().item()) if need_recent else None
+    avg_entropy = None
+    if need_entropy:
+        log_probs = torch.log(probs.clamp_min(1e-12))
+        entropy = -(probs * log_probs).sum(dim=1)
+        avg_entropy = float(normalize_router_entropy(entropy, len(source_ids)).float().mean().item())
+    return {
+        "avg_phase1_entropy": avg_entropy,
+        "avg_phase1_embed_weight": avg_embed,
+        "avg_phase1_recent_weight": avg_recent,
+        "num_completed_sources": float(len(source_ids)),
+    }
+
+
 def phase1_feature_tensor(
     phase1_output: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor],
     source_ids: list[int],
@@ -584,6 +677,21 @@ class ReSkipBlockGroup(nn.Module):
             [ReSkipTransformerLayer(config, first_layer_idx + offset) for offset in range(layers_per_block)]
         )
 
+    def _select_probe_routers(self, probe_mode: str) -> list["BlockAttentionResidual"]:
+        if probe_mode == "all":
+            routers = []
+            for layer in self.layers:
+                routers.extend([layer.attn_router, layer.mlp_router])
+            return routers
+        if probe_mode == "attn_only":
+            return [layer.attn_router for layer in self.layers]
+        if probe_mode == "first_layer":
+            layer = self.layers[0]
+            return [layer.attn_router, layer.mlp_router]
+        if probe_mode == "first_attn":
+            return [self.layers[0].attn_router]
+        raise ValueError(f"Unsupported dynamic skip probe mode: {probe_mode}")
+
     def prepare_phase1(
         self,
         block_states: list[torch.Tensor | None],
@@ -595,25 +703,30 @@ class ReSkipBlockGroup(nn.Module):
         list[int],
     ]:
         completed_blocks, completed_source_ids = collect_completed_blocks(block_states, current_block_idx)
-        if probe_mode == "all":
-            routers = []
-            for layer in self.layers:
-                routers.extend([layer.attn_router, layer.mlp_router])
-        elif probe_mode == "attn_only":
-            routers = [layer.attn_router for layer in self.layers]
-        elif probe_mode == "first_layer":
-            layer = self.layers[0]
-            routers = [layer.attn_router, layer.mlp_router]
-        elif probe_mode == "first_attn":
-            routers = [self.layers[0].attn_router]
-        else:
-            raise ValueError(f"Unsupported dynamic skip probe mode: {probe_mode}")
+        routers = self._select_probe_routers(probe_mode)
         phase1_outputs = batch_attend_completed_blocks(
             routers=routers,
             completed_blocks=completed_blocks,
             return_weights=return_routing_weights,
         )
         return phase1_outputs, completed_source_ids
+
+    def probe_phase1_stats(
+        self,
+        block_states: list[torch.Tensor | None],
+        current_block_idx: int,
+        *,
+        probe_mode: str,
+        strategy: str | None,
+    ) -> dict[str, float | None]:
+        completed_blocks, completed_source_ids = collect_completed_blocks(block_states, current_block_idx)
+        routers = self._select_probe_routers(probe_mode)
+        return summarize_probe_only_phase1(
+            routers=routers,
+            completed_blocks=completed_blocks,
+            source_ids=completed_source_ids,
+            strategy=strategy,
+        )
 
     def summarize_phase1(
         self,
@@ -1400,9 +1513,25 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                     position,
                     dynamic_skips_taken,
                     dynamic_skip_max_skips,
-                )
+            )
             collect_dynamic_skip_stats = collect_routing_info and dynamic_skip_strategy is not None
-            if dynamic_skip_active or (collect_dynamic_skip_stats and not use_prev_block_dynamic):
+            can_use_probe_only_stats = (
+                dynamic_skip_active
+                and not collect_dynamic_skip_stats
+                and not collect_routing_weights
+                and not self.config.enable_looping
+                and dynamic_skip_granularity == "block"
+                and dynamic_skip_probe_mode != "all"
+            )
+            if can_use_probe_only_stats:
+                phase1_stats = current_block.probe_phase1_stats(
+                    block_states=block_states,
+                    current_block_idx=position,
+                    probe_mode=dynamic_skip_probe_mode,
+                    strategy=dynamic_skip_strategy,
+                )
+                decision_stats = phase1_stats
+            elif dynamic_skip_active or (collect_dynamic_skip_stats and not use_prev_block_dynamic):
                 phase1_outputs, completed_source_ids = current_block.prepare_phase1(
                     block_states=block_states,
                     current_block_idx=position,
