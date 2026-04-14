@@ -36,15 +36,24 @@ Current training target: **340M model on FineWeb-Edu 100BT**, 6-GPU training wit
 
 ### Key Experimental Results
 
-Results from the `test3` intermediate checkpoint (8 blocks, 24 layers):
+**340M model** (`reskip_transformer-340M`, 8 blocks, 24 layers, FineWeb-Edu 100BT) — 2026-04-14:
+
+| Configuration | LAMBADA acc | HellaSwag | ARC-Easy | ARC-Challenge | Wall-clock speedup |
+|---|---:|---:|---:|---:|---:|
+| Full-depth | 0.4056 | 0.4607 | 0.5438 | 0.3012 | 1.00x |
+| Dynamic skip: `attn_only + low1 + q=0.95` | **0.4056** | **0.4607** | **0.5438** | **0.3012** | **1.14x** |
+
+> Speedup is real wall-clock (same GPU, same cached batches, `seq_len=8192`, no proxy). Every batch stably skips exactly 1 block. Config: `strategy=recent_weight_gt`, `probe=attn_only`, `position=low1`, `q=0.95`, `max_skips=1`.
+
+**Intermediate checkpoint** (`test3`) — probe mode comparison (2026-04-10):
 
 | Configuration | LAMBADA acc | HellaSwag | ARC-Easy | ARC-Challenge | Long-context speedup |
 |---|---:|---:|---:|---:|---:|
-| Full-depth baseline | 0.2630 | 0.3189 | 0.4457 | 0.2602 | 1.00x |
+| Full-depth | 0.2630 | 0.3189 | 0.4457 | 0.2602 | 1.00x |
 | Dynamic skip: `attn_only + low1 + q=0.9` | **0.2630** | **0.3189** | **0.4457** | **0.2602** | **1.24x** |
 | Dynamic skip: `prev_recent + low1 + q=0.95` | 0.2626 | 0.3172 | 0.4453 | 0.2585 | 1.26x |
 
-> The `attn_only + low1 + q=0.9` configuration achieves full benchmark parity at 1.24x speedup on long-context inputs. This is the current paper mainline candidate. See [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for full experiment details.
+See [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for full experiment details.
 
 ### Resolved Issues
 
@@ -62,7 +71,7 @@ Results from the `test3` intermediate checkpoint (8 blocks, 24 layers):
 | [FLAME_LM_PLAYBOOK.md](FLAME_LM_PLAYBOOK.md) | English | Training and evaluation quick reference |
 | [EXPERIMENTS_CN.md](EXPERIMENTS_CN.md) | Chinese | Comprehensive training/eval guide with current commands and workflow |
 | [DYNAMIC_SKIP_MECHANISM.md](DYNAMIC_SKIP_MECHANISM.md) | Chinese | Why and how dynamic skip works; paper update suggestions |
-| [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) | Chinese/English | Chronological log of dynamic skip experiments (2026-04-09 to 04-10) |
+| [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) | Chinese/English | Chronological log of dynamic skip experiments (2026-04-09 to 04-14) |
 | [ATTNRES_SKIP_LOOP_PLAN_CN.md](ATTNRES_SKIP_LOOP_PLAN_CN.md) | Chinese | Algorithm improvement proposals: Direction 2 (better skip scoring) and Direction 3 (unified skip+loop architecture) |
 
 ---
