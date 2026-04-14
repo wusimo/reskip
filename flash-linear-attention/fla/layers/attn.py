@@ -83,6 +83,7 @@ class Attention(nn.Module):
         past_key_values: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        cache_layer_idx: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         if attention_mask is not None and torch.all(attention_mask):
@@ -106,9 +107,10 @@ class Attention(nn.Module):
         # equivalent to cu_seqlens in `flash_attn`
         cu_seqlens = kwargs.get('cu_seqlens')
 
+        layer_cache_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
         seqlen_offset, max_seqlen = 0, q_len
         if past_key_values is not None:
-            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+            seqlen_offset = past_key_values.get_seq_length(layer_cache_idx)
             max_seqlen = q.shape[1] + seqlen_offset
 
             if attention_mask is not None:
@@ -121,10 +123,10 @@ class Attention(nn.Module):
         q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
 
         if past_key_values is not None:
-            cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
+            cache_has_content = past_key_values.get_seq_length(layer_cache_idx) > 0
             k_cached, v_cached = past_key_values.update(
                 attn_state=(k.flatten(-2, -1), v.flatten(-2, -1)),
-                layer_idx=self.layer_idx,
+                layer_idx=layer_cache_idx,
                 offset=q_len,
                 cache_kwargs=dict(window_size=self.window_size),
             )['attn_state']

@@ -72,6 +72,23 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 FLAME_ROOT="${REPO_ROOT}/flame"
 FLA_ROOT="${REPO_ROOT}/flash-linear-attention"
+PROJECT_VENV_ROOT="$(cd "${REPO_ROOT}/.." && pwd)/.venv"
+
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN}"
+elif [[ -x "${PROJECT_VENV_ROOT}/bin/python" ]]; then
+  PYTHON_BIN="${PROJECT_VENV_ROOT}/bin/python"
+else
+  PYTHON_BIN="$(command -v python)"
+fi
+
+if [[ -n "${TORCHRUN_BIN:-}" ]]; then
+  TORCHRUN_BIN="${TORCHRUN_BIN}"
+elif [[ -x "${PROJECT_VENV_ROOT}/bin/torchrun" ]]; then
+  TORCHRUN_BIN="${PROJECT_VENV_ROOT}/bin/torchrun"
+else
+  TORCHRUN_BIN="$(command -v torchrun)"
+fi
 
 echo "Launching training..."
 
@@ -104,11 +121,11 @@ export PYTHONPATH="${FLAME_ROOT}:${FLA_ROOT}:${PYTHONPATH:-}"
 
 if command -v jq >/dev/null 2>&1; then
   model=$(
-    python -c "import fla, custom_models, sys; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=True).to_json_string())" "$config" | jq -r '.model_type'
+    "${PYTHON_BIN}" -c "import fla, custom_models, sys; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=True).to_json_string())" "$config" | jq -r '.model_type'
   )
 else
   model=$(
-    python -c "import fla, custom_models, sys; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=True).model_type)" "$config"
+    "${PYTHON_BIN}" -c "import fla, custom_models, sys; from transformers import AutoConfig; print(AutoConfig.from_pretrained(sys.argv[1], trust_remote_code=True).model_type)" "$config"
   )
 fi
 
@@ -143,7 +160,7 @@ if [[ -z "${WANDB_RUN_ID:-}" ]]; then
 fi
 
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-torchrun --nnodes=${NNODE} \
+"${TORCHRUN_BIN}" --nnodes=${NNODE} \
   --nproc_per_node=${NGPU} \
   --rdzv_backend c10d \
   --rdzv_endpoint "${MASTER_ADDR}:${MASTER_PORT}" \
@@ -158,7 +175,7 @@ echo "TRAINING DONE!"
 echo "Converting the DCP checkpoints to HF format..."
 
 if [[ -n "${path}" ]]; then
-  python -m flame.utils.convert_dcp_to_hf \
+  "${PYTHON_BIN}" -m flame.utils.convert_dcp_to_hf \
     --path "$path" \
     --step "$steps" \
     --config "$config" \
