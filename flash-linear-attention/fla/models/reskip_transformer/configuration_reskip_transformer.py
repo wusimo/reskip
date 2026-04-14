@@ -52,6 +52,19 @@ class ReSkipTransformerConfig(PretrainedConfig):
         halt_kl_weight: float = 0.0,
         halt_kl_min_weight: float = 0.0,
         halt_kl_decay_steps: int = 0,
+        halt_use_phase1_stats: bool = True,
+        halt_detach_phase1_stats: bool = True,
+        halt_use_position_bias: bool = True,
+        training_soft_min_halt: bool = True,
+        halt_curriculum_disable_after_target: bool = True,
+        early_exit_penalty_weight: float = 0.0,
+        early_exit_penalty_warmup_steps: int = 0,
+        focused_halt_loss_weight: float = 0.0,
+        focused_halt_loss_start_step: int = 0,
+        focused_halt_loss_warmup_steps: int = 0,
+        focused_halt_improvement_margin: float = 0.0,
+        focused_halt_target_temperature: float = 0.1,
+        focused_halt_num_tokens: int = 128,
         ponder_loss_weight: float = 0.0,
         ponder_loss_warmup_steps: int = 0,
         ponder_budget_start_step: int = 0,
@@ -100,6 +113,19 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.halt_kl_weight = halt_kl_weight
         self.halt_kl_min_weight = halt_kl_min_weight
         self.halt_kl_decay_steps = halt_kl_decay_steps
+        self.halt_use_phase1_stats = halt_use_phase1_stats
+        self.halt_detach_phase1_stats = halt_detach_phase1_stats
+        self.halt_use_position_bias = halt_use_position_bias
+        self.training_soft_min_halt = training_soft_min_halt
+        self.halt_curriculum_disable_after_target = halt_curriculum_disable_after_target
+        self.early_exit_penalty_weight = early_exit_penalty_weight
+        self.early_exit_penalty_warmup_steps = early_exit_penalty_warmup_steps
+        self.focused_halt_loss_weight = focused_halt_loss_weight
+        self.focused_halt_loss_start_step = focused_halt_loss_start_step
+        self.focused_halt_loss_warmup_steps = focused_halt_loss_warmup_steps
+        self.focused_halt_improvement_margin = focused_halt_improvement_margin
+        self.focused_halt_target_temperature = focused_halt_target_temperature
+        self.focused_halt_num_tokens = focused_halt_num_tokens
         self.ponder_loss_weight = ponder_loss_weight
         self.ponder_loss_warmup_steps = ponder_loss_warmup_steps
         self.ponder_budget_start_step = ponder_budget_start_step
@@ -130,6 +156,26 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 raise ValueError("`halt_kl_weight` and `halt_kl_min_weight` must be non-negative.")
             if halt_kl_decay_steps < 0:
                 raise ValueError("`halt_kl_decay_steps` must be non-negative.")
+            if not isinstance(halt_use_phase1_stats, bool):
+                raise ValueError("`halt_use_phase1_stats` must be a boolean.")
+            if not isinstance(halt_detach_phase1_stats, bool):
+                raise ValueError("`halt_detach_phase1_stats` must be a boolean.")
+            if not isinstance(training_soft_min_halt, bool):
+                raise ValueError("`training_soft_min_halt` must be a boolean.")
+            if early_exit_penalty_weight < 0:
+                raise ValueError("`early_exit_penalty_weight` must be non-negative.")
+            if early_exit_penalty_warmup_steps < 0:
+                raise ValueError("`early_exit_penalty_warmup_steps` must be non-negative.")
+            if focused_halt_loss_weight < 0:
+                raise ValueError("`focused_halt_loss_weight` must be non-negative.")
+            if focused_halt_loss_start_step < 0:
+                raise ValueError("`focused_halt_loss_start_step` must be non-negative.")
+            if focused_halt_loss_warmup_steps < 0:
+                raise ValueError("`focused_halt_loss_warmup_steps` must be non-negative.")
+            if focused_halt_target_temperature <= 0:
+                raise ValueError("`focused_halt_target_temperature` must be positive.")
+            if focused_halt_num_tokens < 0:
+                raise ValueError("`focused_halt_num_tokens` must be non-negative.")
             if ponder_loss_weight < 0:
                 raise ValueError("`ponder_loss_weight` must be non-negative.")
             if ponder_loss_warmup_steps < 0:

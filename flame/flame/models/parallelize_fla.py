@@ -393,16 +393,38 @@ def _apply_ac_to_block(module: nn.Module, ac_config):
 
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
+    real_model = get_model(model)
+    model_config = getattr(real_model, "config", None)
+    model_type = getattr(model_config, "model_type", None)
+    enable_looping = bool(getattr(model_config, "enable_looping", False))
+    effective_mode = ac_config.mode
+
+    if model_type == "reskip_transformer" and enable_looping and ac_config.mode == "selective":
+        logger.warning(
+            "Selective activation checkpointing is unstable for looping reskip_transformer; "
+            "falling back to full activation checkpointing."
+        )
+        effective_mode = "full"
+
     execution_blocks = list(iter_fsdp_blocks(model))
     if not execution_blocks:
         logger.warning("No block found for activation checkpointing")
         return
 
     for container, layer_id, block in execution_blocks:
-        block = _apply_ac_to_block(block, ac_config)
+        if effective_mode == ac_config.mode:
+            block = _apply_ac_to_block(block, ac_config)
+        else:
+            block = _apply_ac_to_block(
+                block,
+                type("ACConfig", (), {
+                    "mode": effective_mode,
+                    "selective_ac_option": ac_config.selective_ac_option,
+                })(),
+            )
         container.register_module(layer_id, block)
 
-    logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
+    logger.info(f"Applied {effective_mode} activation checkpointing to the model")
 
 
 def apply_compile(model: nn.Module):
@@ -471,17 +493,29 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
+    real_model = get_model(model)
+    model_config = getattr(real_model, "config", None)
+    model_type = getattr(model_config, "model_type", None)
+    enable_looping = bool(getattr(model_config, "enable_looping", False))
+    effective_reshard_policy = reshard_after_forward_policy
+    if model_type == "reskip_transformer" and enable_looping and reshard_after_forward_policy != "never":
+        logger.warning(
+            "Looping reskip_transformer is unstable with FSDP reshard_after_forward enabled; "
+            "forcing `training.fsdp_reshard_after_forward=never`."
+        )
+        effective_reshard_policy = "never"
+
     execution_blocks = list(iter_fsdp_blocks(model))
     if not execution_blocks:
         logger.warning("No block found for FSDP")
     else:
         total_blocks = len(execution_blocks)
         for layer_id, (_, _, block) in enumerate(execution_blocks):
-            if reshard_after_forward_policy == "always":
+            if effective_reshard_policy == "always":
                 reshard_after_forward = True
-            elif reshard_after_forward_policy == "never":
+            elif effective_reshard_policy == "never":
                 reshard_after_forward = False
-            elif reshard_after_forward_policy == "default":
+            elif effective_reshard_policy == "default":
                 if pp_enabled:
                     # For PP, do not reshard after forward to avoid per-microbatch
                     # all-gathers, which can be expensive and non-overlapped
@@ -492,7 +526,7 @@ def apply_fsdp(
                     reshard_after_forward = int(layer_id) < total_blocks - 1
             else:
                 raise ValueError(
-                    f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."
+                    f"Invalid reshard_after_forward_policy: {effective_reshard_policy}."
                 )
             fully_shard(
                 block,
