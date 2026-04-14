@@ -1,5 +1,7 @@
 # Flame/FLA LM Playbook
 
+> **Document role**: Concise English quick-reference for training and evaluating ReSkip/ReLoop with the Flame/FLA framework. For the comprehensive Chinese guide with current commands, checkpoint consistency workflow, and full lm-eval procedure, see [EXPERIMENTS_CN.md](EXPERIMENTS_CN.md). For the dynamic skip mechanism explanation, see [DYNAMIC_SKIP_MECHANISM.md](DYNAMIC_SKIP_MECHANISM.md).
+
 ## New Implementation
 
 The new LM implementation now lives in FLA itself:

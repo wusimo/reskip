@@ -1,5 +1,7 @@
 # 实验总览与执行说明
 
+> **Document summary (English)**: This is the primary Chinese-language guide for training and evaluating ReSkip/ReLoop. It covers training commands (340M, 6-GPU), checkpoint consistency checks, lm-eval workflow (full-depth / static skip / dynamic skip), and the StarVLA+AttnRes experiment line. For a concise English quick-reference, see [FLAME_LM_PLAYBOOK.md](FLAME_LM_PLAYBOOK.md). For the dynamic skip mechanism explanation, see [DYNAMIC_SKIP_MECHANISM.md](DYNAMIC_SKIP_MECHANISM.md).
+
 ## 1. 文档定位
 
 本文件用于统一整理当前仓库里真正需要执行和记录的实验内容，重点覆盖：

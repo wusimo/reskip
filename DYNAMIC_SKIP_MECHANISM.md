@@ -1,5 +1,7 @@
 # ReSkip 动态 Skip 方案说明
 
+> **本文档说明**：本文档解释了为什么 ReSkip 从静态 keep-mask 转向动态 runtime skip，动态 skip 如何利用 AttnRes 的两阶段结构，以及对论文写法的具体修改建议。对应实验数据见 [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md)，训练/评测命令见 [EXPERIMENTS_CN.md](EXPERIMENTS_CN.md)。
+
 ## 1. 为什么要从静态 skip 改成动态 skip
 
 我们最近在语言模型上的实验表明，一个很关键的现象是：
