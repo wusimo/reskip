@@ -378,3 +378,120 @@ CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
   --device cuda:0 \
   --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_prev_recent_low1_q095
 ```
+
+## 2026-04-14 340M 干净复比：benchmark 不掉且已有真实加速
+
+模型与导出目录：
+- full-depth：[reskip_transformer-340M](/home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer-340M)
+- dynamic-safe：[reskip_340M_dynamic_tolerated](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_dynamic_tolerated)
+
+这轮复比的目的：
+- 不再讨论 proxy latency
+- 直接在同一张 GPU7、同一批缓存样本、同一 `seq_len=8192` 条件下，对 full-depth 与 dynamic-safe 做干净 wall-clock 对比
+- 再用同一张 GPU7 跑完整四任务 `lm-eval`
+
+### 运行前提
+
+- GPU：物理 `7` 卡
+- 环境：`/home/user01/Minko/reskip2/.venv`
+- 动态配置来源：
+  - 分析文件：[routing_analysis.json](/home/user01/Minko/reskip2/reskip/outputs/reskip_analysis_340M_targeted/routing_analysis.json)
+  - 导出模型目录：[reskip_340M_dynamic_tolerated](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_dynamic_tolerated)
+
+当前 `dynamic-safe` 配置：
+- `strategy = recent_weight_gt`
+- `probe_mode = attn_only`
+- `position_mode = low1`
+- `quantile = 0.95`
+- `max_skips = 1`
+
+### 代码侧必要优化
+
+针对 340M，这轮确认真正限制速度的不是 AttnRes 分 block 本身，而是动态 skip 的额外实现开销。为此在
+[modeling_reskip_transformer.py](/home/user01/Minko/reskip2/reskip/flash-linear-attention/fla/models/reskip_transformer/modeling_reskip_transformer.py)
+中只保留了必要的推理热路径优化：
+
+- block dynamic skip 只在 `cached_prev` 或显式收集统计时计算 `block_phase1_summary`
+- MLP dynamic skip 只在当前位置确实可能触发时才计算 `mlp_phase1_stats`
+- 普通推理不再额外构造 `mlp_execution_trace`
+- `router_entropies` 只在训练或显式统计时累计
+
+### 同批次真实测速
+
+测速设置：
+- `seq_len = 8192`
+- `num_batches = 48`
+- `warmup = 4`
+- 不开启 `return_routing_info`
+- full 和 dynamic 使用完全相同的缓存 batch
+
+结果：
+
+| 配置 | mean_batch_s | tok/s | mean_loss |
+|---|---:|---:|---:|
+| full-depth | 0.04865 | 168395.9 | 9.2022 |
+| dynamic-safe | 0.04275 | 191621.8 | 8.6621 |
+
+结论：
+- 当前 `340M dynamic-safe` 相对 full-depth 的真实前向速度提升约为 `1.14x`
+- 这已经不是 proxy，而是同批次 wall-clock 测速结果
+
+### 动态触发情况
+
+在前 16 个 batch 上额外打开 `return_routing_info` 检查：
+- 每个 batch 都稳定跳过 `1` 个 block
+- `skipped_blocks_samples = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]`
+
+这说明：
+- 340M 不是“根本跳不动”
+- 当前 safe 配置已经能稳定触发动态 skip
+
+### 四任务 lm-eval
+
+full-depth 命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 /home/user01/Minko/reskip2/.venv/bin/python \
+  /home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py \
+  --model_path /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer-340M \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto \
+  --device cuda:0 \
+  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_full_gpu7
+```
+
+dynamic-safe 命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=7 /home/user01/Minko/reskip2/.venv/bin/python \
+  /home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py \
+  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_340M_dynamic_tolerated \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto \
+  --device cuda:0 \
+  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_dynamic_safe_gpu7
+```
+
+结果文件：
+- full-depth：[results_2026-04-14T12-37-58.313056.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_full_gpu7/__home__user01__Minko__reskip2__reskip__flame__saves__reskip_transformer-340M/results_2026-04-14T12-37-58.313056.json)
+- dynamic-safe：[results_2026-04-14T12-40-01.423102.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_dynamic_safe_gpu7/__home__user01__Minko__reskip2__reskip__outputs__reskip_340M_dynamic_tolerated/results_2026-04-14T12-40-01.423102.json)
+
+四任务对比：
+
+| Task | Metric | Full-depth | Dynamic-safe |
+|---|---:|---:|---:|
+| lambada_openai | acc | 0.4056 | 0.4056 |
+| lambada_openai | ppl | 20.2022 | 20.2022 |
+| hellaswag | acc_norm | 0.4607 | 0.4607 |
+| arc_easy | acc_norm | 0.5438 | 0.5438 |
+| arc_challenge | acc_norm | 0.3012 | 0.3012 |
+
+### 最新结论
+
+- 对当前 `340M / 8 blocks / 24 layers` 的模型，`dynamic-safe` 已经实现：
+  - benchmark 与 full-depth 一致
+  - 同批次真实前向测速约 `1.14x`
+- 因此当前主线判断更新为：
+  - `340M` 上的动态 ReSkip 并不是“只有精度没有速度”
+  - 问题的关键点在于推理热路径实现是否足够收敛
+  - 在收紧这部分额外开销后，当前 safe 动态 skip 已具备继续写入主实验线的价值
