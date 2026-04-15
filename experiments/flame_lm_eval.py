@@ -25,15 +25,21 @@ def prepare_model_from_analysis(
 
     model, tokenizer = load_model_and_tokenizer(resolved_model_path, device, dtype=dtype)
     decoder = model.get_decoder()
-    decoder.clear_skip_keep_mask()
-    if hasattr(decoder, "clear_dynamic_skip_policy"):
+    model_type = str(getattr(getattr(model, "config", None), "model_type", ""))
+    supports_skip_controls = model_type == "reskip_transformer"
+    if supports_skip_controls:
+        decoder.clear_skip_keep_mask()
         decoder.clear_dynamic_skip_policy()
 
     if prepare_mode == "best_static":
+        if not supports_skip_controls:
+            raise ValueError("Static skip preparation is only supported for reskip_transformer models.")
         keep_mask = payload["best_keep_mask"]
         decoder.set_skip_keep_mask(keep_mask)
         print("Preparing static skip model from analysis: best_static")
     else:
+        if not supports_skip_controls:
+            raise ValueError("Dynamic skip preparation is only supported for reskip_transformer models.")
         dynamic = payload.get("dynamic_skip_analysis")
         if dynamic is None:
             raise ValueError("`analysis_json` does not contain `dynamic_skip_analysis`.")

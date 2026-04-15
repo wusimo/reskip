@@ -27,6 +27,11 @@ from fla.models.mom import MomConfig, MomForCausalLM, MomModel
 from fla.models.nsa import NSAConfig, NSAForCausalLM, NSAModel
 from fla.models.path_attn import PaTHAttentionConfig, PaTHAttentionForCausalLM, PaTHAttentionModel
 from fla.models.retnet import RetNetConfig, RetNetForCausalLM, RetNetModel
+from fla.models.reloop_transformer import (
+    ReLoopTransformerConfig,
+    ReLoopTransformerForCausalLM,
+    ReLoopTransformerModel,
+)
 from fla.models.reskip_transformer import (
     ReSkipTransformerConfig,
     ReSkipTransformerForCausalLM,
@@ -117,6 +122,9 @@ __all__ = [
     'RetNetConfig',
     'RetNetForCausalLM',
     'RetNetModel',
+    'ReLoopTransformerConfig',
+    'ReLoopTransformerForCausalLM',
+    'ReLoopTransformerModel',
     'ReSkipTransformerConfig',
     'ReSkipTransformerForCausalLM',
     'ReSkipTransformerModel',
@@ -126,9 +134,6 @@ __all__ = [
     'SambaConfig',
     'SambaForCausalLM',
     'SambaModel',
-    'ReSkipTransformerConfig',
-    'ReSkipTransformerForCausalLM',
-    'ReSkipTransformerModel',
     'TransformerConfig',
     'TransformerForCausalLM',
     'TransformerModel',
