@@ -1,6 +1,33 @@
-import warnings
-
 from transformers.configuration_utils import PretrainedConfig
+
+
+_LEGACY_RELOOP_KEYS = {
+    "enable_looping",
+    "num_recurrent_blocks",
+    "max_loops",
+    "halt_threshold",
+    "halt_kl_weight",
+    "halt_kl_min_weight",
+    "halt_kl_decay_steps",
+    "halt_use_phase1_stats",
+    "halt_detach_phase1_stats",
+    "halt_use_position_bias",
+    "training_soft_min_halt",
+    "halt_curriculum_disable_after_target",
+    "early_exit_penalty_weight",
+    "early_exit_penalty_warmup_steps",
+    "focused_halt_loss_weight",
+    "focused_halt_loss_start_step",
+    "focused_halt_loss_warmup_steps",
+    "focused_halt_improvement_margin",
+    "focused_halt_target_temperature",
+    "focused_halt_num_tokens",
+    "ponder_loss_weight",
+    "ponder_loss_warmup_steps",
+    "ponder_budget_start_step",
+    "ponder_target_depth_ratio",
+    "ponder_target_steps",
+}
 
 
 class ReSkipTransformerConfig(PretrainedConfig):
@@ -37,9 +64,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
         vocab_size: int = 32000,
         attn_res_num_blocks: int = 8,
         attn_res_temperature: float = 1.0,
-        enable_looping: bool = False,
-        num_recurrent_blocks: int | None = None,
-        max_loops: int = 1,
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
         dynamic_skip_strategy: str | None = None,
@@ -48,30 +72,19 @@ class ReSkipTransformerConfig(PretrainedConfig):
         dynamic_skip_threshold: float | None = None,
         dynamic_skip_position_thresholds: list[float] | None = None,
         dynamic_skip_max_skips: int | None = None,
-        halt_threshold: float = 0.99,
-        halt_kl_weight: float = 0.0,
-        halt_kl_min_weight: float = 0.0,
-        halt_kl_decay_steps: int = 0,
-        halt_use_phase1_stats: bool = True,
-        halt_detach_phase1_stats: bool = True,
-        halt_use_position_bias: bool = True,
-        training_soft_min_halt: bool = True,
-        halt_curriculum_disable_after_target: bool = True,
-        early_exit_penalty_weight: float = 0.0,
-        early_exit_penalty_warmup_steps: int = 0,
-        focused_halt_loss_weight: float = 0.0,
-        focused_halt_loss_start_step: int = 0,
-        focused_halt_loss_warmup_steps: int = 0,
-        focused_halt_improvement_margin: float = 0.0,
-        focused_halt_target_temperature: float = 0.1,
-        focused_halt_num_tokens: int = 128,
-        ponder_loss_weight: float = 0.0,
-        ponder_loss_warmup_steps: int = 0,
-        ponder_budget_start_step: int = 0,
-        ponder_target_depth_ratio: float = 0.5,
-        ponder_target_steps: int = 0,
         **kwargs,
     ):
+        legacy_enable_looping = bool(kwargs.pop("enable_looping", False))
+        kwargs.pop("num_recurrent_blocks", None)
+        for key in list(kwargs):
+            if key in _LEGACY_RELOOP_KEYS:
+                kwargs.pop(key)
+
+        if legacy_enable_looping:
+            raise ValueError(
+                "`enable_looping=True` is no longer supported by `reskip_transformer`. "
+                "Use `reloop_transformer` instead."
+            )
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_heads = num_heads
@@ -96,9 +109,10 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.attn_res_num_blocks = attn_res_num_blocks
         self.attn_res_temperature = attn_res_temperature
-        self.enable_looping = enable_looping
-        self.num_recurrent_blocks = num_recurrent_blocks
-        self.max_loops = max_loops
+
+        self.enable_looping = False
+        self.num_recurrent_blocks = attn_res_num_blocks
+
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
         self.dynamic_skip_strategy = dynamic_skip_strategy
@@ -109,34 +123,14 @@ class ReSkipTransformerConfig(PretrainedConfig):
             list(dynamic_skip_position_thresholds) if dynamic_skip_position_thresholds is not None else None
         )
         self.dynamic_skip_max_skips = dynamic_skip_max_skips
-        self.halt_threshold = halt_threshold
-        self.halt_kl_weight = halt_kl_weight
-        self.halt_kl_min_weight = halt_kl_min_weight
-        self.halt_kl_decay_steps = halt_kl_decay_steps
-        self.halt_use_phase1_stats = halt_use_phase1_stats
-        self.halt_detach_phase1_stats = halt_detach_phase1_stats
-        self.halt_use_position_bias = halt_use_position_bias
-        self.training_soft_min_halt = training_soft_min_halt
-        self.halt_curriculum_disable_after_target = halt_curriculum_disable_after_target
-        self.early_exit_penalty_weight = early_exit_penalty_weight
-        self.early_exit_penalty_warmup_steps = early_exit_penalty_warmup_steps
-        self.focused_halt_loss_weight = focused_halt_loss_weight
-        self.focused_halt_loss_start_step = focused_halt_loss_start_step
-        self.focused_halt_loss_warmup_steps = focused_halt_loss_warmup_steps
-        self.focused_halt_improvement_margin = focused_halt_improvement_margin
-        self.focused_halt_target_temperature = focused_halt_target_temperature
-        self.focused_halt_num_tokens = focused_halt_num_tokens
-        self.ponder_loss_weight = ponder_loss_weight
-        self.ponder_loss_warmup_steps = ponder_loss_warmup_steps
-        self.ponder_budget_start_step = ponder_budget_start_step
-        self.ponder_target_depth_ratio = ponder_target_depth_ratio
-        self.ponder_target_steps = ponder_target_steps
 
         if fuse_cross_entropy and fuse_linear_cross_entropy:
             raise ValueError(
                 "`fuse_cross_entropy` and `fuse_linear_cross_entropy` cannot be True at the same time."
             )
         if fuse_linear_cross_entropy:
+            import warnings
+
             warnings.warn(
                 "`fuse_linear_cross_entropy` is enabled. If training becomes unstable, disable it first."
             )
@@ -145,54 +139,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 f"`num_hidden_layers` ({num_hidden_layers}) must be divisible by "
                 f"`attn_res_num_blocks` ({attn_res_num_blocks})."
             )
-        if enable_looping:
-            if num_recurrent_blocks is None:
-                raise ValueError("`num_recurrent_blocks` is required when `enable_looping=True`.")
-            if num_recurrent_blocks <= 0 or max_loops <= 0:
-                raise ValueError("`num_recurrent_blocks` and `max_loops` must be positive.")
-            if not 0.0 < halt_threshold <= 1.0:
-                raise ValueError("`halt_threshold` must be in (0, 1].")
-            if halt_kl_weight < 0 or halt_kl_min_weight < 0:
-                raise ValueError("`halt_kl_weight` and `halt_kl_min_weight` must be non-negative.")
-            if halt_kl_decay_steps < 0:
-                raise ValueError("`halt_kl_decay_steps` must be non-negative.")
-            if not isinstance(halt_use_phase1_stats, bool):
-                raise ValueError("`halt_use_phase1_stats` must be a boolean.")
-            if not isinstance(halt_detach_phase1_stats, bool):
-                raise ValueError("`halt_detach_phase1_stats` must be a boolean.")
-            if not isinstance(training_soft_min_halt, bool):
-                raise ValueError("`training_soft_min_halt` must be a boolean.")
-            if early_exit_penalty_weight < 0:
-                raise ValueError("`early_exit_penalty_weight` must be non-negative.")
-            if early_exit_penalty_warmup_steps < 0:
-                raise ValueError("`early_exit_penalty_warmup_steps` must be non-negative.")
-            if focused_halt_loss_weight < 0:
-                raise ValueError("`focused_halt_loss_weight` must be non-negative.")
-            if focused_halt_loss_start_step < 0:
-                raise ValueError("`focused_halt_loss_start_step` must be non-negative.")
-            if focused_halt_loss_warmup_steps < 0:
-                raise ValueError("`focused_halt_loss_warmup_steps` must be non-negative.")
-            if focused_halt_target_temperature <= 0:
-                raise ValueError("`focused_halt_target_temperature` must be positive.")
-            if focused_halt_num_tokens < 0:
-                raise ValueError("`focused_halt_num_tokens` must be non-negative.")
-            if ponder_loss_weight < 0:
-                raise ValueError("`ponder_loss_weight` must be non-negative.")
-            if ponder_loss_warmup_steps < 0:
-                raise ValueError("`ponder_loss_warmup_steps` must be non-negative.")
-            if ponder_budget_start_step < 0:
-                raise ValueError("`ponder_budget_start_step` must be non-negative.")
-            if not 0.0 < ponder_target_depth_ratio <= 1.0:
-                raise ValueError("`ponder_target_depth_ratio` must be in (0, 1].")
-            if ponder_target_steps < 0:
-                raise ValueError("`ponder_target_steps` must be non-negative.")
-            if attn_res_num_blocks != num_recurrent_blocks * max_loops:
-                raise ValueError(
-                    "`attn_res_num_blocks` must equal `num_recurrent_blocks * max_loops` in looping mode."
-                )
-        elif num_recurrent_blocks is None:
-            self.num_recurrent_blocks = attn_res_num_blocks
-
         if self.skip_keep_mask is not None and len(self.skip_keep_mask) != attn_res_num_blocks:
             raise ValueError(
                 f"`skip_keep_mask` length ({len(self.skip_keep_mask)}) must match "

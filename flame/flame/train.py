@@ -57,6 +57,207 @@ def build_tokenizer(job_config: JobConfig) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(job_config.model.tokenizer_path)
 
 
+def _build_reloop_training_terms(
+    *,
+    model_config,
+    step: int,
+    collect_metrics: bool,
+    routing_metric_values: dict[str, list[float]],
+) -> dict[str, float | int | None]:
+    max_depth = float(model_config.attn_res_num_blocks)
+    base_halt_kl_weight = float(getattr(model_config, "halt_kl_weight", 0.0))
+    halt_kl_min_weight = float(getattr(model_config, "halt_kl_min_weight", 0.0))
+    halt_kl_decay_steps = int(getattr(model_config, "halt_kl_decay_steps", 0))
+    if base_halt_kl_weight > 0:
+        if halt_kl_decay_steps > 0:
+            halt_kl_progress = min(step / halt_kl_decay_steps, 1.0)
+            halt_kl_weight = base_halt_kl_weight + (
+                halt_kl_min_weight - base_halt_kl_weight
+            ) * halt_kl_progress
+        else:
+            halt_kl_weight = halt_kl_min_weight if halt_kl_min_weight > 0 else base_halt_kl_weight
+    else:
+        halt_kl_weight = 0.0
+
+    base_ponder_weight = float(getattr(model_config, "ponder_loss_weight", 0.0))
+    base_early_exit_penalty_weight = float(
+        getattr(model_config, "early_exit_penalty_weight", base_ponder_weight)
+    )
+    early_exit_penalty_warmup_steps = int(
+        getattr(model_config, "early_exit_penalty_warmup_steps", 0)
+    )
+    if base_early_exit_penalty_weight > 0:
+        early_exit_penalty_progress = 1.0
+        if early_exit_penalty_warmup_steps > 0:
+            early_exit_penalty_progress = min(
+                step / early_exit_penalty_warmup_steps,
+                1.0,
+            )
+        early_exit_penalty_weight = base_early_exit_penalty_weight * early_exit_penalty_progress
+    else:
+        early_exit_penalty_weight = 0.0
+
+    base_focused_halt_loss_weight = float(
+        getattr(model_config, "focused_halt_loss_weight", 0.0)
+    )
+    focused_halt_loss_start_step = int(
+        getattr(model_config, "focused_halt_loss_start_step", 0)
+    )
+    focused_halt_loss_warmup_steps = int(
+        getattr(model_config, "focused_halt_loss_warmup_steps", 0)
+    )
+    if base_focused_halt_loss_weight > 0 and step >= focused_halt_loss_start_step:
+        focused_halt_progress = 1.0
+        if focused_halt_loss_warmup_steps > 0:
+            focused_halt_progress = min(
+                (step - focused_halt_loss_start_step + 1)
+                / focused_halt_loss_warmup_steps,
+                1.0,
+            )
+        focused_halt_loss_weight = base_focused_halt_loss_weight * focused_halt_progress
+    else:
+        focused_halt_loss_weight = 0.0
+
+    ponder_warmup_steps = int(getattr(model_config, "ponder_loss_warmup_steps", 0))
+    ponder_budget_start_step = int(getattr(model_config, "ponder_budget_start_step", 0))
+    target_depth_ratio = float(getattr(model_config, "ponder_target_depth_ratio", 1.0))
+    target_depth_steps = int(getattr(model_config, "ponder_target_steps", 0))
+    disable_halt_curriculum_after_target = bool(
+        getattr(model_config, "halt_curriculum_disable_after_target", True)
+    )
+    if base_ponder_weight > 0 and step > ponder_budget_start_step:
+        budget_step = step - ponder_budget_start_step
+        warmup_progress = 1.0
+        if ponder_warmup_steps > 0:
+            warmup_progress = min(budget_step / ponder_warmup_steps, 1.0)
+        depth_regularizer_weight = base_ponder_weight * warmup_progress
+    else:
+        depth_regularizer_weight = 0.0
+
+    halt_curriculum_active = True
+    if disable_halt_curriculum_after_target and target_depth_steps > 0:
+        halt_curriculum_active = step <= (ponder_budget_start_step + target_depth_steps)
+    if halt_curriculum_active:
+        if step <= ponder_budget_start_step:
+            target_depth = max_depth
+        else:
+            target_depth_progress = 1.0
+            if target_depth_steps > 0:
+                target_depth_progress = min(
+                    (step - ponder_budget_start_step) / target_depth_steps,
+                    1.0,
+                )
+            target_depth = max_depth * (
+                1.0 - (1.0 - target_depth_ratio) * target_depth_progress
+            )
+        min_halt_depth = max(1, math.floor(target_depth))
+    else:
+        target_depth = None
+        min_halt_depth = None
+        early_exit_penalty_weight = 0.0
+
+    terms = {
+        "halt_kl_weight": halt_kl_weight,
+        "early_exit_penalty_weight": early_exit_penalty_weight,
+        "focused_halt_loss_weight": focused_halt_loss_weight,
+        "depth_regularizer_weight": depth_regularizer_weight,
+        "target_depth": target_depth,
+        "min_halt_depth": min_halt_depth,
+    }
+    if collect_metrics:
+        routing_metric_values.setdefault("model/halt_kl_weight", []).append(halt_kl_weight)
+        routing_metric_values.setdefault("model/early_exit_penalty_weight", []).append(
+            early_exit_penalty_weight
+        )
+        routing_metric_values.setdefault("model/focused_halt_loss_weight", []).append(
+            focused_halt_loss_weight
+        )
+        routing_metric_values.setdefault("model/ponder_loss_weight", []).append(
+            depth_regularizer_weight
+        )
+        if target_depth is not None:
+            routing_metric_values.setdefault("model/target_depth", []).append(target_depth)
+        if min_halt_depth is not None:
+            routing_metric_values.setdefault("model/min_halt_depth", []).append(float(min_halt_depth))
+    return terms
+
+
+def _apply_reloop_aux_losses(
+    *,
+    loss: torch.Tensor,
+    output,
+    model_config,
+    terms: dict[str, float | int | None],
+    collect_routing_metrics: bool,
+    routing_metric_values: dict[str, list[float]],
+) -> torch.Tensor:
+    expected_depth_tensor = getattr(output, "expected_depth_tensor", None)
+    exit_kl_tensor = getattr(output, "exit_kl_tensor", None)
+    exit_entropy_tensor = getattr(output, "exit_entropy_tensor", None)
+    early_exit_mass_tensor = getattr(output, "early_exit_mass_tensor", None)
+    routing_entropy_tensor = getattr(output, "routing_entropy_tensor", None)
+    focused_halt_loss_tensor = getattr(output, "focused_halt_loss_tensor", None)
+    focused_halt_target_mean_tensor = getattr(output, "focused_halt_target_mean_tensor", None)
+    focused_halt_improvement_mean_tensor = getattr(output, "focused_halt_improvement_mean_tensor", None)
+
+    halt_kl_weight = terms["halt_kl_weight"]
+    if halt_kl_weight is not None and halt_kl_weight > 0 and exit_kl_tensor is not None:
+        loss = loss + halt_kl_weight * exit_kl_tensor
+        if collect_routing_metrics:
+            routing_metric_values.setdefault("model/halt_kl", []).append(float(exit_kl_tensor.detach()))
+
+    if collect_routing_metrics and exit_entropy_tensor is not None:
+        routing_metric_values.setdefault("model/exit_entropy", []).append(float(exit_entropy_tensor.detach()))
+
+    min_halt_depth = terms["min_halt_depth"]
+    early_exit_penalty_weight = terms["early_exit_penalty_weight"]
+    if (
+        min_halt_depth is not None
+        and early_exit_penalty_weight is not None
+        and early_exit_penalty_weight > 0
+        and early_exit_mass_tensor is not None
+    ):
+        early_exit_penalty = early_exit_mass_tensor * float(model_config.attn_res_num_blocks)
+        loss = loss + early_exit_penalty_weight * early_exit_penalty
+        if collect_routing_metrics:
+            routing_metric_values.setdefault("model/early_exit_penalty", []).append(
+                float(early_exit_penalty.detach())
+            )
+
+    target_depth = terms["target_depth"]
+    depth_regularizer_weight = terms["depth_regularizer_weight"]
+    if (
+        target_depth is not None
+        and depth_regularizer_weight is not None
+        and depth_regularizer_weight > 0
+        and expected_depth_tensor is not None
+    ):
+        depth_regularizer = torch.relu(expected_depth_tensor - target_depth)
+        loss = loss + depth_regularizer_weight * depth_regularizer
+        if collect_routing_metrics:
+            routing_metric_values.setdefault("model/depth_regularizer", []).append(
+                float(depth_regularizer.detach())
+            )
+
+    if routing_entropy_tensor is not None and collect_routing_metrics:
+        routing_metric_values.setdefault("model/routing_entropy", []).append(
+            float(routing_entropy_tensor.detach())
+        )
+    if collect_routing_metrics and focused_halt_loss_tensor is not None:
+        routing_metric_values.setdefault("model/focused_halt_loss", []).append(
+            float(focused_halt_loss_tensor.detach())
+        )
+    if collect_routing_metrics and focused_halt_target_mean_tensor is not None:
+        routing_metric_values.setdefault("model/focused_halt_target_mean", []).append(
+            float(focused_halt_target_mean_tensor.detach())
+        )
+    if collect_routing_metrics and focused_halt_improvement_mean_tensor is not None:
+        routing_metric_values.setdefault("model/focused_halt_improvement_mean", []).append(
+            float(focused_halt_improvement_mean_tensor.detach())
+        )
+    return loss
+
+
 register_train_spec(
     TrainSpec(
         name="fla",
@@ -429,118 +630,17 @@ def main(job_config: JobConfig):
             losses = []
             routing_metric_values: dict[str, list[float]] = {}
             collect_routing_metrics = (
-                model_config.model_type == "reskip_transformer"
+                model_config.model_type in ("reskip_transformer", "reloop_transformer")
                 and metric_logger.should_log(train_state.step)
             )
-            depth_regularizer_weight = None
-            halt_kl_weight = None
-            early_exit_penalty_weight = None
-            focused_halt_loss_weight = None
-            target_depth = None
-            min_halt_depth = None
-            if model_config.model_type == "reskip_transformer" and getattr(model_config, "enable_looping", False):
-                max_depth = float(model_config.attn_res_num_blocks)
-                base_halt_kl_weight = float(getattr(model_config, "halt_kl_weight", 0.0))
-                halt_kl_min_weight = float(getattr(model_config, "halt_kl_min_weight", 0.0))
-                halt_kl_decay_steps = int(getattr(model_config, "halt_kl_decay_steps", 0))
-                if base_halt_kl_weight > 0:
-                    if halt_kl_decay_steps > 0:
-                        halt_kl_progress = min(train_state.step / halt_kl_decay_steps, 1.0)
-                        halt_kl_weight = base_halt_kl_weight + (
-                            halt_kl_min_weight - base_halt_kl_weight
-                        ) * halt_kl_progress
-                    else:
-                        halt_kl_weight = halt_kl_min_weight if halt_kl_min_weight > 0 else base_halt_kl_weight
-                else:
-                    halt_kl_weight = 0.0
-
-                base_ponder_weight = float(getattr(model_config, "ponder_loss_weight", 0.0))
-                base_early_exit_penalty_weight = float(
-                    getattr(model_config, "early_exit_penalty_weight", base_ponder_weight)
+            reloop_terms = None
+            if model_config.model_type == "reloop_transformer":
+                reloop_terms = _build_reloop_training_terms(
+                    model_config=model_config,
+                    step=train_state.step,
+                    collect_metrics=collect_routing_metrics,
+                    routing_metric_values=routing_metric_values,
                 )
-                early_exit_penalty_warmup_steps = int(
-                    getattr(model_config, "early_exit_penalty_warmup_steps", 0)
-                )
-                if base_early_exit_penalty_weight > 0:
-                    early_exit_penalty_progress = 1.0
-                    if early_exit_penalty_warmup_steps > 0:
-                        early_exit_penalty_progress = min(
-                            train_state.step / early_exit_penalty_warmup_steps,
-                            1.0,
-                        )
-                    early_exit_penalty_weight = base_early_exit_penalty_weight * early_exit_penalty_progress
-                else:
-                    early_exit_penalty_weight = 0.0
-                base_focused_halt_loss_weight = float(
-                    getattr(model_config, "focused_halt_loss_weight", 0.0)
-                )
-                focused_halt_loss_start_step = int(
-                    getattr(model_config, "focused_halt_loss_start_step", 0)
-                )
-                focused_halt_loss_warmup_steps = int(
-                    getattr(model_config, "focused_halt_loss_warmup_steps", 0)
-                )
-                if base_focused_halt_loss_weight > 0 and train_state.step >= focused_halt_loss_start_step:
-                    focused_halt_progress = 1.0
-                    if focused_halt_loss_warmup_steps > 0:
-                        focused_halt_progress = min(
-                            (train_state.step - focused_halt_loss_start_step + 1)
-                            / focused_halt_loss_warmup_steps,
-                            1.0,
-                        )
-                    focused_halt_loss_weight = base_focused_halt_loss_weight * focused_halt_progress
-                else:
-                    focused_halt_loss_weight = 0.0
-                ponder_warmup_steps = int(getattr(model_config, "ponder_loss_warmup_steps", 0))
-                ponder_budget_start_step = int(getattr(model_config, "ponder_budget_start_step", 0))
-                target_depth_ratio = float(getattr(model_config, "ponder_target_depth_ratio", 1.0))
-                target_depth_steps = int(getattr(model_config, "ponder_target_steps", 0))
-                disable_halt_curriculum_after_target = bool(
-                    getattr(model_config, "halt_curriculum_disable_after_target", True)
-                )
-                if base_ponder_weight > 0 and train_state.step > ponder_budget_start_step:
-                    budget_step = train_state.step - ponder_budget_start_step
-                    warmup_progress = 1.0
-                    if ponder_warmup_steps > 0:
-                        warmup_progress = min(budget_step / ponder_warmup_steps, 1.0)
-                    depth_regularizer_weight = base_ponder_weight * warmup_progress
-                else:
-                    depth_regularizer_weight = 0.0
-                halt_curriculum_active = True
-                if disable_halt_curriculum_after_target and target_depth_steps > 0:
-                    halt_curriculum_active = train_state.step <= (ponder_budget_start_step + target_depth_steps)
-                if halt_curriculum_active:
-                    if train_state.step <= ponder_budget_start_step:
-                        target_depth = max_depth
-                    else:
-                        target_depth_progress = 1.0
-                        if target_depth_steps > 0:
-                            target_depth_progress = min(
-                                (train_state.step - ponder_budget_start_step) / target_depth_steps, 1.0
-                            )
-                        target_depth = max_depth * (
-                            1.0 - (1.0 - target_depth_ratio) * target_depth_progress
-                        )
-                    min_halt_depth = max(1, math.floor(target_depth))
-                else:
-                    target_depth = None
-                    min_halt_depth = None
-                    early_exit_penalty_weight = 0.0
-                if collect_routing_metrics:
-                    routing_metric_values.setdefault("model/halt_kl_weight", []).append(halt_kl_weight)
-                    routing_metric_values.setdefault("model/early_exit_penalty_weight", []).append(
-                        early_exit_penalty_weight
-                    )
-                    routing_metric_values.setdefault("model/focused_halt_loss_weight", []).append(
-                        focused_halt_loss_weight
-                    )
-                    routing_metric_values.setdefault("model/ponder_loss_weight", []).append(
-                        depth_regularizer_weight
-                    )
-                    if target_depth is not None:
-                        routing_metric_values.setdefault("model/target_depth", []).append(target_depth)
-                    if min_halt_depth is not None:
-                        routing_metric_values.setdefault("model/min_halt_depth", []).append(float(min_halt_depth))
             # do gradient accumulation if enabled
             for _ in range(job_config.training.gradient_accumulation_steps):
                 # get batch
@@ -623,80 +723,32 @@ def main(job_config: JobConfig):
                     # Non-PP forward / backward
                     with train_context(optional_context_parallel_ctx):
                         with maybe_enable_amp:
+                            model_forward_kwargs = {}
+                            if reloop_terms is not None:
+                                model_forward_kwargs.update(
+                                    focused_halt_loss_weight_override=reloop_terms["focused_halt_loss_weight"],
+                                    min_halt_depth=reloop_terms["min_halt_depth"],
+                                )
                             output = model(
                                 input_ids=input_ids,
                                 labels=labels,
                                 position_ids=position_ids,
                                 cu_seqlens=cu_seqlens,
                                 return_routing_info=collect_routing_metrics,
-                                focused_halt_loss_weight_override=focused_halt_loss_weight,
-                                min_halt_depth=min_halt_depth,
+                                **model_forward_kwargs,
                             )
                         loss = output.loss
-                        expected_depth_tensor = getattr(output, "expected_depth_tensor", None)
-                        exit_kl_tensor = getattr(output, "exit_kl_tensor", None)
-                        exit_entropy_tensor = getattr(output, "exit_entropy_tensor", None)
-                        early_exit_mass_tensor = getattr(output, "early_exit_mass_tensor", None)
-                        routing_entropy_tensor = getattr(output, "routing_entropy_tensor", None)
-                        focused_halt_loss_tensor = getattr(output, "focused_halt_loss_tensor", None)
-                        focused_halt_target_mean_tensor = getattr(
-                            output, "focused_halt_target_mean_tensor", None
-                        )
-                        focused_halt_improvement_mean_tensor = getattr(
-                            output, "focused_halt_improvement_mean_tensor", None
-                        )
-                        if halt_kl_weight is not None and halt_kl_weight > 0 and exit_kl_tensor is not None:
-                            loss = loss + halt_kl_weight * exit_kl_tensor
-                            if collect_routing_metrics:
-                                routing_metric_values.setdefault("model/halt_kl", []).append(
-                                    float(exit_kl_tensor.detach())
-                                )
-                        if collect_routing_metrics and exit_entropy_tensor is not None:
-                            routing_metric_values.setdefault("model/exit_entropy", []).append(
-                                float(exit_entropy_tensor.detach())
+                        if reloop_terms is not None:
+                            loss = _apply_reloop_aux_losses(
+                                loss=loss,
+                                output=output,
+                                model_config=model_config,
+                                terms=reloop_terms,
+                                collect_routing_metrics=collect_routing_metrics,
+                                routing_metric_values=routing_metric_values,
                             )
-                        if (
-                            min_halt_depth is not None
-                            and early_exit_penalty_weight is not None
-                            and early_exit_penalty_weight > 0
-                            and early_exit_mass_tensor is not None
-                        ):
-                            early_exit_penalty = early_exit_mass_tensor * float(model_config.attn_res_num_blocks)
-                            loss = loss + early_exit_penalty_weight * early_exit_penalty
-                            if collect_routing_metrics:
-                                routing_metric_values.setdefault("model/early_exit_penalty", []).append(
-                                    float(early_exit_penalty.detach())
-                                )
-                        if (
-                            target_depth is not None
-                            and depth_regularizer_weight is not None
-                            and depth_regularizer_weight > 0
-                            and expected_depth_tensor is not None
-                        ):
-                            depth_regularizer = torch.relu(expected_depth_tensor - target_depth)
-                            loss = loss + depth_regularizer_weight * depth_regularizer
-                            if collect_routing_metrics:
-                                routing_metric_values.setdefault("model/depth_regularizer", []).append(
-                                    float(depth_regularizer.detach())
-                                )
                         loss = loss / job_config.training.gradient_accumulation_steps
                         routing_info = getattr(output, "routing_info", None)
-                        if routing_entropy_tensor is not None and collect_routing_metrics:
-                            routing_metric_values.setdefault("model/routing_entropy", []).append(
-                                float(routing_entropy_tensor.detach())
-                            )
-                        if collect_routing_metrics and focused_halt_loss_tensor is not None:
-                            routing_metric_values.setdefault("model/focused_halt_loss", []).append(
-                                float(focused_halt_loss_tensor.detach())
-                            )
-                        if collect_routing_metrics and focused_halt_target_mean_tensor is not None:
-                            routing_metric_values.setdefault("model/focused_halt_target_mean", []).append(
-                                float(focused_halt_target_mean_tensor.detach())
-                            )
-                        if collect_routing_metrics and focused_halt_improvement_mean_tensor is not None:
-                            routing_metric_values.setdefault(
-                                "model/focused_halt_improvement_mean", []
-                            ).append(float(focused_halt_improvement_mean_tensor.detach()))
                         if routing_info is not None:
                             routing_metric_values.setdefault("model/effective_depth", []).append(
                                 float(routing_info["effective_depth"])
@@ -707,14 +759,17 @@ def main(job_config: JobConfig):
                             routing_metric_values.setdefault("model/depth_ratio", []).append(
                                 float(routing_info["effective_depth"]) / float(model_config.attn_res_num_blocks)
                             )
-                            routing_metric_values.setdefault("model/ponder_cost", []).append(
-                                float(routing_info["ponder_cost"])
-                            )
-                            halt_probabilities = routing_info.get("halt_probabilities")
-                            if halt_probabilities:
-                                routing_metric_values.setdefault("model/halt_prob_mean", []).append(
-                                    float(sum(halt_probabilities) / len(halt_probabilities))
-                                )
+                            if reloop_terms is not None:
+                                ponder_cost = routing_info.get("ponder_cost")
+                                if ponder_cost is not None:
+                                    routing_metric_values.setdefault("model/ponder_cost", []).append(
+                                        float(ponder_cost)
+                                    )
+                                halt_probabilities = routing_info.get("halt_probabilities")
+                                if halt_probabilities:
+                                    routing_metric_values.setdefault("model/halt_prob_mean", []).append(
+                                        float(sum(halt_probabilities) / len(halt_probabilities))
+                                    )
                         loss.backward()
 
                 losses.append(loss)
