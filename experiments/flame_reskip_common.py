@@ -139,6 +139,8 @@ def evaluate_causal_lm(
     importance_matrix = None
     block_importance_sum = None
     batch_metrics = []
+    model_type = str(getattr(getattr(model, "config", None), "model_type", ""))
+    supports_skip_controls = model_type == "reskip_transformer"
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -151,18 +153,20 @@ def evaluate_causal_lm(
                 attention_mask = None
         if cu_seqlens is not None:
             cu_seqlens = cu_seqlens.to(device)
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            cu_seqlens=cu_seqlens,
-            use_cache=False,
-            return_dict=True,
-            return_routing_info=return_routing_info,
-            enable_skipping=enable_skipping,
-            skip_keep_mask=skip_keep_mask,
+        forward_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "cu_seqlens": cu_seqlens,
+            "use_cache": False,
+            "return_dict": True,
+            "return_routing_info": return_routing_info,
             **model_forward_kwargs,
-        )
+        }
+        if supports_skip_controls:
+            forward_kwargs["enable_skipping"] = enable_skipping
+            forward_kwargs["skip_keep_mask"] = skip_keep_mask
+        outputs = model(**forward_kwargs)
         valid_tokens = count_valid_tokens(labels)
         total_loss += outputs.loss.item() * valid_tokens
         total_tokens += valid_tokens

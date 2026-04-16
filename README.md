@@ -23,37 +23,28 @@ These α weights are a natural routing signal:
 
 ### Implementation
 
-The main implementation now lives in the **flame/FLA** framework:
+The main implementation now lives in the **flame/FLA** framework, and ReSkip and ReLoop are now two separate FLA model modules (split April 2026 to allow ReLoop to evolve independently):
 
 | Component | Location |
 |-----------|----------|
-| ReSkip/ReLoop model | `flash-linear-attention/fla/models/reskip_transformer/` |
+| ReSkip model | `flash-linear-attention/fla/models/reskip_transformer/` |
+| ReLoop model | `flash-linear-attention/fla/models/reloop_transformer/` |
 | Training framework | `flame/` |
-| Main 340M config | `flame/configs/reskip_transformer_340M.json` |
-| ReLoop config | `flame/configs/reloop_transformer_340M.json` |
+| ReSkip 340M config | `flame/configs/reskip_transformer_340M.json` (`model_type=reskip_transformer`) |
+| ReLoop 340M config | `flame/configs/reloop_transformer_340M.json` (`model_type=reloop_transformer`) |
 
 Current training target: **340M model on FineWeb-Edu 100BT**, 6-GPU training with streaming + varlen.
 
 ### Key Experimental Results
 
-**340M model** (`reskip_transformer-340M`, 8 blocks, 24 layers, FineWeb-Edu 100BT) — 2026-04-14:
+**340M model** (`reskip_transformer-340M`, 8 blocks, 24 layers, FineWeb-Edu 100BT) — 2026-04-16:
 
 | Configuration | LAMBADA acc | HellaSwag | ARC-Easy | ARC-Challenge | Wall-clock speedup |
 |---|---:|---:|---:|---:|---:|
 | Full-depth | 0.4056 | 0.4607 | 0.5438 | 0.3012 | 1.00x |
-| Dynamic skip: `attn_only + low1 + q=0.95` | **0.4056** | **0.4607** | **0.5438** | **0.3012** | **1.14x** |
+| Dynamic skip: `attn_only + {3,5} + q=0.85 + max_skips=2` | **0.4056** | **0.4607** | **0.5438** | **0.3012** | **~1.19x** |
 
-> Speedup is real wall-clock (same GPU, same cached batches, `seq_len=8192`, no proxy). Every batch stably skips exactly 1 block. Config: `strategy=recent_weight_gt`, `probe=attn_only`, `position=low1`, `q=0.95`, `max_skips=1`.
-
-**Intermediate checkpoint** (`test3`) — probe mode comparison (2026-04-10):
-
-| Configuration | LAMBADA acc | HellaSwag | ARC-Easy | ARC-Challenge | Long-context speedup |
-|---|---:|---:|---:|---:|---:|
-| Full-depth | 0.2630 | 0.3189 | 0.4457 | 0.2602 | 1.00x |
-| Dynamic skip: `attn_only + low1 + q=0.9` | **0.2630** | **0.3189** | **0.4457** | **0.2602** | **1.24x** |
-| Dynamic skip: `prev_recent + low1 + q=0.95` | 0.2626 | 0.3172 | 0.4453 | 0.2585 | 1.26x |
-
-See [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for full experiment details.
+> Config: `strategy=recent_weight_gt`, `probe=attn_only`, `positions={3,5}`, `q=0.85`, `max_skips=2`. Position selection uses **ablation-informed + importance-informed** combination: block 3 has the lowest static-removal PPL impact; block 5 has the lowest AttnRes importance score. Together they provide both high skip frequency and safe skip space. See [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for full experiment details.
 
 ### Resolved Issues
 
@@ -80,10 +71,14 @@ See [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for full ex
 
 ```
 reskip/
-├── flash-linear-attention/           # FLA library — contains ReSkip/ReLoop model implementations
-│   └── fla/models/reskip_transformer/
-│       ├── modeling_reskip_transformer.py   # Forward pass, dynamic skip, routing trace
-│       └── configuration_reskip_transformer.py
+├── flash-linear-attention/           # FLA library
+│   └── fla/models/
+│       ├── reskip_transformer/       # ReSkip model: dynamic/static block skipping
+│       │   ├── modeling_reskip_transformer.py
+│       │   └── configuration_reskip_transformer.py
+│       └── reloop_transformer/       # ReLoop model: weight-shared loops + ACT halting
+│           ├── modeling_reloop_transformer.py
+│           └── configuration_reloop_transformer.py
 ├── flame/                            # Training framework
 │   ├── configs/
 │   │   ├── reskip_transformer_340M.json    # 340M ReSkip pretraining config
@@ -113,20 +108,23 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash train.sh \
     --training.dataset /path/to/fineweb_edu_100BT \
     # ... (full command in EXPERIMENTS_CN.md §4.2)
 
-# Routing analysis + dynamic skip export
+# Routing analysis + dynamic skip export (auto-searches ablation-informed positions)
 python experiments/flame_analyze_reskip.py \
     --model_path flame/saves/reskip_transformer_340M \
     --dataset /path/to/fineweb_edu_100BT \
+    --streaming --seq_len 8192 --batch_size 1 --num_batches 32 \
     --dynamic_skip_strategy recent_weight_gt \
-    --dynamic_skip_probe_modes all,attn_only \
-    --dynamic_skip_quantiles 0.9,0.95,0.97 \
+    --dynamic_skip_probe_modes attn_only,first_attn \
+    --dynamic_skip_position_modes auto \
+    --dynamic_skip_quantiles 0.8,0.85,0.9,0.93,0.95,0.97 \
+    --dynamic_skip_max_skips_options 1,2,3 \
     --output_dir outputs/reskip_analysis \
-    --export_best_dynamic_model_dir outputs/reskip_340M_dynamic_skip_ready \
+    --export_best_dynamic_model_dir outputs/reskip_dynamic_best \
     --device cuda
 
-# Evaluation
+# Evaluation (skip policy is saved in config.json, auto-applied)
 python experiments/flame_lm_eval.py \
-    --model_path outputs/reskip_340M_dynamic_skip_ready \
+    --model_path outputs/reskip_dynamic_best \
     --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
     --device cuda:0
 ```
@@ -146,9 +144,10 @@ ReSkip block execution is naturally **two-phase**:
 Key properties:
 - No auxiliary network or training loss
 - Position-specific calibration thresholds (not a single global value)
-- `max_skips=1` gives the best stability
+- **Ablation-informed position selection**: blocks are ranked by static-removal PPL impact, not just AttnRes importance. Block 3 (highest importance) turns out to have the lowest removal impact — "frequently referenced" does not mean "irreplaceable"
+- `max_skips=2` with combined ablation + importance positions gives the best speed/quality tradeoff
 
-See [DYNAMIC_SKIP_MECHANISM.md](DYNAMIC_SKIP_MECHANISM.md) for the full mechanism description and paper update suggestions.
+See [DYNAMIC_SKIP_MECHANISM.md](DYNAMIC_SKIP_MECHANISM.md) for the full mechanism description and [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for experiment details.
 
 ---
 

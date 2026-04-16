@@ -240,8 +240,11 @@ class GLATPPlan(TPPlan):
 TP_PLAN_MAP = {
     "transformer": TransformerTPPlan,
     "reskip_transformer": TransformerTPPlan,
+    "reloop_transformer": TransformerTPPlan,
     "gla": GLATPPlan,
 }
+
+RESKIP_FAMILY_MODEL_TYPES = ("reskip_transformer", "reloop_transformer")
 
 
 def iter_execution_blocks(model: nn.Module):
@@ -251,10 +254,10 @@ def iter_execution_blocks(model: nn.Module):
     if blocks is None:
         return
 
-    if model_type == "reskip_transformer":
+    if model_type in RESKIP_FAMILY_MODEL_TYPES:
         for block_group in blocks:
             if not hasattr(block_group, "layers"):
-                logger.warning('reskip block group has no "layers" attribute')
+                logger.warning('%s block group has no "layers" attribute', model_type)
                 continue
             for layer_id, layer in block_group.layers.named_children():
                 yield block_group.layers, layer_id, layer
@@ -271,7 +274,7 @@ def iter_fsdp_blocks(model: nn.Module):
     if blocks is None:
         return
 
-    if model_type == "reskip_transformer":
+    if model_type in RESKIP_FAMILY_MODEL_TYPES:
         for block_id, block in blocks.named_children():
             yield blocks, block_id, block
         return
@@ -396,13 +399,14 @@ def apply_ac(model: nn.Module, ac_config):
     real_model = get_model(model)
     model_config = getattr(real_model, "config", None)
     model_type = getattr(model_config, "model_type", None)
-    enable_looping = bool(getattr(model_config, "enable_looping", False))
     effective_mode = ac_config.mode
 
-    if model_type == "reskip_transformer" and enable_looping and ac_config.mode == "selective":
+    is_looping = model_type == "reloop_transformer"
+    if is_looping and ac_config.mode == "selective":
         logger.warning(
-            "Selective activation checkpointing is unstable for looping reskip_transformer; "
-            "falling back to full activation checkpointing."
+            "Selective activation checkpointing is unstable for looping %s; "
+            "falling back to full activation checkpointing.",
+            model_type,
         )
         effective_mode = "full"
 
@@ -496,12 +500,13 @@ def apply_fsdp(
     real_model = get_model(model)
     model_config = getattr(real_model, "config", None)
     model_type = getattr(model_config, "model_type", None)
-    enable_looping = bool(getattr(model_config, "enable_looping", False))
     effective_reshard_policy = reshard_after_forward_policy
-    if model_type == "reskip_transformer" and enable_looping and reshard_after_forward_policy != "never":
+    is_looping = model_type == "reloop_transformer"
+    if is_looping and reshard_after_forward_policy != "never":
         logger.warning(
-            "Looping reskip_transformer is unstable with FSDP reshard_after_forward enabled; "
-            "forcing `training.fsdp_reshard_after_forward=never`."
+            "Looping %s is unstable with FSDP reshard_after_forward enabled; "
+            "forcing `training.fsdp_reshard_after_forward=never`.",
+            model_type,
         )
         effective_reshard_policy = "never"
 

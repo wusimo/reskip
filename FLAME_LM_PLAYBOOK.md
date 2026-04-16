@@ -4,13 +4,14 @@
 
 ## New Implementation
 
-The new LM implementation now lives in FLA itself:
+ReSkip and ReLoop are now two separate FLA modules (split April 2026):
 
-- `flash-linear-attention/fla/models/reskip_transformer/`
+- `flash-linear-attention/fla/models/reskip_transformer/` — ReSkip (`model_type=reskip_transformer`)
+- `flash-linear-attention/fla/models/reloop_transformer/` — ReLoop (`model_type=reloop_transformer`)
 - `flame/configs/reskip_transformer_340M.json`
 - `flame/configs/reloop_transformer_340M.json`
 
-This keeps the architecture change inside FLA’s transformer family, while flame remains the trainer/orchestrator.
+This keeps the architecture change inside FLA's transformer family, while flame remains the trainer/orchestrator. Both modules share the same AttnRes primitives (`BlockAttentionResidual`, two-phase block execution, phase-1 routing statistics) but evolve independently — ReSkip stays stable while ReLoop's halting/ponder mechanism is still being debugged.
 
 Implemented behavior:
 

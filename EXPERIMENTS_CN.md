@@ -28,6 +28,22 @@
 
 不再使用单独拉下来的 `baseflame`。
 
+### 2.1.1 ReSkip 与 ReLoop 已拆分为两个 FLA 模型
+
+2026-04-14 起，ReSkip 和 ReLoop 拆分成两个独立的 FLA 模型目录：
+
+- [fla/models/reskip_transformer/](/home/user01/Minko/reskip2/reskip/flash-linear-attention/fla/models/reskip_transformer/) —— `model_type = reskip_transformer`
+- [fla/models/reloop_transformer/](/home/user01/Minko/reskip2/reskip/flash-linear-attention/fla/models/reloop_transformer/) —— `model_type = reloop_transformer`
+
+对应 config 文件：
+
+- [reskip_transformer_340M.json](/home/user01/Minko/reskip2/reskip/flame/configs/reskip_transformer_340M.json) 使用 `"model_type": "reskip_transformer"`
+- [reloop_transformer_340M.json](/home/user01/Minko/reskip2/reskip/flame/configs/reloop_transformer_340M.json) 使用 `"model_type": "reloop_transformer"`
+
+注意：
+- 旧的 `flame/saves/*` 下面的 checkpoint 快照仍然使用 `model_type = reskip_transformer`，加载它们会自动走各自快照里的 `fla/models/reskip_transformer/` 冻结副本，不受本次拆分影响。
+- 新训练的 ReLoop 正式 run 请使用更新后的 `reloop_transformer_340M.json`。
+
 ### 2.2 已确认修复的问题
 
 之前 `ReSkip` 训练里最关键的问题是：
@@ -66,21 +82,26 @@
 - 新训练生成的 checkpoint 可以正常用于离线检查、HF 导出、`lm-eval`
 - 旧的异常 checkpoint 不再作为正式结果依据
 
-### 2.4 当前 ReSkip analysis 结论
+### 2.4 当前 ReSkip analysis 结论（2026-04-16 更新）
 
-目前 `ReSkip` 的分析结论已经更新：
+当前最佳动态 skip 方案：`recent_weight_gt + attn_only probe + positions {3,5} + q=0.85 + max_skips=2`
 
-- 不再把“全局静态删一个 block”当成唯一 skip 方案
-- 当前更推荐的部署/评测路径是：
-  - 先做 `reskip analysis`
-  - 再导出带默认动态 skip 配置的 HF 模型
-  - 再直接对这个动态模型跑 `lm-eval`
+- 四任务 benchmark 与 full-depth **完全一致**
+- Wall-clock 加速约 **1.19x**（seq_len=8192）
+- 核心发现：**ablation-informed 位置选择**比单纯的 AttnRes importance 选位更有效
+  - Block 3（importance 最高 0.561）的 static removal PPL impact 实际最低（1.31x）
+  - Block 5（importance 最低 0.400）skip 触发频率最高
+  - 两者组合 + max_skips=2 实现了提速与保质的最佳平衡
 
-已经验证过：
+部署/评测路径：
+1. 用 `flame_analyze_reskip.py` 做分析（自动搜索含 ablation-informed 的位置组合）
+2. 导出带动态 skip 配置的 HF 模型（skip 策略保存在 `config.json` 中）
+3. 直接对导出模型跑 `lm-eval`
 
-- 静态删除任意单个中间 block，通常都会让 PPL 恶化较多
-- 但基于 AttnRes 运行时 `phase1` 统计的动态 skip，可以在更接近 full-depth 的质量下减少平均 block 数
-- 这条动态 skip 路径不需要额外训练，只依赖 AttnRes 自身的运行时信号
+已淘汰的方案（代码已清理）：
+- MLP-level skip（routing 信号不适用于 MLP 级别）
+- Hybrid block+MLP skip（增加 overhead）
+- Sample-level quantile 聚合（batch_size=1 下无效）
 
 ---
 
@@ -296,90 +317,73 @@ CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
   --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M
 ```
 
-### 8.4 先做 dynamic analysis，再导出动态模型
+### 8.4 动态 skip 分析 + 导出（推荐流程）
+
+分析脚本会自动搜索最佳动态 skip 配置，包含 ablation-informed 位置模式：
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 python experiments/flame_analyze_reskip.py \
-  --model_path /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer_340M \
+  --model_path /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer-340M \
   --dataset /home/user01/Minko/datasets/fineweb_edu_100BT \
   --dataset_split train \
   --seq_len 8192 \
-  --context_len 2048 \
   --batch_size 1 \
   --num_workers 2 \
   --num_batches 32 \
   --streaming \
-  --varlen \
   --device cuda \
   --dtype bf16 \
-  --output_dir /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis_dynamic \
+  --output_dir /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis \
   --dynamic_skip_strategy recent_weight_gt \
-  --dynamic_skip_quantiles 0.9,0.95,0.97 \
-  --dynamic_skip_max_skips_options 1 \
-  --export_best_dynamic_model_dir /home/user01/Minko/reskip2/reskip/outputs/reskip_340M_dynamic_skip_ready
+  --dynamic_skip_probe_modes attn_only,first_attn \
+  --dynamic_skip_position_modes auto \
+  --dynamic_skip_quantiles 0.8,0.85,0.9,0.93,0.95,0.97 \
+  --dynamic_skip_max_skips_options 1,2,3 \
+  --dynamic_skip_latency_num_batches 16 \
+  --dynamic_skip_latency_top_k 8 \
+  --dynamic_skip_speed_ppl_tolerance 0.05 \
+  --export_best_dynamic_model_dir /home/user01/Minko/reskip2/reskip/outputs/reskip_dynamic_best
 ```
 
-这个目录导出后，`config.json` 会自带：
+`--dynamic_skip_position_modes auto` 会自动搜索：
+- `ablation1`/`ablation2`/`ablation3`：static removal PPL impact 最低的 block 组合
+- `low1`/`low2`/`low3`：AttnRes importance 最低的 block 组合
+- `recommended`/`all`/`late*`/`taillow*`：其他启发式组合
 
-- `dynamic_skip_strategy`
-- `dynamic_skip_position_thresholds`
-- `dynamic_skip_max_skips`
+导出目录的 `config.json` 会自带 `dynamic_skip_strategy`、`dynamic_skip_position_thresholds`、`dynamic_skip_max_skips`，后续直接拿来跑分即可。
 
-因此后续直接拿这个目录跑分即可。
-
-注意这里有 3 种 dynamic 选择：
-
-- `best_dynamic_ppl`
-  质量最优，但通常跳得不深
-- `best_dynamic_skip`
-  跳得最深，但可能明显掉分
-- `best_dynamic_tolerated`
-  在允许的 `ppl_tolerance` 以内，跳得最深
-
-现在推荐把第三种作为默认部署/跑分方案。
+当前 340M 最佳配置为 `attn_only + {3,5} + q=0.85 + max_skips=2`，已导出至：
+- [reskip_340M_combined_35_skip2_q085](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_combined_35_skip2_q085)
 
 ### 8.5 动态 skip 直接跑分
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
-  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_340M_dynamic_skip_ready \
+  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_dynamic_best \
   --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
   --batch_size auto \
   --device cuda:0 \
-  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_dynamic
+  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_dynamic
 ```
 
 ### 8.6 让 lm-eval 自动读取 analysis 并准备动态模型
 
-如果不想手动维护单独的动态导出目录，也可以直接：
-
 ```bash
 CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
-  --analysis_json /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis_dynamic/routing_analysis.json \
+  --analysis_json /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis/routing_analysis.json \
   --dynamic_mode tolerated \
   --prepared_model_dir /tmp/reskip_eval_dynamic \
   --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
   --batch_size auto \
   --device cuda:0 \
-  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_dynamic
+  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_dynamic
 ```
 
-这个流程会：
-
-1. 读取 `routing_analysis.json`
-2. 自动准备一个带默认动态 skip 配置的 HF 模型目录
-3. 直接调用 `lm-eval`
-
-其中：
-
-- `--dynamic_mode quality`
-  选择质量最好的 dynamic 配置
-- `--dynamic_mode tolerated`
-  选择在 `ppl_tolerance` 内跳得最深的 dynamic 配置
-- `--dynamic_mode deepest`
-  选择跳得最深的 dynamic 配置，不保证质量
-- `--dynamic_mode static`
-  走静态 keep-mask 配置，但仍复用同一个评测入口
+`--dynamic_mode` 选项：
+- `tolerated`：在 `ppl_tolerance` 内跳得最深（**推荐**）
+- `quality`：质量最优
+- `fast`：wall-clock 最快
+- `deepest`：跳得最深，不保证质量
 
 ### 8.7 建议顺序
 
