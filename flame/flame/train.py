@@ -152,9 +152,18 @@ def _build_reloop_training_terms(
             )
         min_halt_depth = max(1, math.floor(target_depth))
     else:
-        target_depth = None
+        # Curriculum completed. The hard floor and early-exit penalty come off
+        # so halt_cumulative can genuinely select any depth per sample. If
+        # `halt_retain_target_after_curriculum` is set, keep the fully-decayed
+        # target alive so the symmetric depth regularizer still holds the
+        # batch-average depth near the target — otherwise depth would collapse
+        # to whatever focused_halt alone prefers.
         min_halt_depth = None
         early_exit_penalty_weight = 0.0
+        if bool(getattr(model_config, "halt_retain_target_after_curriculum", False)):
+            target_depth = max_depth * target_depth_ratio
+        else:
+            target_depth = None
 
     terms = {
         "halt_kl_weight": halt_kl_weight,
@@ -232,7 +241,12 @@ def _apply_reloop_aux_losses(
         and depth_regularizer_weight > 0
         and expected_depth_tensor is not None
     ):
-        depth_regularizer = torch.relu(expected_depth_tensor - target_depth)
+        # Symmetric attractor: pull expected_depth toward the curriculum target
+        # in both directions. A one-sided ReLU(x - target) only caps above
+        # target; combined with `min_halt_depth = floor(target)` as a hard
+        # floor, it collapses to a fixed depth. Using |x - target| lets per-
+        # sample halt decisions vary around the target mean.
+        depth_regularizer = (expected_depth_tensor - target_depth).abs()
         loss = loss + depth_regularizer_weight * depth_regularizer
         if collect_routing_metrics:
             routing_metric_values.setdefault("model/depth_regularizer", []).append(

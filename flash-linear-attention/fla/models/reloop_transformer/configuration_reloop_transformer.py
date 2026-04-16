@@ -39,7 +39,10 @@ class ReLoopTransformerConfig(PretrainedConfig):
         attn_res_temperature: float = 1.0,
         num_recurrent_blocks: int | None = None,
         max_loops: int = 1,
+        halt_mode: str = "head",
         halt_threshold: float = 0.99,
+        attnres_halt_threshold: float = 0.15,
+        attnres_halt_temperature: float = 0.05,
         halt_kl_weight: float = 0.0,
         halt_kl_min_weight: float = 0.0,
         halt_kl_decay_steps: int = 0,
@@ -47,7 +50,9 @@ class ReLoopTransformerConfig(PretrainedConfig):
         halt_detach_phase1_stats: bool = True,
         halt_use_position_bias: bool = True,
         training_soft_min_halt: bool = True,
+        training_full_depth: bool = False,
         halt_curriculum_disable_after_target: bool = True,
+        halt_retain_target_after_curriculum: bool = False,
         early_exit_penalty_weight: float = 0.0,
         early_exit_penalty_warmup_steps: int = 0,
         focused_halt_loss_weight: float = 0.0,
@@ -56,6 +61,7 @@ class ReLoopTransformerConfig(PretrainedConfig):
         focused_halt_improvement_margin: float = 0.0,
         focused_halt_target_temperature: float = 0.1,
         focused_halt_num_tokens: int = 128,
+        multi_exit_loss_weight: float = 0.0,
         ponder_loss_weight: float = 0.0,
         ponder_loss_warmup_steps: int = 0,
         ponder_budget_start_step: int = 0,
@@ -91,7 +97,10 @@ class ReLoopTransformerConfig(PretrainedConfig):
         self.enable_looping = True
         self.num_recurrent_blocks = num_recurrent_blocks
         self.max_loops = max_loops
+        self.halt_mode = halt_mode
         self.halt_threshold = halt_threshold
+        self.attnres_halt_threshold = attnres_halt_threshold
+        self.attnres_halt_temperature = attnres_halt_temperature
         self.halt_kl_weight = halt_kl_weight
         self.halt_kl_min_weight = halt_kl_min_weight
         self.halt_kl_decay_steps = halt_kl_decay_steps
@@ -99,7 +108,9 @@ class ReLoopTransformerConfig(PretrainedConfig):
         self.halt_detach_phase1_stats = halt_detach_phase1_stats
         self.halt_use_position_bias = halt_use_position_bias
         self.training_soft_min_halt = training_soft_min_halt
+        self.training_full_depth = training_full_depth
         self.halt_curriculum_disable_after_target = halt_curriculum_disable_after_target
+        self.halt_retain_target_after_curriculum = halt_retain_target_after_curriculum
         self.early_exit_penalty_weight = early_exit_penalty_weight
         self.early_exit_penalty_warmup_steps = early_exit_penalty_warmup_steps
         self.focused_halt_loss_weight = focused_halt_loss_weight
@@ -108,6 +119,7 @@ class ReLoopTransformerConfig(PretrainedConfig):
         self.focused_halt_improvement_margin = focused_halt_improvement_margin
         self.focused_halt_target_temperature = focused_halt_target_temperature
         self.focused_halt_num_tokens = focused_halt_num_tokens
+        self.multi_exit_loss_weight = multi_exit_loss_weight
         self.ponder_loss_weight = ponder_loss_weight
         self.ponder_loss_warmup_steps = ponder_loss_warmup_steps
         self.ponder_budget_start_step = ponder_budget_start_step

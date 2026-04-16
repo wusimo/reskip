@@ -1,0 +1,33 @@
+# Main ReSkip / Flame environment
+# Usage:
+#   cd /path/to/reskip
+#   pip install -r requirements.txt
+#
+# This file targets the main ReSkip / Flame / lm-eval workflow only.
+# If you need StarVLA, install its extra dependencies separately.
+
+# Local packages in this workspace
+-e ./torchtitan
+-e ./flash-linear-attention
+-e ./flame
+
+# Core runtime
+torch>=2.7.0
+torchdata
+triton>=3.0
+transformers>=4.45.0
+accelerate
+datasets>=3.3.0
+tiktoken>=0.5.0
+einops
+ninja
+pyyaml>=6.0
+numpy>=1.24.0
+tqdm>=4.60.0
+psutil
+
+# Logging / analysis / evaluation
+wandb
+tensorboard
+matplotlib>=3.7.0
+lm-eval

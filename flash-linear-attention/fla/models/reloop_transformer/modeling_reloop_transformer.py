@@ -203,6 +203,28 @@ def normalize_router_entropy(entropy: torch.Tensor, num_sources: int) -> torch.T
     return (entropy.float() / max_entropy).clamp_(0.0, 1.0).to(entropy.dtype)
 
 
+def per_sample_recent_weight(
+    routers: list["BlockAttentionResidual"],
+    completed_blocks: list[torch.Tensor],
+) -> torch.Tensor:
+    """Per-sample routing weight on the most recent completed block.
+
+    Returns a [batch] tensor measuring how strongly the block group's
+    routers attend to the latest source.  Low value → the recent block
+    is not contributing much → good candidate for halting.
+    """
+    if len(completed_blocks) <= 1:
+        return completed_blocks[0].new_zeros(completed_blocks[0].shape[0])
+    values = torch.stack(completed_blocks, dim=0)  # [sources, batch, seq, hidden]
+    base_keys = _rms_norm_base(values, routers[0].key_norm.eps)
+    queries = torch.stack([_router_effective_query(r) for r in routers], dim=0)
+    scale = math.sqrt(values.shape[-1]) * routers[0].temperature
+    scores = torch.einsum("qd,nbtd->qnbt", queries, base_keys) / scale
+    probs = torch.softmax(scores, dim=1)  # [routers, sources, batch, seq]
+    # weight on last source, averaged over routers and sequence positions
+    return probs[:, -1, :, :].mean(dim=(0, 2)).detach()  # [batch]
+
+
 def collect_completed_blocks(
     block_states: list[torch.Tensor | None],
     current_block_idx: int,
@@ -250,6 +272,7 @@ class ReLoopBaseModelOutputWithPast(BaseModelOutputWithPast):
     routing_entropy_tensor: torch.Tensor | None = None
     loop_step_hidden_states: tuple[torch.Tensor, ...] | None = None
     halt_logits_tensors: tuple[torch.Tensor, ...] | None = None
+    multi_exit_hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
 @dataclass
@@ -802,6 +825,7 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
         min_halt_depth: int | None = None,
         fixed_loop_positions: int | None = None,
         collect_loop_step_states: bool = False,
+        collect_multi_exit_states: bool = False,
         **kwargs: Unpack[Any],
     ) -> tuple | ReLoopBaseModelOutputWithPast:
         if output_attentions:
@@ -831,6 +855,7 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         loop_step_hidden_states: list[torch.Tensor] | None = [] if collect_loop_step_states else None
         halt_logits_tensors: list[torch.Tensor] | None = [] if collect_loop_step_states else None
+        multi_exit_hidden_states: list[torch.Tensor] | None = [] if collect_multi_exit_states else None
         next_cache = past_key_values
         routing_events: list[dict[str, Any]] = []
         execution_trace: list[dict[str, Any]] = []
@@ -902,6 +927,16 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
                 active_gate = hidden_states.new_ones(batch_size)
                 soft_fraction_value = active_gate.mean()
                 expected_fraction = soft_fraction_value
+            # During training with training_full_depth, force all blocks to
+            # execute so every block receives gradient through the final LM
+            # loss.  The halt head still learns via ponder_cost (whose gradient
+            # flows through the soft path computed above) and focused_halt_loss.
+            # At inference, actual gating is applied as usual.
+            if self.training and self.config.training_full_depth:
+                active_mask = torch.ones_like(halt_cumulative, dtype=torch.bool)
+                executed_fraction = 1.0
+                active_gate = hidden_states.new_ones(batch_size)
+
             if not torch.any(active_mask) and not self.training:
                 if return_routing_info:
                     execution_trace.append(
@@ -970,20 +1005,41 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
             halt_probability_mean = 0.0
             halt_structural_bias = 0.0
             halt_position_bias = 0.0
-            pooled = self._pool_hidden(self.halt_norm(hidden_states), attention_mask)
-            halt_logits = self.halt_head(pooled).squeeze(-1)
-            if self.config.halt_use_position_bias:
-                position_bias_value = self.halt_position_bias[position].to(halt_logits.dtype)
-                halt_logits = halt_logits + position_bias_value
-                halt_position_bias = float(position_bias_value.detach().item())
-            if halt_phase1_features is not None:
-                phase1_features = halt_phase1_features.to(device=pooled.device, dtype=pooled.dtype)
-                structural_logits = self.halt_phase1_proj(
-                    phase1_features.unsqueeze(0).expand(pooled.shape[0], -1)
-                ).squeeze(-1)
-                halt_logits = halt_logits + structural_logits
-                halt_structural_bias = float(structural_logits.mean().detach().item())
-            block_halt = torch.sigmoid(halt_logits)
+            if self.config.halt_mode == "attnres":
+                # ── AttnRes-native halting ──
+                # Use the per-sample routing weight on the most recent
+                # completed block as the halt signal.  Low weight → recent
+                # block not contributing → halt.  No learned halt head;
+                # the signal comes purely from AttnRes routing.
+                completed_blocks_for_halt, _ = collect_completed_blocks(block_states, position)
+                routers_for_halt = []
+                for layer in current_block.layers:
+                    routers_for_halt.extend([layer.attn_router, layer.mlp_router])
+                if position > 0 and len(completed_blocks_for_halt) > 1:
+                    recent_w = per_sample_recent_weight(routers_for_halt, completed_blocks_for_halt)
+                    halt_logits = (
+                        (self.config.attnres_halt_threshold - recent_w)
+                        / max(self.config.attnres_halt_temperature, 1e-6)
+                    )
+                else:
+                    halt_logits = hidden_states.new_full((batch_size,), -10.0)
+                block_halt = torch.sigmoid(halt_logits)
+            else:
+                # ── Learned halt head (original) ──
+                pooled = self._pool_hidden(self.halt_norm(hidden_states), attention_mask)
+                halt_logits = self.halt_head(pooled).squeeze(-1)
+                if self.config.halt_use_position_bias:
+                    position_bias_value = self.halt_position_bias[position].to(halt_logits.dtype)
+                    halt_logits = halt_logits + position_bias_value
+                    halt_position_bias = float(position_bias_value.detach().item())
+                if halt_phase1_features is not None:
+                    phase1_features = halt_phase1_features.to(device=pooled.device, dtype=pooled.dtype)
+                    structural_logits = self.halt_phase1_proj(
+                        phase1_features.unsqueeze(0).expand(pooled.shape[0], -1)
+                    ).squeeze(-1)
+                    halt_logits = halt_logits + structural_logits
+                    halt_structural_bias = float(structural_logits.mean().detach().item())
+                block_halt = torch.sigmoid(halt_logits)
             hard_block_halt = block_halt * active_mask.to(block_halt.dtype)
             halt_cumulative = torch.clamp(halt_cumulative + hard_block_halt, max=1.0)
             if soft_remaining is not None:
@@ -1015,6 +1071,8 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
                 loop_step_hidden_states.append(hidden_states.detach())
             if halt_logits_tensors is not None:
                 halt_logits_tensors.append(halt_logits)
+            if multi_exit_hidden_states is not None:
+                multi_exit_hidden_states.append(hidden_states)
 
             if return_routing_info:
                 payload = {
@@ -1098,6 +1156,7 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
             routing_entropy_tensor=routing_entropy_tensor,
             loop_step_hidden_states=tuple(loop_step_hidden_states) if loop_step_hidden_states is not None else None,
             halt_logits_tensors=tuple(halt_logits_tensors) if halt_logits_tensors is not None else None,
+            multi_exit_hidden_states=tuple(multi_exit_hidden_states) if multi_exit_hidden_states is not None else None,
         )
 
     @torch.no_grad()
@@ -1297,7 +1356,9 @@ class ReLoopTransformerForCausalLM(ReLoopTransformerPreTrainedModel, FLAGenerati
             if focused_halt_loss_weight_override is None
             else focused_halt_loss_weight_override
         )
+        multi_exit_loss_weight = float(self.config.multi_exit_loss_weight)
         collect_loop_step_states = bool(labels is not None and focused_halt_loss_weight > 0)
+        collect_multi_exit = bool(labels is not None and multi_exit_loss_weight > 0 and self.training)
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1314,6 +1375,7 @@ class ReLoopTransformerForCausalLM(ReLoopTransformerPreTrainedModel, FLAGenerati
             return_routing_info=return_routing_info,
             min_halt_depth=min_halt_depth,
             collect_loop_step_states=collect_loop_step_states,
+            collect_multi_exit_states=collect_multi_exit,
             **kwargs,
         )
 
@@ -1374,6 +1436,33 @@ class ReLoopTransformerForCausalLM(ReLoopTransformerPreTrainedModel, FLAGenerati
                         min_halt_depth=min_halt_depth,
                     )
                     loss = loss + focused_halt_loss_weight * focused_halt_loss_tensor
+
+            # ── Multi-exit loss: LM loss at every intermediate depth ──
+            # Subsample tokens to avoid materializing huge [seq, vocab] logits
+            # (128 tokens → [128, vocab] ≈ 8 MB per exit, vs 4 GB at full seq).
+            # States are non-detached so gradient flows back to blocks,
+            # training them to produce valid intermediate representations.
+            if self.training and multi_exit_loss_weight > 0:
+                me_states = getattr(outputs, "multi_exit_hidden_states", None)
+                if me_states is not None and len(me_states) > 0:
+                    me_num_tokens = 128
+                    valid_positions = labels.ne(criterion.ignore_index).nonzero(as_tuple=False)
+                    if valid_positions.shape[0] > me_num_tokens:
+                        me_idx = torch.randperm(
+                            valid_positions.shape[0], device=labels.device
+                        )[:me_num_tokens]
+                        valid_positions = valid_positions[me_idx]
+                    me_batch_idx = valid_positions[:, 0]
+                    me_seq_idx = valid_positions[:, 1]
+                    me_labels = labels[me_batch_idx, me_seq_idx]
+                    me_loss_sum = hidden_states.new_zeros(())
+                    for step_h in me_states:
+                        sampled_h = step_h[me_batch_idx, me_seq_idx]  # [≤128, hidden]
+                        normed_h = self.model.norm(sampled_h)
+                        step_logits = self.lm_head(normed_h)
+                        step_loss = F.cross_entropy(step_logits, me_labels)
+                        me_loss_sum = me_loss_sum + step_loss
+                    loss = loss + multi_exit_loss_weight * (me_loss_sum / len(me_states))
 
         if not return_dict:
             output = (logits,) + outputs[1:]
