@@ -726,13 +726,8 @@ class ReSkipBlockGroup(nn.Module):
         phase1_outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]] | None = None,
         completed_source_ids: list[int] | None = None,
         cache_layer_offset: int | None = None,
-        dynamic_skip_granularity: str = "block",
-        dynamic_skip_strategy: str | None = None,
-        dynamic_skip_threshold: float | None = None,
-        dynamic_skip_position_thresholds: list[float] | None = None,
-        dynamic_skip_max_skips: int | None = None,
-        dynamic_skips_taken: int = 0,
         collect_dynamic_skip_stats: bool = False,
+        dynamic_skip_strategy: str | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple[
         torch.Tensor,
@@ -741,10 +736,6 @@ class ReSkipBlockGroup(nn.Module):
         list[tuple[list[int], torch.Tensor | None]],
         list[torch.Tensor],
         dict[str, float | None] | None,
-        list[dict[str, Any]],
-        list[dict[str, Any]],
-        int,
-        int,
     ]:
         block_input = block_states[current_block_idx]
         if block_input is None:
@@ -763,14 +754,8 @@ class ReSkipBlockGroup(nn.Module):
         mlp_records: list[tuple[list[int], torch.Tensor | None]] = []
         need_router_entropy = self.training or collect_dynamic_skip_stats
         router_entropies: list[torch.Tensor] = []
-        layer_execution_trace: list[dict[str, Any]] = []
-        mlp_execution_trace: list[dict[str, Any]] = []
-        skip_units_taken = dynamic_skips_taken
-        compute_units_executed = 0
         block_phase1_summary = None
-        if dynamic_skip_granularity == "block" and (
-            collect_dynamic_skip_stats or is_cached_prev_dynamic_strategy(dynamic_skip_strategy)
-        ):
+        if collect_dynamic_skip_stats or is_cached_prev_dynamic_strategy(dynamic_skip_strategy):
             block_phase1_summary = self.summarize_phase1(phase1_outputs, completed_source_ids)
 
         for layer_idx, layer in enumerate(self.layers):
@@ -778,35 +763,7 @@ class ReSkipBlockGroup(nn.Module):
             mlp_phase1 = phase1_outputs[2 * layer_idx + 1]
             attn_source_ids = list(completed_source_ids) if partial_block is None else [*completed_source_ids, current_block_idx]
             cache_layer_idx = None if cache_layer_offset is None else cache_layer_offset + layer_idx
-            global_layer_idx = layer.layer_idx
-            mlp_phase1_stats = None
-            skip_mlp = False
-            mlp_need_position = (
-                dynamic_skip_granularity == "mlp"
-                and dynamic_skip_needs_phase1_position(
-                    strategy=dynamic_skip_strategy,
-                    threshold=dynamic_skip_threshold,
-                    position_thresholds=dynamic_skip_position_thresholds,
-                    position=global_layer_idx,
-                    num_positions=self.layers[0].config.num_hidden_layers,
-                    skipped_so_far=skip_units_taken,
-                    max_skips=dynamic_skip_max_skips,
-                )
-            )
-            if dynamic_skip_granularity == "mlp" and (mlp_need_position or collect_dynamic_skip_stats):
-                mlp_phase1_stats = summarize_phase1_output(mlp_phase1, completed_source_ids)
-            if mlp_need_position:
-                skip_mlp = should_skip_dynamic_position(
-                    strategy=dynamic_skip_strategy,
-                    threshold=dynamic_skip_threshold,
-                    position_thresholds=dynamic_skip_position_thresholds,
-                    phase1_stats=mlp_phase1_stats if mlp_phase1_stats is not None else {},
-                    position=global_layer_idx,
-                    num_positions=self.layers[0].config.num_hidden_layers,
-                    skipped_so_far=skip_units_taken,
-                    max_skips=dynamic_skip_max_skips,
-                )
-            partial_block, next_cache, attn_weights, mlp_weights, attn_entropy, mlp_entropy, mlp_was_skipped = layer(
+            partial_block, next_cache, attn_weights, mlp_weights, attn_entropy, mlp_entropy, _mlp_was_skipped = layer(
                 block_input=block_input,
                 partial_block=partial_block,
                 attn_phase1=attn_phase1,
@@ -816,38 +773,21 @@ class ReSkipBlockGroup(nn.Module):
                 use_cache=use_cache,
                 active_mask=active_mask,
                 return_routing_weights=return_routing_weights,
-                skip_mlp=skip_mlp,
+                skip_mlp=False,
                 cache_layer_idx=cache_layer_idx,
                 **kwargs,
             )
             attn_records.append((attn_source_ids, attn_weights))
             mlp_records.append(([*completed_source_ids, current_block_idx], mlp_weights))
-            compute_units_executed += 1
-            if mlp_was_skipped:
-                skip_units_taken += 1
-            else:
-                compute_units_executed += 1
-            attn_num_sources = len(attn_source_ids)
-            mlp_num_sources = len(completed_source_ids) + 1
             if need_router_entropy:
+                attn_num_sources = len(attn_source_ids)
+                mlp_num_sources = len(completed_source_ids) + 1
                 router_entropies.extend(
                     [
                         normalize_router_entropy(attn_entropy, attn_num_sources).mean(),
                         normalize_router_entropy(mlp_entropy, mlp_num_sources).mean(),
                     ]
                 )
-            if dynamic_skip_granularity == "mlp" and collect_dynamic_skip_stats:
-                payload = {
-                    "position": global_layer_idx,
-                    "block_position": current_block_idx,
-                    "block_idx": self.block_idx,
-                    "local_layer_idx": layer_idx,
-                    "status": "skipped" if mlp_was_skipped else "executed",
-                    "executed_fraction": 0.0 if mlp_was_skipped else 1.0,
-                }
-                if mlp_phase1_stats is not None:
-                    payload.update(mlp_phase1_stats)
-                mlp_execution_trace.append(payload)
 
         return (
             partial_block,
@@ -856,10 +796,6 @@ class ReSkipBlockGroup(nn.Module):
             mlp_records,
             router_entropies,
             block_phase1_summary,
-            layer_execution_trace,
-            mlp_execution_trace,
-            skip_units_taken,
-            compute_units_executed,
         )
 
 
@@ -932,7 +868,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         self._skip_keep_mask = self._normalize_keep_mask(config.skip_keep_mask)
         self._dynamic_skip_position_thresholds = self._normalize_dynamic_skip_position_thresholds(
             config.dynamic_skip_position_thresholds,
-            getattr(config, "dynamic_skip_granularity", "block"),
+            "block",
         )
         self._last_routing_info: dict[str, Any] | None = None
 
@@ -1010,19 +946,17 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
     def _normalize_dynamic_skip_position_thresholds(
         self,
         thresholds: list[float] | torch.Tensor | None,
-        granularity: str | None = None,
+        _granularity: str | None = None,
     ) -> list[float] | None:
         if thresholds is None:
             return None
-        granularity = granularity or getattr(self.config, "dynamic_skip_granularity", "block")
         if isinstance(thresholds, torch.Tensor):
             thresholds = thresholds.tolist()
         thresholds = [float(value) for value in thresholds]
-        expected_positions = self.num_block_positions if granularity == "block" else self.config.num_hidden_layers
-        if len(thresholds) != expected_positions:
+        if len(thresholds) != self.num_block_positions:
             raise ValueError(
-                f"Expected dynamic position thresholds of length {expected_positions} for "
-                f"granularity={granularity}, got {len(thresholds)}."
+                f"Expected dynamic position thresholds of length {self.num_block_positions}, "
+                f"got {len(thresholds)}."
             )
         return thresholds
 
@@ -1030,16 +964,13 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         self,
         *,
         strategy: str,
-        granularity: str | None = None,
         probe_mode: str | None = None,
         threshold: float | None = None,
         position_thresholds: list[float] | torch.Tensor | None = None,
         max_skips: int | None = None,
     ) -> None:
-        granularity = granularity or getattr(self.config, "dynamic_skip_granularity", "block")
-        normalized_thresholds = self._normalize_dynamic_skip_position_thresholds(position_thresholds, granularity)
+        normalized_thresholds = self._normalize_dynamic_skip_position_thresholds(position_thresholds, "block")
         self.config.dynamic_skip_strategy = strategy
-        self.config.dynamic_skip_granularity = granularity
         self.config.dynamic_skip_probe_mode = probe_mode if probe_mode is not None else "all"
         self.config.dynamic_skip_threshold = None if threshold is None else float(threshold)
         self._dynamic_skip_position_thresholds = normalized_thresholds
@@ -1048,7 +979,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
 
     def clear_dynamic_skip_policy(self) -> None:
         self.config.dynamic_skip_strategy = None
-        self.config.dynamic_skip_granularity = "block"
         self.config.dynamic_skip_probe_mode = "all"
         self.config.dynamic_skip_threshold = None
         self._dynamic_skip_position_thresholds = None
@@ -1131,10 +1061,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         self,
         routing_events: list[dict[str, Any]],
         execution_trace: list[dict[str, Any]],
-        mlp_execution_trace: list[dict[str, Any]],
         keep_mask: list[bool] | None,
-        compute_units_executed: float,
-        compute_units_total: float,
     ) -> dict[str, Any]:
         if routing_events:
             importance_matrix, block_importance, self_importance = self._aggregate_routing(routing_events)
@@ -1154,17 +1081,10 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             "self_importance": self_importance,
             "block_schedule": list(self.block_schedule),
             "keep_mask": keep_mask if keep_mask is not None else [True] * self.num_block_positions,
-            "blocks_executed": execution_trace,
             "execution_trace": execution_trace,
-            "mlp_execution_trace": mlp_execution_trace,
             "num_blocks_executed": float(num_blocks_executed),
             "effective_depth": float(num_blocks_executed),
-            "expected_depth": float(num_blocks_executed),
-            "num_mlp_skipped": float(sum(1 for entry in mlp_execution_trace if entry["status"] == "skipped")),
-            "num_mlp_executed": float(sum(1 for entry in mlp_execution_trace if entry["status"] == "executed")),
-            "num_compute_units_executed": float(compute_units_executed),
-            "num_compute_units_total": float(compute_units_total),
-            "compute_ratio": float(compute_units_executed / max(compute_units_total, 1.0)),
+            "compute_ratio": float(num_blocks_executed / max(self.num_block_positions, 1)),
         }
 
     def get_input_embeddings(self):
@@ -1187,7 +1107,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         enable_skipping: bool | None = None,
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
         dynamic_skip_strategy: str | None = None,
-        dynamic_skip_granularity: str | None = None,
         dynamic_skip_probe_mode: str | None = None,
         dynamic_skip_threshold: float | None = None,
         dynamic_skip_position_thresholds: list[float] | torch.Tensor | None = None,
@@ -1204,6 +1123,11 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 "Ignoring legacy ReLoop-only runtime arguments on `reskip_transformer`.",
                 stacklevel=2,
             )
+        # Silently drop legacy granularity/mlp/sample_quantile kwargs from old configs.
+        for _legacy_key in ("dynamic_skip_granularity", "dynamic_skip_mlp_position_thresholds",
+                            "dynamic_skip_max_mlp_skips", "dynamic_skip_sample_quantile"):
+            kwargs.pop(_legacy_key, None)
+
         if output_attentions:
             warnings.warn(
                 "`ReSkipTransformerModel` does not return token attention weights. "
@@ -1217,10 +1141,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         if dynamic_skip_strategy is None:
             dynamic_skip_strategy = getattr(self.config, "dynamic_skip_strategy", None)
-        if dynamic_skip_granularity is None:
-            dynamic_skip_granularity = getattr(self.config, "dynamic_skip_granularity", "block")
-        if dynamic_skip_granularity not in {"block", "mlp"}:
-            raise ValueError("`dynamic_skip_granularity` must be either 'block' or 'mlp'.")
         if dynamic_skip_probe_mode is None:
             dynamic_skip_probe_mode = getattr(self.config, "dynamic_skip_probe_mode", "all")
         if dynamic_skip_threshold is None:
@@ -1248,7 +1168,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
         keep_mask = self._resolve_keep_mask(enable_skipping, skip_keep_mask)
         routing_events: list[dict[str, Any]] = []
         execution_trace: list[dict[str, Any]] = []
-        mlp_execution_trace: list[dict[str, Any]] = []
         routing_entropy_terms: list[torch.Tensor] = []
         prev_block_dynamic_stats: dict[str, float | None] | None = None
 
@@ -1258,11 +1177,9 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
 
         dynamic_skip_position_thresholds = self._normalize_dynamic_skip_position_thresholds(
             dynamic_skip_position_thresholds,
-            dynamic_skip_granularity,
+            "block",
         )
         dynamic_skips_taken = 0
-        compute_units_total = float(self.num_block_positions * self.layers_per_block * 2)
-        compute_units_executed = 0.0
 
         if self.gradient_checkpointing and self.training and use_cache:
             logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
@@ -1279,11 +1196,8 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             completed_source_ids = None
             reusable_phase1 = False
             dynamic_skip_active = False
-            use_prev_block_dynamic = (
-                dynamic_skip_granularity == "block"
-                and is_cached_prev_dynamic_strategy(dynamic_skip_strategy)
-            )
-            if dynamic_skip_granularity == "block" and not use_prev_block_dynamic:
+            use_prev_block_dynamic = is_cached_prev_dynamic_strategy(dynamic_skip_strategy)
+            if not use_prev_block_dynamic:
                 dynamic_skip_active = self._dynamic_skip_needs_phase1(
                     dynamic_skip_strategy,
                     dynamic_skip_threshold,
@@ -1297,7 +1211,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 dynamic_skip_active
                 and not collect_dynamic_skip_stats
                 and not collect_routing_weights
-                and dynamic_skip_granularity == "block"
                 and dynamic_skip_probe_mode != "all"
             )
             if can_use_probe_only_stats:
@@ -1366,9 +1279,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                     }
                     if decision_stats is not None:
                         payload.update(decision_stats)
-                    execution_trace.append(
-                        payload
-                    )
+                    execution_trace.append(payload)
                 continue
 
             (
@@ -1378,10 +1289,6 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 mlp_records,
                 router_entropies,
                 block_phase1_summary,
-                block_layer_trace,
-                block_mlp_trace,
-                dynamic_skips_taken,
-                block_compute_units,
             ) = current_block(
                 block_states=block_states,
                 current_block_idx=position,
@@ -1393,19 +1300,12 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 phase1_outputs=phase1_outputs if reusable_phase1 else None,
                 completed_source_ids=completed_source_ids if reusable_phase1 else None,
                 cache_layer_offset=position * self.layers_per_block,
-                dynamic_skip_granularity=dynamic_skip_granularity,
-                dynamic_skip_strategy=dynamic_skip_strategy,
-                dynamic_skip_threshold=dynamic_skip_threshold,
-                dynamic_skip_position_thresholds=dynamic_skip_position_thresholds,
-                dynamic_skip_max_skips=dynamic_skip_max_skips,
-                dynamic_skips_taken=dynamic_skips_taken,
                 collect_dynamic_skip_stats=collect_dynamic_skip_stats,
+                dynamic_skip_strategy=dynamic_skip_strategy,
                 **kwargs,
             )
             routing_entropy_terms.extend(router_entropies)
-            compute_units_executed += float(block_compute_units)
-            mlp_execution_trace.extend(block_mlp_trace)
-            if dynamic_skip_granularity == "block" and (dynamic_skip_strategy is not None or collect_dynamic_skip_stats):
+            if dynamic_skip_strategy is not None or collect_dynamic_skip_stats:
                 prev_block_dynamic_stats = block_phase1_summary
             if collect_routing_weights:
                 for source_ids, attn_weights in attn_records:
@@ -1425,9 +1325,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
                 }
                 if decision_stats is not None:
                     payload.update(decision_stats)
-                execution_trace.append(
-                    payload
-                )
+                execution_trace.append(payload)
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
@@ -1441,10 +1339,7 @@ class ReSkipTransformerModel(ReSkipTransformerPreTrainedModel):
             routing_info = self._build_routing_info(
                 routing_events=routing_events,
                 execution_trace=execution_trace,
-                mlp_execution_trace=mlp_execution_trace,
                 keep_mask=keep_mask,
-                compute_units_executed=compute_units_executed,
-                compute_units_total=compute_units_total,
             )
             if routing_entropy_tensor is not None:
                 routing_info["routing_entropy"] = float(routing_entropy_tensor.detach().item())
@@ -1565,7 +1460,6 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
         enable_skipping: bool | None = None,
         skip_keep_mask: list[int] | list[bool] | torch.Tensor | None = None,
         dynamic_skip_strategy: str | None = None,
-        dynamic_skip_granularity: str | None = None,
         dynamic_skip_probe_mode: str | None = None,
         dynamic_skip_threshold: float | None = None,
         dynamic_skip_position_thresholds: list[float] | torch.Tensor | None = None,
@@ -1601,7 +1495,6 @@ class ReSkipTransformerForCausalLM(ReSkipTransformerPreTrainedModel, FLAGenerati
             enable_skipping=enable_skipping,
             skip_keep_mask=skip_keep_mask,
             dynamic_skip_strategy=dynamic_skip_strategy,
-            dynamic_skip_granularity=dynamic_skip_granularity,
             dynamic_skip_probe_mode=dynamic_skip_probe_mode,
             dynamic_skip_threshold=dynamic_skip_threshold,
             dynamic_skip_position_thresholds=dynamic_skip_position_thresholds,

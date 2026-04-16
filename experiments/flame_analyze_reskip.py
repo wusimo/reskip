@@ -86,6 +86,7 @@ def build_dynamic_position_modes(
     *,
     num_positions: int,
     block_importance: list[float],
+    block_ablation_ppl: list[float] | None = None,
     mode_spec: str,
 ) -> list[tuple[str, list[int]]]:
     interior = [idx for idx in range(1, max(num_positions - 1, 1))]
@@ -93,6 +94,13 @@ def build_dynamic_position_modes(
         return [("all", interior)]
 
     by_importance = sorted(interior, key=lambda idx: block_importance[idx])
+    # Ablation-informed: sort interior blocks by static-removal PPL impact (lowest = safest to skip).
+    # When ablation data is unavailable, fall back to reverse importance (highest importance = lowest
+    # downstream weight = most likely to be compensated by other blocks).
+    if block_ablation_ppl is not None:
+        by_ablation = sorted(interior, key=lambda idx: block_ablation_ppl[idx] if idx < len(block_ablation_ppl) else float("inf"))
+    else:
+        by_ablation = sorted(interior, key=lambda idx: block_importance[idx], reverse=True)
     tail = interior[len(interior) // 2 :]
     tail_by_importance = sorted(tail, key=lambda idx: block_importance[idx])
     median_importance = None
@@ -105,7 +113,7 @@ def build_dynamic_position_modes(
         if not token:
             continue
         if token == "auto":
-            for expanded in ("recommended", "all", "low1", "low2", "low3", "late2", "late3", "taillow1", "taillow2", "taillow3"):
+            for expanded in ("recommended", "all", "low1", "low2", "low3", "late2", "late3", "taillow1", "taillow2", "taillow3", "ablation1", "ablation2", "ablation3"):
                 raw = expanded
                 token = raw.strip()
                 if token in {name for name, _ in modes}:
@@ -134,6 +142,11 @@ def build_dynamic_position_modes(
                     positions = sorted(tail_by_importance[: max(0, min(count, len(tail_by_importance)))])
                     modes.append((token, positions))
                     continue
+                if token.startswith("ablation"):
+                    count = int(token[8:])
+                    positions = sorted(by_ablation[: max(0, min(count, len(by_ablation)))])
+                    modes.append((token, positions))
+                    continue
             continue
         if token == "all":
             modes.append(("all", interior))
@@ -157,6 +170,11 @@ def build_dynamic_position_modes(
         if token.startswith("taillow"):
             count = int(token[7:])
             positions = sorted(tail_by_importance[: max(0, min(count, len(tail_by_importance)))])
+            modes.append((token, positions))
+            continue
+        if token.startswith("ablation"):
+            count = int(token[8:])
+            positions = sorted(by_ablation[: max(0, min(count, len(by_ablation)))])
             modes.append((token, positions))
             continue
         if token.startswith("custom:"):
@@ -269,9 +287,9 @@ def main() -> None:
     parser.add_argument("--dynamic_skip_strategy", default="")
     parser.add_argument(
         "--dynamic_skip_granularity",
-        choices=("block", "mlp"),
+        choices=("block",),
         default="block",
-        help="Apply dynamic skip at the block level or the per-layer MLP sublayer level.",
+        help="Dynamic skip granularity (block-level only).",
     )
     parser.add_argument(
         "--dynamic_skip_probe_modes",
@@ -279,7 +297,7 @@ def main() -> None:
         help="Comma-separated probe modes for dynamic skip: all, attn_only, first_layer, first_attn",
     )
     parser.add_argument("--dynamic_skip_quantiles", default="0.5,0.6,0.7,0.8,0.9,0.95,0.97,0.99")
-    parser.add_argument("--dynamic_skip_max_skips_options", default="1,2")
+    parser.add_argument("--dynamic_skip_max_skips_options", default="1,2,3")
     parser.add_argument(
         "--dynamic_skip_position_modes",
         default="auto",
@@ -508,21 +526,17 @@ def main() -> None:
 
     dynamic_skip_analysis = None
     if args.dynamic_skip_strategy:
-        dynamic_trace_field = "mlp_execution_trace" if args.dynamic_skip_granularity == "mlp" else "execution_trace"
+        dynamic_trace_field = "execution_trace"
         calibration_batches = (
             args.dynamic_skip_calibration_batches
             if args.dynamic_skip_calibration_batches > 0
             else args.num_batches
         )
-        dynamic_num_positions = (
-            decoder.config.num_hidden_layers if args.dynamic_skip_granularity == "mlp" else decoder.num_block_positions
-        )
+        dynamic_num_positions = decoder.num_block_positions
         disabled_thresholds = [dynamic_disable_threshold(args.dynamic_skip_strategy)] * dynamic_num_positions
         dynamic_probe_modes = [item.strip() for item in args.dynamic_skip_probe_modes.split(",") if item.strip()]
         if args.dynamic_skip_strategy.startswith("prev_"):
             dynamic_probe_modes = ["cached_prev"]
-        if args.dynamic_skip_granularity == "mlp":
-            dynamic_probe_modes = ["all"]
         if not dynamic_probe_modes:
             raise ValueError("`--dynamic_skip_probe_modes` must contain at least one probe mode.")
         calibration_by_probe_mode = {}
@@ -565,13 +579,18 @@ def main() -> None:
         dynamic_max_skips_options = [
             int(item.strip()) for item in args.dynamic_skip_max_skips_options.split(",") if item.strip()
         ]
+        # Use block ablation PPL data (if available) for ablation-informed position modes.
+        ablation_ppl_map = None
+        if block_ablation:
+            ablation_ppl_map = [0.0] * num_positions
+            for entry in block_ablation:
+                ablated = entry.get("ablated_block")
+                if ablated is not None and ablated < num_positions:
+                    ablation_ppl_map[ablated] = entry.get("perplexity", float("inf"))
         position_modes = build_dynamic_position_modes(
             num_positions=num_positions,
-            block_importance=(
-                expand_block_importance_to_layers(reference_calibration.get("block_importance", []), decoder.layers_per_block)
-                if args.dynamic_skip_granularity == "mlp"
-                else reference_calibration.get("block_importance", [])
-            ),
+            block_importance=reference_calibration.get("block_importance", []),
+            block_ablation_ppl=ablation_ppl_map,
             mode_spec=args.dynamic_skip_position_modes,
         )
         dynamic_eval_full = run_eval(

@@ -29,6 +29,13 @@ _LEGACY_RELOOP_KEYS = {
     "ponder_target_steps",
 }
 
+_LEGACY_SKIP_KEYS = {
+    "dynamic_skip_granularity",
+    "dynamic_skip_mlp_position_thresholds",
+    "dynamic_skip_max_mlp_skips",
+    "dynamic_skip_sample_quantile",
+}
+
 
 class ReSkipTransformerConfig(PretrainedConfig):
     model_type = "reskip_transformer"
@@ -67,7 +74,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
         enable_skip_inference: bool = False,
         skip_keep_mask: list[int] | list[bool] | None = None,
         dynamic_skip_strategy: str | None = None,
-        dynamic_skip_granularity: str = "block",
         dynamic_skip_probe_mode: str | None = "all",
         dynamic_skip_threshold: float | None = None,
         dynamic_skip_position_thresholds: list[float] | None = None,
@@ -77,7 +83,7 @@ class ReSkipTransformerConfig(PretrainedConfig):
         legacy_enable_looping = bool(kwargs.pop("enable_looping", False))
         kwargs.pop("num_recurrent_blocks", None)
         for key in list(kwargs):
-            if key in _LEGACY_RELOOP_KEYS:
+            if key in _LEGACY_RELOOP_KEYS or key in _LEGACY_SKIP_KEYS:
                 kwargs.pop(key)
 
         if legacy_enable_looping:
@@ -116,7 +122,6 @@ class ReSkipTransformerConfig(PretrainedConfig):
         self.enable_skip_inference = enable_skip_inference
         self.skip_keep_mask = list(skip_keep_mask) if skip_keep_mask is not None else None
         self.dynamic_skip_strategy = dynamic_skip_strategy
-        self.dynamic_skip_granularity = dynamic_skip_granularity
         self.dynamic_skip_probe_mode = dynamic_skip_probe_mode
         self.dynamic_skip_threshold = dynamic_skip_threshold
         self.dynamic_skip_position_thresholds = (
@@ -144,19 +149,13 @@ class ReSkipTransformerConfig(PretrainedConfig):
                 f"`skip_keep_mask` length ({len(self.skip_keep_mask)}) must match "
                 f"`attn_res_num_blocks` ({attn_res_num_blocks})."
             )
-        if self.dynamic_skip_granularity not in {"block", "mlp"}:
-            raise ValueError("`dynamic_skip_granularity` must be either 'block' or 'mlp'.")
-        expected_dynamic_positions = (
-            attn_res_num_blocks if self.dynamic_skip_granularity == "block" else num_hidden_layers
-        )
         if (
             self.dynamic_skip_position_thresholds is not None
-            and len(self.dynamic_skip_position_thresholds) != expected_dynamic_positions
+            and len(self.dynamic_skip_position_thresholds) != attn_res_num_blocks
         ):
             raise ValueError(
                 f"`dynamic_skip_position_thresholds` length ({len(self.dynamic_skip_position_thresholds)}) must match "
-                f"the expected dynamic skip positions ({expected_dynamic_positions}) for "
-                f"`dynamic_skip_granularity={self.dynamic_skip_granularity}`."
+                f"`attn_res_num_blocks` ({attn_res_num_blocks})."
             )
         if self.dynamic_skip_max_skips is not None and self.dynamic_skip_max_skips < 0:
             raise ValueError("`dynamic_skip_max_skips` must be non-negative.")

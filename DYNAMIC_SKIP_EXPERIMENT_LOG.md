@@ -307,77 +307,130 @@ LAMBADA 单任务结果：
   - 长上下文代理测速约 `1.26x`
   - 但当前 benchmark 已经开始轻微下滑，更适合作为扩展方案或后续继续优化的方向
 
-## 最新可复现实验指令
+## 最新可复现实验指令（2026-04-16 更新）
 
-### 1. 主线分析：`block_attn_only_low1_q09`
+对任意已训练好的 ReSkip 模型，完整流程为：**分析 → 导出 → 评测**。
 
-用于在 `test3` 上重新做最新版动态分析：
+### 前置条件
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
-  /home/user01/Minko/reskip2/reskip/experiments/flame_analyze_reskip.py \
-  --model_path /home/user01/Minko/reskip2/reskip/flame/saves/reskip_transformer-test3 \
-  --dataset /home/user01/Minko/datasets/fineweb_edu_100BT \
+# 激活环境
+source /home/user01/Minko/reskip2/.venv/bin/activate
+cd /home/user01/Minko/reskip2/reskip
+
+# 变量（按实际修改）
+MODEL_PATH=flame/saves/reskip_transformer-340M
+DATASET=/home/user01/Minko/datasets/fineweb_edu_100BT
+GPU=6
+```
+
+### 第 1 步：路由分析 + 阈值校准
+
+自动搜索最佳动态 skip 配置。分析脚本会：
+1. 跑 full-depth 评测，得到 block importance 和 block ablation
+2. 按 probe_mode × position_mode × quantile × max_skips 网格搜索
+3. 输出 `routing_analysis.json`（包含所有候选配置的 PPL 和 skip 率）
+
+```bash
+CUDA_VISIBLE_DEVICES=$GPU python experiments/flame_analyze_reskip.py \
+  --model_path $MODEL_PATH \
+  --dataset $DATASET \
   --dataset_split train \
   --seq_len 8192 \
-  --context_len 2048 \
   --batch_size 1 \
-  --num_workers 2 \
   --num_batches 32 \
   --streaming \
-  --varlen \
   --device cuda \
   --dtype bf16 \
-  --output_dir /home/user01/Minko/reskip2/reskip/outputs/reskip_analysis_test3_v7 \
+  --output_dir outputs/reskip_analysis \
   --dynamic_skip_strategy recent_weight_gt \
-  --dynamic_skip_probe_modes all,attn_only,first_layer,first_attn \
+  --dynamic_skip_probe_modes attn_only,first_attn \
   --dynamic_skip_position_modes auto \
-  --dynamic_skip_quantiles 0.5,0.6,0.7,0.8,0.9,0.95,0.97,0.99 \
-  --dynamic_skip_max_skips_options 1,2 \
+  --dynamic_skip_quantiles 0.8,0.85,0.9,0.93,0.95,0.97 \
+  --dynamic_skip_max_skips_options 1,2,3 \
   --dynamic_skip_latency_num_batches 16 \
-  --dynamic_skip_latency_top_k 16 \
-  --dynamic_skip_speed_ppl_tolerance 0.05
+  --dynamic_skip_latency_top_k 8 \
+  --dynamic_skip_speed_ppl_tolerance 0.05 \
+  --export_best_dynamic_model_dir outputs/reskip_dynamic_best
 ```
 
-当前 paper 主线推荐从分析结果中选用：
-- `probe_mode = attn_only`
-- `position_mode = low1`
-- `quantile = 0.9`
-- `max_skips = 1`
+`--dynamic_skip_position_modes auto` 会自动搜索以下位置集（含 ablation-informed）：
+- `low1`/`low2`/`low3`：AttnRes importance 最低的 1/2/3 个 block
+- `ablation1`/`ablation2`/`ablation3`：static removal PPL impact 最低的 1/2/3 个 block
+- `recommended`/`all`/`late*`/`taillow*`：其他启发式组合
 
-对应导出模型目录：
-- [reskip_test3_block_attnonly_low1_q09](/home/user01/Minko/reskip2/reskip/outputs/reskip_test3_block_attnonly_low1_q09)
-
-### 2. 主线跑分：`block_attn_only_low1_q09`
+分析完成后查看推荐配置：
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
-  /home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py \
-  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_test3_block_attnonly_low1_q09 \
+python -c “
+import json
+with open('outputs/reskip_analysis/routing_analysis.json') as f:
+    d = json.load(f)
+dsa = d['dynamic_skip_analysis']
+for key in ['best_ppl_metrics', 'best_tolerated_metrics', 'best_speed_metrics']:
+    m = dsa.get(key)
+    if m:
+        print(f'{key}: probe={m.get(\”probe_mode\”)} pos={m.get(\”position_mode\”)} '
+              f'q={m.get(\”quantile\”)} max_skips={m.get(\”max_skips\”)} '
+              f'ppl={m.get(\”perplexity\”,0):.4f} blocks={m.get(\”avg_blocks\”,0):.2f}')
+“
+```
+
+### 第 2 步：手动导出指定配置（可选）
+
+如果想导出分析脚本之外的自定义配置（如组合 ablation + importance 位置），使用导出脚本：
+
+```bash
+CUDA_VISIBLE_DEVICES=$GPU python experiments/export_ablation_skip_models.py \
+  --model_path $MODEL_PATH \
+  --dataset $DATASET \
+  --seq_len 8192 \
+  --cal_batches 32
+```
+
+默认导出三个配置：
+- `reskip_340M_ablation1_skip1_q085`：block 3 only, max_skips=1（最安全）
+- `reskip_340M_ablation2_skip2_q085`：blocks {2,3}, max_skips=2（更激进）
+- `reskip_340M_ablation2_skip2_q093`：blocks {2,3}, max_skips=2, 更保守阈值
+
+当前最佳配置 `combined {3,5}/skip2/q085` 的手动导出见本文后续章节。
+
+### 第 3 步：四任务 Benchmark 评测
+
+```bash
+# 评测导出模型（dynamic skip 策略已保存在 config.json 中，自动生效）
+CUDA_VISIBLE_DEVICES=$GPU python experiments/flame_lm_eval.py \
+  --model_path outputs/reskip_dynamic_best \
   --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
   --batch_size auto \
   --device cuda:0 \
-  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_block_attnonly_low1_q09
-```
+  --output_path outputs/lm_eval_reskip_dynamic_best
 
-### 3. 扩展方向：`prev_recent_weight_low1_q095`
-
-这是更 AttnRes 原生的“上一已执行 block 决策下一 block”版本。当前 benchmark 略掉点，但速度更激进。
-
-导出模型目录：
-- [reskip_test3_prev_recent_low1_q095](/home/user01/Minko/reskip2/reskip/outputs/reskip_test3_prev_recent_low1_q095)
-
-跑分命令：
-
-```bash
-CUDA_VISIBLE_DEVICES=6 /home/user01/Minko/reskip2/.venv/bin/python \
-  /home/user01/Minko/reskip2/reskip/experiments/flame_lm_eval.py \
-  --model_path /home/user01/Minko/reskip2/reskip/outputs/reskip_test3_prev_recent_low1_q095 \
+# 对比 full-depth 基线
+CUDA_VISIBLE_DEVICES=$GPU python experiments/flame_lm_eval.py \
+  --model_path $MODEL_PATH \
   --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
   --batch_size auto \
   --device cuda:0 \
-  --output_path /home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_test3_prev_recent_low1_q095
+  --output_path outputs/lm_eval_reskip_full
 ```
+
+### 当前 340M 主线推荐配置
+
+| 参数 | 值 |
+|---|---|
+| strategy | `recent_weight_gt` |
+| probe_mode | `attn_only` |
+| positions | `{3, 5}`（block 3 = ablation 最安全，block 5 = importance 最低） |
+| quantile | `0.85` |
+| max_skips | `2` |
+
+对应已导出模型：[reskip_340M_combined_35_skip2_q085](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_combined_35_skip2_q085)
+
+实测结果：
+- 四任务 benchmark 与 full-depth **完全一致**
+- Wall-clock **~1.19x** 加速
+- 每 batch 平均跳 0.88 个 block
 
 ## 2026-04-14 340M 干净复比：benchmark 不掉且已有真实加速
 
@@ -478,13 +531,13 @@ CUDA_VISIBLE_DEVICES=7 /home/user01/Minko/reskip2/.venv/bin/python \
 
 四任务对比：
 
-| Task | Metric | Full-depth | Dynamic-safe |
+| Task | Metric | Full-depth | Dynamic-safe |base Transformer|
 |---|---:|---:|---:|
-| lambada_openai | acc | 0.4056 | 0.4056 |
-| lambada_openai | ppl | 20.2022 | 20.2022 |
-| hellaswag | acc_norm | 0.4607 | 0.4607 |
-| arc_easy | acc_norm | 0.5438 | 0.5438 |
-| arc_challenge | acc_norm | 0.3012 | 0.3012 |
+| lambada_openai | acc | 0.4056 | 0.4056 |0.3790|
+| lambada_openai | ppl | 20.2022 | 20.2022 |24.7077|
+| hellaswag | acc_norm | 0.4607 | 0.4607 |0.4436|
+| arc_easy | acc_norm | 0.5438 | 0.5438 |0.5502|
+| arc_challenge | acc_norm | 0.3012 | 0.3012 |0.2912|
 
 ### 最新结论
 
@@ -492,6 +545,171 @@ CUDA_VISIBLE_DEVICES=7 /home/user01/Minko/reskip2/.venv/bin/python \
   - benchmark 与 full-depth 一致
   - 同批次真实前向测速约 `1.14x`
 - 因此当前主线判断更新为：
-  - `340M` 上的动态 ReSkip 并不是“只有精度没有速度”
+  - `340M` 上的动态 ReSkip 并不是”只有精度没有速度”
   - 问题的关键点在于推理热路径实现是否足够收敛
   - 在收紧这部分额外开销后，当前 safe 动态 skip 已具备继续写入主实验线的价值
+
+## 2026-04-16 基于 Ablation 的多 Block Skip：突破 max_skips=1 的瓶颈
+
+### 动机
+
+之前所有实验均使用 `max_skips=1`，最多只跳 1 个 block，速度提升上限被粒度硬性限制。此次实验的核心思路是：
+
+1. **用 static block ablation 的 PPL impact 来选择 skip 候选位置**，而非仅依赖 AttnRes importance score
+2. **放开 `max_skips=2`**，允许同时跳过多个 block
+3. 使用 `recent_weight_gt` + `attn_only` probe + 按位置独立校准阈值
+
+### Block Ablation 回顾
+
+从 `reskip_340M_probe_sweep_fast_gpu7` 分析得到的单 block 静态移除 PPL：
+
+| Block | AttnRes Importance | Static Removal PPL | PPL Ratio |
+|---|---:|---:|---:|
+| 0 | 0.286 | 36.91 | 3.60x |
+| 1 | 0.427 | 83.23 | 8.11x |
+| 2 | 0.517 | 13.99 | **1.36x** |
+| **3** | **0.561** | **13.43** | **1.31x (最低)** |
+| 4 | 0.460 | 15.40 | 1.50x |
+| 5 | 0.400 | 19.54 | 1.90x |
+
+关键洞察：Block 3 的 AttnRes importance 最高（0.561），但 static removal PPL impact 最低（1.31x）。这说明 **importance score（”被引用频率”）和实际可替代性是两回事**。Block 3 虽然被下游 block 频繁引用，但它的信息可以被其他 block 的组合补偿。
+
+### 候选位置集设计
+
+| 名称 | 位置 | 选择依据 |
+|---|---|---|
+| `low1` | {5} | 之前最佳，AttnRes importance 第二低 |
+| `ablation1` | {3} | ablation impact 最低 |
+| `ablation2` | {2, 3} | ablation impact 最低的两个 |
+
+### 实验 A：多 Block Skip（max_skips=1,2）
+
+proxy 评测设置：
+- 模型：`flame/saves/reskip_transformer-340M`
+- 数据：`fineweb_edu_100BT` train split, streaming, seed=1
+- `seq_len=8192`, `batch_size=1`, `eval_batches=16`, `cal_batches=32`
+- `strategy=recent_weight_gt`, `probe_mode=attn_only`
+- 校准阈值按位置独立从 calibration set 中取 quantile
+
+proxy PPL ratio 结果（相对 full-depth）：
+
+| 配置 | max_skips | quantile | PPL ratio | Avg Blocks |
+|---|---:|---:|---:|---:|
+| `low1` {5} | 1 | 0.85 | 0.973x | 7.81 |
+| **`ablation1` {3}** | **1** | **0.85** | **0.924x** | **7.75** |
+| `ablation1` {3} | 1 | 0.95 | 0.959x | 7.88 |
+| `ablation2` {2,3} | 1 | 0.85 | 0.996x | 7.62 |
+| **`ablation2` {2,3}** | **2** | **0.85** | **0.996x** | **7.62** |
+| **`ablation2` {2,3}** | **2** | **0.93** | **1.010x** | **7.69** |
+
+注意：`ablation1 {3} q=0.85` 的 proxy PPL 反而比 full-depth **低 7.6%**。这意味着 block 3 在部分输入上不仅冗余，而且可能引入干扰。
+
+### 实验 B/C 总结（负面结果，记录但不推荐）
+
+**实验 B（Hybrid block+MLP skip）**：MLP-level skip 使用 `recent_weight_gt` 信号效果极差，总是增加 overhead 而非减少延迟。`recent_weight_gt` 衡量的是 block 间引用关系，不适合判断单层 MLP 是否可跳。结论：**放弃，MLP skip 需要专用的 routing signal。**
+
+**实验 C（Sample-level quantile 聚合）**：在 `batch_size=1` 下与 mean 聚合完全一致（预期中），需要 `batch_size > 1` 才能体现差异。结论：**中性，待大 batch 场景验证。**
+
+### 四任务 lm-eval Benchmark
+
+导出模型：
+- `ablation1 {3} skip=1 q=0.85`：[reskip_340M_ablation1_skip1_q085](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_ablation1_skip1_q085)
+- `ablation2 {2,3} skip=2 q=0.85`：[reskip_340M_ablation2_skip2_q085](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_ablation2_skip2_q085)
+
+跑分命令：
+
+```bash
+# ablation1
+CUDA_VISIBLE_DEVICES=6 python experiments/flame_lm_eval.py \
+  --model_path outputs/reskip_340M_ablation1_skip1_q085 \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto --device cuda:0 \
+  --output_path outputs/lm_eval_reskip_340M_ablation1_skip1_q085
+
+# ablation2
+CUDA_VISIBLE_DEVICES=7 python experiments/flame_lm_eval.py \
+  --model_path outputs/reskip_340M_ablation2_skip2_q085 \
+  --tasks lambada_openai,hellaswag,arc_easy,arc_challenge \
+  --batch_size auto --device cuda:0 \
+  --output_path outputs/lm_eval_reskip_340M_ablation2_skip2_q085
+```
+
+结果文件：
+- `ablation1`：[results_2026-04-16T08-39-27.197962.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_ablation1_skip1_q085/outputs__reskip_340M_ablation1_skip1_q085/results_2026-04-16T08-39-27.197962.json)
+- `ablation2`：[results_2026-04-16T08-40-03.755112.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_ablation2_skip2_q085/outputs__reskip_340M_ablation2_skip2_q085/results_2026-04-16T08-40-03.755112.json)
+
+四任务对比：
+
+| Task | Metric | Full-depth | prev best (low1/skip1) | ablation1 {3}/skip1 | ablation2 {2,3}/skip2 |
+|---|---:|---:|---:|---:|---:|
+| lambada_openai | acc | 0.4056 | 0.4056 | **0.4056** | 0.4048 |
+| lambada_openai | ppl | 20.2022 | 20.2022 | **20.2022** | 20.6781 |
+| hellaswag | acc_norm | 0.4607 | 0.4607 | **0.4607** | 0.4603 |
+| arc_easy | acc_norm | 0.5438 | 0.5438 | **0.5438** | **0.5438** |
+| arc_challenge | acc_norm | 0.3012 | 0.3012 | **0.3012** | **0.3012** |
+
+### 新最佳配置：combined {3,5}/skip2/q085
+
+通过把 ablation 发现的 block 3 和传统的 block 5 组合，同时放开 max_skips=2：
+
+- **Block 3**：ablation impact 最低，skip 可提升质量
+- **Block 5**：AttnRes importance 最低，skip 触发频率最高
+- **max_skips=2**：两个位置在同一 forward 中同时可跳
+
+导出模型：[reskip_340M_combined_35_skip2_q085](/home/user01/Minko/reskip2/reskip/outputs/reskip_340M_combined_35_skip2_q085)
+
+### 四任务 lm-eval
+
+结果文件：[results_2026-04-16T09-05-32.101070.json](/home/user01/Minko/reskip2/reskip/outputs/lm_eval_reskip_340M_combined_35_skip2_q085/outputs__reskip_340M_combined_35_skip2_q085/results_2026-04-16T09-05-32.101070.json)
+
+| Task | Metric | Full-depth | prev best (low1/skip1) | **combined {3,5}/skip2** |
+|---|---:|---:|---:|---:|
+| lambada_openai | acc | 0.4056 | 0.4056 | **0.4056** |
+| lambada_openai | ppl | 20.2022 | 20.2022 | **20.2022** |
+| hellaswag | acc_norm | 0.4607 | 0.4607 | **0.4607** |
+| arc_easy | acc_norm | 0.5438 | 0.5438 | **0.5438** |
+| arc_challenge | acc_norm | 0.3012 | 0.3012 | **0.3012** |
+
+四任务与 full-depth **完全一致**。
+
+### 同批次 wall-clock 测速
+
+设置：`seq_len=8192`, `num_batches=48`, `warmup=4`, GPU6 串行跑所有配置。
+
+| 配置 | s/batch | tok/s | speedup | avg_skips/batch |
+|---|---:|---:|---:|---:|
+| full-depth | 0.05451 | 150273 | 1.000x | 0.00 |
+| prev_best (low1/skip1/q095) | — | — | ~1.14x (2026-04-14) | ~1.00 |
+| **combined {3,5}/skip2/q085** | **0.04579** | **178900** | **1.190x** | **0.88** |
+| combined {2,3,5}/skip2/q080 | 0.04480 | 182850 | 1.217x | 1.12 |
+
+注意：latency 因 GPU 调度波动会有 ±5% 偏差。以上为同一会话内连续测量值，相对排序可靠。
+
+### 核心发现
+
+1. **Block 3 是隐藏的最佳 skip 目标**：AttnRes importance 最高（0.561）但 static removal impact 最低（1.31x PPL ratio）。"被引用频率高"≠"不可替代"——block 3 的信息可被其他 block 补偿。
+
+2. **组合 {3,5} + max_skips=2 同时提速和保质**：
+   - Block 5 提供高 skip 触发率（低 importance → routing 信号频繁触发）
+   - Block 3 提供安全 skip 空间（低 ablation impact → 跳过不损质量）
+   - 两者互补，达到 0.88 skips/batch，speedup ~1.19x，benchmark 零退化
+
+3. **Ablation-informed 选位 vs AttnRes importance 选位**：两种信号互补而非替代。importance 低的 block（如 5）skip 触发频率高；ablation impact 低的 block（如 3）skip 安全性高。组合使用效果最佳。
+
+### 淘汰方向（代码已清理）
+
+- MLP-level skip：`recent_weight_gt` 信号不适用于 MLP 级别决策
+- Hybrid block+MLP skip：增加 overhead 而非减少
+- Sample-level quantile 聚合：batch_size=1 下无效
+
+### 代码清理
+
+- `configuration_reskip_transformer.py`：移除 `dynamic_skip_granularity`、`mlp_position_thresholds`、`max_mlp_skips`、`sample_quantile`；legacy key 自动忽略
+- `modeling_reskip_transformer.py`：移除 MLP skip 路径、hybrid 模式、sample_quantile 管道；BlockGroup.forward() 返回值从 10-tuple 简化为 6-tuple
+- `flame_analyze_reskip.py`：新增 `ablation1`/`ablation2`/`ablation3` 位置模式（基于 block ablation PPL 排序），默认 `max_skips_options=1,2,3`
+
+### 下一步
+
+- 考虑更细粒度 block 划分（12 blocks × 2 layers），进一步释放 skip 空间
+- 将 ablation-informed 选位写入 paper 的 method section
+- 在 1.3B 模型上验证组合选位策略的可迁移性
