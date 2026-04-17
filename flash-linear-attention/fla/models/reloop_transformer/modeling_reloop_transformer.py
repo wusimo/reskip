@@ -54,7 +54,13 @@ def blend_states(
 ) -> torch.Tensor:
     if active_mask is None:
         return new_states
-    mask = active_mask[:, None, None].to(dtype=new_states.dtype)
+    # active_mask can be either per-sequence [batch] or per-token [batch, seq]
+    if active_mask.dim() == 1:
+        mask = active_mask[:, None, None].to(dtype=new_states.dtype)
+    elif active_mask.dim() == 2:
+        mask = active_mask.unsqueeze(-1).to(dtype=new_states.dtype)
+    else:
+        raise ValueError(f"active_mask has unexpected ndim={active_mask.dim()}")
     return new_states * mask + old_states * (1.0 - mask)
 
 
@@ -206,23 +212,32 @@ def normalize_router_entropy(entropy: torch.Tensor, num_sources: int) -> torch.T
 def per_sample_recent_weight(
     routers: list["BlockAttentionResidual"],
     completed_blocks: list[torch.Tensor],
+    per_token: bool = False,
+    detach: bool = True,
 ) -> torch.Tensor:
-    """Per-sample routing weight on the most recent completed block.
+    """Routing weight on the most recent completed block, averaged over routers.
 
-    Returns a [batch] tensor measuring how strongly the block group's
-    routers attend to the latest source.  Low value → the recent block
-    is not contributing much → good candidate for halting.
+    Returns [batch] (per-sequence, averaged over seq) or [batch, seq] (per-token).
+    Low value → the recent block is not contributing much → good candidate for halting.
+    Pass detach=False to get a differentiable version for ponder cost computation.
     """
     if len(completed_blocks) <= 1:
-        return completed_blocks[0].new_zeros(completed_blocks[0].shape[0])
+        base = completed_blocks[0]
+        if per_token:
+            return base.new_zeros(base.shape[0], base.shape[1])
+        return base.new_zeros(base.shape[0])
     values = torch.stack(completed_blocks, dim=0)  # [sources, batch, seq, hidden]
     base_keys = _rms_norm_base(values, routers[0].key_norm.eps)
     queries = torch.stack([_router_effective_query(r) for r in routers], dim=0)
     scale = math.sqrt(values.shape[-1]) * routers[0].temperature
     scores = torch.einsum("qd,nbtd->qnbt", queries, base_keys) / scale
     probs = torch.softmax(scores, dim=1)  # [routers, sources, batch, seq]
-    # weight on last source, averaged over routers and sequence positions
-    return probs[:, -1, :, :].mean(dim=(0, 2)).detach()  # [batch]
+    recent_probs = probs[:, -1, :, :]  # [routers, batch, seq]
+    if per_token:
+        result = recent_probs.mean(dim=0)  # [batch, seq]
+    else:
+        result = recent_probs.mean(dim=(0, 2))  # [batch]
+    return result.detach() if detach else result
 
 
 def collect_completed_blocks(
@@ -273,6 +288,7 @@ class ReLoopBaseModelOutputWithPast(BaseModelOutputWithPast):
     loop_step_hidden_states: tuple[torch.Tensor, ...] | None = None
     halt_logits_tensors: tuple[torch.Tensor, ...] | None = None
     multi_exit_hidden_states: tuple[torch.Tensor, ...] | None = None
+    ponder_expected_depth_tensor: torch.Tensor | None = None
 
 
 @dataclass
@@ -867,11 +883,31 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
         hidden_states = inputs_embeds
 
         batch_size = hidden_states.shape[0]
+        seq_len = hidden_states.shape[1]
+        per_token_halt = bool(self.config.attnres_halt_per_token and self.config.halt_mode == "attnres")
         if use_cache and batch_size > 1:
             raise ValueError("Looping KV cache currently supports batch size 1 only.")
-        halt_cumulative = hidden_states.new_zeros(batch_size)
+        if per_token_halt:
+            halt_cumulative = hidden_states.new_zeros(batch_size, seq_len)
+        else:
+            halt_cumulative = hidden_states.new_zeros(batch_size)
         soft_threshold = float(self.config.halt_threshold)
-        soft_remaining = hidden_states.new_full((batch_size,), soft_threshold) if self.training else None
+        # When training_full_depth is on, all blocks always execute so the
+        # soft-halting machinery (which produces gradients through halted
+        # blocks for ACT-style training) is not needed and can cause shape
+        # conflicts with per-token halt.
+        _use_soft_remaining = (
+            self.training and not getattr(self.config, "training_full_depth", False)
+        )
+        soft_remaining = (
+            hidden_states.new_full((batch_size,), soft_threshold) if _use_soft_remaining else None
+        )
+        # Accumulate per-token survival probability for ponder cost computation
+        ponder_cost_weight_cfg = float(getattr(self.config, "ponder_cost_weight", 0.0))
+        need_ponder_cost_tracking = bool(ponder_cost_weight_cfg > 0 and self.training and per_token_halt)
+        ponder_expected_depth_per_token = (
+            hidden_states.new_zeros(batch_size, seq_len) if need_ponder_cost_tracking else None
+        )
         halt_probabilities: list[float] | None = [] if return_routing_info and not self.training else None
         ponder_cost = hidden_states.new_zeros(())
         expected_depth = hidden_states.new_zeros(())
@@ -905,8 +941,14 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
                 executed_fraction = float(active_mask.float().mean().item())
                 if self.training:
                     if soft_remaining is None:
-                        raise RuntimeError("Expected soft halting state during training.")
-                    if soft_halt_allowed:
+                        # training_full_depth mode: soft halting is disabled.
+                        # Use constant expected_fraction = 1 (all blocks always
+                        # execute); the halt behavior at inference is driven by
+                        # AttnRes routing independently.
+                        active_gate = active_mask.to(hidden_states.dtype)
+                        soft_fraction_value = hidden_states.new_ones(())
+                        expected_fraction = soft_fraction_value
+                    elif soft_halt_allowed:
                         active_soft = (soft_remaining / max(soft_threshold, 1e-6)).clamp_(0.0, 1.0)
                         active_gate = active_soft + (active_mask.to(hidden_states.dtype) - active_soft).detach()
                         soft_fraction_value = active_soft.mean()
@@ -929,13 +971,15 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
                 expected_fraction = soft_fraction_value
             # During training with training_full_depth, force all blocks to
             # execute so every block receives gradient through the final LM
-            # loss.  The halt head still learns via ponder_cost (whose gradient
-            # flows through the soft path computed above) and focused_halt_loss.
-            # At inference, actual gating is applied as usual.
+            # loss.  Halt probabilities are still computed (used for ponder
+            # cost and inference-time actual halting).
             if self.training and self.config.training_full_depth:
                 active_mask = torch.ones_like(halt_cumulative, dtype=torch.bool)
                 executed_fraction = 1.0
-                active_gate = hidden_states.new_ones(batch_size)
+                if per_token_halt:
+                    active_gate = hidden_states.new_ones(batch_size, seq_len)
+                else:
+                    active_gate = hidden_states.new_ones(batch_size)
 
             if not torch.any(active_mask) and not self.training:
                 if return_routing_info:
@@ -1016,13 +1060,54 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
                 for layer in current_block.layers:
                     routers_for_halt.extend([layer.attn_router, layer.mlp_router])
                 if position > 0 and len(completed_blocks_for_halt) > 1:
-                    recent_w = per_sample_recent_weight(routers_for_halt, completed_blocks_for_halt)
+                    recent_w = per_sample_recent_weight(
+                        routers_for_halt, completed_blocks_for_halt, per_token=per_token_halt,
+                    )
                     halt_logits = (
                         (self.config.attnres_halt_threshold - recent_w)
                         / max(self.config.attnres_halt_temperature, 1e-6)
                     )
+                    # For ponder cost, compute a differentiable halt_prob that
+                    # lets gradient flow back to the routing pseudo-queries.
+                    # Subsample tokens to avoid ~1 GB/position of fp32 copies
+                    # of the full [num_sources, batch, seq, hidden] values.
+                    if need_ponder_cost_tracking:
+                        ponder_n_tokens = 256
+                        if seq_len > ponder_n_tokens:
+                            sample_idx = torch.randperm(
+                                seq_len, device=hidden_states.device,
+                            )[:ponder_n_tokens]
+                            sliced_blocks = [b[:, sample_idx, :] for b in completed_blocks_for_halt]
+                        else:
+                            sample_idx = None
+                            sliced_blocks = completed_blocks_for_halt
+                        recent_w_grad = per_sample_recent_weight(
+                            routers_for_halt, sliced_blocks,
+                            per_token=True, detach=False,
+                        )
+                        halt_logits_grad = (
+                            (self.config.attnres_halt_threshold - recent_w_grad)
+                            / max(self.config.attnres_halt_temperature, 1e-6)
+                        )
+                        halt_prob_grad = torch.sigmoid(halt_logits_grad).to(
+                            ponder_expected_depth_per_token.dtype
+                        )
+                        # Expected survival past this position; accumulate on
+                        # subsampled tokens only (final loss is mean).
+                        if sample_idx is None:
+                            ponder_expected_depth_per_token = (
+                                ponder_expected_depth_per_token + (1.0 - halt_prob_grad)
+                            )
+                        else:
+                            ponder_expected_depth_per_token = ponder_expected_depth_per_token.clone()
+                            ponder_expected_depth_per_token[:, sample_idx] = (
+                                ponder_expected_depth_per_token[:, sample_idx] + (1.0 - halt_prob_grad)
+                            )
                 else:
-                    halt_logits = hidden_states.new_full((batch_size,), -10.0)
+                    if per_token_halt:
+                        halt_logits = hidden_states.new_full((batch_size, seq_len), -10.0)
+                    else:
+                        halt_logits = hidden_states.new_full((batch_size,), -10.0)
                 block_halt = torch.sigmoid(halt_logits)
             else:
                 # ── Learned halt head (original) ──
@@ -1157,6 +1242,9 @@ class ReLoopTransformerModel(ReLoopTransformerPreTrainedModel):
             loop_step_hidden_states=tuple(loop_step_hidden_states) if loop_step_hidden_states is not None else None,
             halt_logits_tensors=tuple(halt_logits_tensors) if halt_logits_tensors is not None else None,
             multi_exit_hidden_states=tuple(multi_exit_hidden_states) if multi_exit_hidden_states is not None else None,
+            ponder_expected_depth_tensor=(
+                ponder_expected_depth_per_token.mean() if ponder_expected_depth_per_token is not None else None
+            ),
         )
 
     @torch.no_grad()
@@ -1357,8 +1445,13 @@ class ReLoopTransformerForCausalLM(ReLoopTransformerPreTrainedModel, FLAGenerati
             else focused_halt_loss_weight_override
         )
         multi_exit_loss_weight = float(self.config.multi_exit_loss_weight)
+        stochastic_exit_loss = bool(self.config.stochastic_exit_loss)
         collect_loop_step_states = bool(labels is not None and focused_halt_loss_weight > 0)
-        collect_multi_exit = bool(labels is not None and multi_exit_loss_weight > 0 and self.training)
+        collect_multi_exit = bool(
+            labels is not None
+            and self.training
+            and (multi_exit_loss_weight > 0 or stochastic_exit_loss)
+        )
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1437,11 +1530,7 @@ class ReLoopTransformerForCausalLM(ReLoopTransformerPreTrainedModel, FLAGenerati
                     )
                     loss = loss + focused_halt_loss_weight * focused_halt_loss_tensor
 
-            # ── Multi-exit loss: LM loss at every intermediate depth ──
-            # Subsample tokens to avoid materializing huge [seq, vocab] logits
-            # (128 tokens → [128, vocab] ≈ 8 MB per exit, vs 4 GB at full seq).
-            # States are non-detached so gradient flows back to blocks,
-            # training them to produce valid intermediate representations.
+            # ── Multi-exit loss (legacy, kept for backward compat) ──
             if self.training and multi_exit_loss_weight > 0:
                 me_states = getattr(outputs, "multi_exit_hidden_states", None)
                 if me_states is not None and len(me_states) > 0:
@@ -1457,12 +1546,66 @@ class ReLoopTransformerForCausalLM(ReLoopTransformerPreTrainedModel, FLAGenerati
                     me_labels = labels[me_batch_idx, me_seq_idx]
                     me_loss_sum = hidden_states.new_zeros(())
                     for step_h in me_states:
-                        sampled_h = step_h[me_batch_idx, me_seq_idx]  # [≤128, hidden]
+                        sampled_h = step_h[me_batch_idx, me_seq_idx]
                         normed_h = self.model.norm(sampled_h)
                         step_logits = self.lm_head(normed_h)
                         step_loss = F.cross_entropy(step_logits, me_labels)
                         me_loss_sum = me_loss_sum + step_loss
                     loss = loss + multi_exit_loss_weight * (me_loss_sum / len(me_states))
+
+            # ── Stochastic exit loss ──
+            # Replace multi-exit's "please all depths equally" with a single
+            # randomly-sampled exit per step.  With probability
+            # `stochastic_exit_full_depth_prob` the sampled exit is the full
+            # depth (main LM loss unchanged).  Otherwise, we sample an
+            # intermediate depth and add a subsampled LM loss there.
+            # This avoids the multi-exit anti-incentive that makes every
+            # depth produce identical output.
+            if self.training and bool(self.config.stochastic_exit_loss):
+                me_states = getattr(outputs, "multi_exit_hidden_states", None)
+                if me_states is not None and len(me_states) > 1:
+                    full_depth_prob = float(self.config.stochastic_exit_full_depth_prob)
+                    n_max = len(me_states)
+                    n_min = max(1, int(self.config.stochastic_exit_min_depth))
+                    # Sample exit index: full depth with probability
+                    # `full_depth_prob`, else uniform over [n_min, n_max-1].
+                    if torch.rand(1).item() < full_depth_prob or n_max <= n_min:
+                        exit_idx = n_max - 1  # full depth, already in main loss
+                        # Nothing extra to add — main `loss` is the full-depth LM loss
+                    else:
+                        exit_idx = int(torch.randint(n_min - 1, n_max - 1, (1,)).item())
+                        # Subsample tokens for cheap intermediate loss
+                        se_num_tokens = 128
+                        valid_positions = labels.ne(criterion.ignore_index).nonzero(as_tuple=False)
+                        if valid_positions.shape[0] > se_num_tokens:
+                            se_idx = torch.randperm(
+                                valid_positions.shape[0], device=labels.device
+                            )[:se_num_tokens]
+                            valid_positions = valid_positions[se_idx]
+                        se_batch_idx = valid_positions[:, 0]
+                        se_seq_idx = valid_positions[:, 1]
+                        se_labels = labels[se_batch_idx, se_seq_idx]
+                        step_h = me_states[exit_idx]
+                        sampled_h = step_h[se_batch_idx, se_seq_idx]
+                        normed_h = self.model.norm(sampled_h)
+                        step_logits = self.lm_head(normed_h)
+                        se_loss = F.cross_entropy(step_logits, se_labels)
+                        # Weight proportional to prob of sampling this exit so
+                        # expectation matches a uniform multi-exit loss
+                        stochastic_weight = (1.0 - full_depth_prob)
+                        loss = loss + stochastic_weight * se_loss
+
+            # ── Soft ponder cost ──
+            # λ · E[depth].  E[depth] is the differentiable expected depth
+            # computed from per-token AttnRes halt probabilities; gradient
+            # flows back to the routing pseudo-queries, giving them
+            # incentive to halt earlier on samples that don't need the
+            # full depth.  Requires `attnres_halt_per_token=True`.
+            ponder_cost_weight = float(self.config.ponder_cost_weight)
+            if self.training and ponder_cost_weight > 0:
+                ped = getattr(outputs, "ponder_expected_depth_tensor", None)
+                if ped is not None:
+                    loss = loss + ponder_cost_weight * ped
 
         if not return_dict:
             output = (logits,) + outputs[1:]

@@ -62,6 +62,11 @@ class ReLoopTransformerConfig(PretrainedConfig):
         focused_halt_target_temperature: float = 0.1,
         focused_halt_num_tokens: int = 128,
         multi_exit_loss_weight: float = 0.0,
+        stochastic_exit_loss: bool = False,
+        stochastic_exit_full_depth_prob: float = 0.5,
+        stochastic_exit_min_depth: int = 2,
+        attnres_halt_per_token: bool = False,
+        ponder_cost_weight: float = 0.0,
         ponder_loss_weight: float = 0.0,
         ponder_loss_warmup_steps: int = 0,
         ponder_budget_start_step: int = 0,
@@ -120,6 +125,11 @@ class ReLoopTransformerConfig(PretrainedConfig):
         self.focused_halt_target_temperature = focused_halt_target_temperature
         self.focused_halt_num_tokens = focused_halt_num_tokens
         self.multi_exit_loss_weight = multi_exit_loss_weight
+        self.stochastic_exit_loss = stochastic_exit_loss
+        self.stochastic_exit_full_depth_prob = stochastic_exit_full_depth_prob
+        self.stochastic_exit_min_depth = stochastic_exit_min_depth
+        self.attnres_halt_per_token = attnres_halt_per_token
+        self.ponder_cost_weight = ponder_cost_weight
         self.ponder_loss_weight = ponder_loss_weight
         self.ponder_loss_warmup_steps = ponder_loss_warmup_steps
         self.ponder_budget_start_step = ponder_budget_start_step
