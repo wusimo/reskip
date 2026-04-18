@@ -142,6 +142,8 @@ def main():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--save-model", action="store_true",
+                   help="save recovered base weights at end")
     args = p.parse_args()
 
     skip_layers = set(int(x) for x in args.skip_layers.split(","))
@@ -178,6 +180,16 @@ def main():
         f.write(f"Init PPL (after pruning): {init_ppl:.3f}\n")
         f.write(f"Final PPL (after recovery): {final_ppl:.3f}\n")
         f.write(f"Pruned {len(skip_layers)}/{pruned.config.text_config.num_hidden_layers}\n")
+
+    # Save recovered base weights + skip_layers list for later inference
+    if args.save_model and args.recover_tokens > 0:
+        state = {
+            "skip_layers": sorted(skip_layers),
+            "base_state_dict": pruned.base.state_dict(),
+        }
+        save_path = Path(args.output_dir) / "recovered_state.pt"
+        torch.save(state, save_path)
+        print(f"[prune] Saved recovered model to {save_path}")
 
 
 if __name__ == "__main__":
