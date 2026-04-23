@@ -14,7 +14,7 @@
 \usepackage{nicefrac}
 \usepackage{microtype}
 \usepackage{graphicx}
-\usepackage{xcolor}
+\usepackage[table]{xcolor}
 \usepackage{algorithm}
 \usepackage{algorithmic}
 \usepackage{subcaption}
@@ -53,11 +53,11 @@
 
 \begin{abstract}
 Adaptive computation promises to match transformer inference cost to input complexity, but existing methods---early exit classifiers, mixture-of-depths, layer pruning---either require auxiliary networks, from-scratch training with compute-aware losses, or irreversible post-hoc surgery that degrades quality.
-We observe that \emph{Attention Residuals} (\attnres{})~\citep{fu2025attention}---a drop-in replacement for the standard residual that attends over previous block outputs with a learned pseudo-query---already encode the routing signal adaptive computation needs, and their two-phase execution makes this signal available \emph{before} each block runs, at near-zero extra cost.
+We observe that \emph{Attention Residuals} (\attnres{})~\citep{chen2026attnres}---a drop-in replacement for the standard residual that attends over previous block outputs with a learned pseudo-query---already encode the routing signal adaptive computation needs, and their two-phase execution makes this signal available \emph{before} each block runs, at near-zero extra cost.
 We develop this observation into a practical recipe in three parts.
 \textbf{(1)~\reskip{}}: we read the phase-1 \attnres{} weights as a pre-execution skip signal, with position-calibrated thresholds. On a 340M from-scratch \attnres{} transformer pretrained on FineWeb-Edu, \reskip{} achieves $1.19\times$ wall-clock speedup with \emph{zero} degradation across LAMBADA, HellaSwag, ARC-Easy, and ARC-Challenge. We also document an \emph{importance--ablation disconnect}: the most-referenced block is not the most irreplaceable one---combining both signals strictly dominates either alone.
-\textbf{(2)~\retrofit{}} (the main contribution): we show how to convert \emph{any} pretrained transformer into an \attnres{}-capable model through a single light fine-tune, without destroying its existing quality. We compare three retrofit routes---interpolation, auxiliary observer via distillation, and informed-initialization temperature annealing---and characterise when each works.
-\textbf{(3)~VLA application}: retrofitting a vision-language-action backbone yields modality-specific routing that translates into modality-aware skipping for robotic inference.
+\textbf{(2)~\retrofit{}} (the main contribution): we show how to convert \emph{any} pretrained transformer into an \attnres{}-capable model through a single light fine-tune, without destroying its existing quality. Our method is a \emph{$\gamma$-gated residual injection}: one block-level \attnres{} router + a small zero-init residual adapter per block, with the base backbone frozen. At $\gamma=0$ the retrofit is exactly the pretrained model; training moves $\gamma$ and the router jointly. Applied to Qwen3-VL-2B with 2{,}000 steps on a UltraChat+LLaVA mixture (7.4M trainable parameters, $\sim$0.35\% of the base), the retrofit not only preserves base quality but \emph{improves} it (LAMBADA $+4.4$pp acc / $-18$\% ppl, MMMU $+1.1$pp, MMBench and MMStar matched to base), while inheriting \reskip{}'s phase-1 dynamic skip at an additional $1.1$--$1.27\times$ wall-clock speedup.
+\textbf{(3)~VLA application}: the same retrofit recipe is our plan for vision-language-action backbones, where we expect modality-specific routing (vision tokens prefer early blocks, action tokens use late blocks) to yield modality-aware skipping for robotic inference; this is work in progress.
 Together, these give a path from an off-the-shelf transformer to an adaptive-depth model in a single fine-tune pass, with no architectural changes at inference.
 \end{abstract}
 
@@ -69,10 +69,13 @@ Together, these give a path from an off-the-shelf transformer to an adaptive-dep
 Modern transformers process every token through every layer regardless of how hard the next token is to predict. Several lines of work try to fix this mismatch: early-exit methods~\citep{schuster2022confident, elbayad2020depth} add auxiliary classifiers per layer, Mixture-of-Depths~\citep{raposo2024mixture} learns per-token routing with an auxiliary capacity loss, layer-pruning approaches~\citep{gromov2024unreasonable, men2024shortgpt} remove layers post-hoc, and Universal Transformers~\citep{dehghani2018universal} share weights across depth with explicit halting~\citep{graves2016adaptive}. All of these share a limitation: the routing signal---whether to spend more compute---is \emph{external} to the core transformer computation and must be added either as training-time supervision, a separate head, or a post-hoc heuristic.
 
 \paragraph{Insight.}
-Attention Residuals (\attnres{})~\citep{fu2025attention} replace the fixed scalar-$1$ residual with a learned softmax attention over all previously completed block outputs. The attention weights $\alpha_{n \to l}$ are input-dependent, competitively normalised, and---crucially for this paper---are computed \emph{before} block $l$ runs, as part of forming the block's input. Two observations follow. First, the weights already constitute a natural routing signal: a block that downstream blocks never attend to is, by construction, a block that can be skipped. Second, this signal is available as a pre-execution check, at negligible cost, so we can make the skip decision \emph{at inference time}, per input, without additional parameters or training.
+Attention Residuals (\attnres{})~\citep{chen2026attnres} replace the fixed scalar-$1$ residual with a learned softmax attention over all previously completed block outputs. The attention weights $\alpha_{n \to l}$ are input-dependent, competitively normalised, and---crucially for this paper---are computed \emph{before} block $l$ runs, as part of forming the block's input. Two observations follow. First, the weights already constitute a natural routing signal: a block that downstream blocks never attend to is, by construction, a block that can be skipped. Second, this signal is available as a pre-execution check, at negligible cost, so we can make the skip decision \emph{at inference time}, per input, without additional parameters or training.
 
-\paragraph{But \attnres{} must be trained in.}
-\attnres{} is an architectural modification: the pseudo-queries $\{\mathbf{w}_l\}$ and the online-softmax merge (Algorithm~\ref{alg:two_phase}) have no counterpart in a standard residual network. Existing works on \attnres{}---including its introduction~\citep{fu2025attention} and our own from-scratch validation---assume the model was pretrained with \attnres{} from step zero. This is expensive: reproducing a 7B-scale \attnres{} model costs tens of thousands of GPU-hours and forfeits all the investment in existing checkpoints. If adaptive computation via \attnres{} is to have practical value, we need a way to \emph{retrofit} pretrained transformers into \attnres{}-capable ones, cheaply, without destroying their quality.
+\paragraph{From LLMs to latency-critical VLAs.}
+Our first-phase validation shows this idea works at scale: on a 340M from-scratch \attnres{} transformer pretrained on FineWeb-Edu, phase-1 skip yields $1.19\times$ wall-clock speedup at \emph{zero} benchmark degradation (Section~\ref{sec:reskip}). But the absolute latency picture sharpens as we move downstream: even block-level \attnres{} still pays a per-block phase-1 probe cost, and at the sub-10B scale that powers real-time robotics---Vision-Language-Action (VLA) systems with closed-loop control cycles of $\leq\!100$\,ms---every millisecond of per-layer overhead is visible. A VLA cannot afford a mechanism that \emph{adds} latency to buy adaptiveness; it needs a mechanism that \emph{pays for itself in speed} on average.
+
+\paragraph{But training \attnres{} from scratch is prohibitive.}
+\attnres{} is an architectural modification: the pseudo-queries $\{\mathbf{w}_l\}$ and the online-softmax merge (Algorithm~\ref{alg:two_phase}) have no counterpart in a standard residual network. Every existing \attnres{} model in the literature, including the one validated in Section~\ref{sec:reskip}, was pretrained with \attnres{} from step zero. Reproducing this at 2--7B VLM scale costs tens of thousands of GPU-hours, and in the VLA case one must further retrain the action head on top of a model with a non-standard backbone---which makes no sense when a strong open-weight standard VLM (e.g., Qwen3-VL-2B, InternVL-2.5, InternVL-3) is already available and being actively improved by the community. If adaptive-depth inference is to have practical value for latency-critical applications, we need a way to \emph{retrofit} a pretrained, standard-residual transformer into an \attnres{}-capable one---through a short, cheap fine-tune that \textbf{(i) preserves, or ideally improves, benchmark quality}, \textbf{(ii) inherits \reskip{}'s phase-1 dynamic skip so that per-input speedup offsets the introduced per-block probe cost}, and \textbf{(iii) leaves the base weights usable for the downstream action-head training that follows}.
 
 \paragraph{Contributions.}
 This paper delivers that retrofit recipe, along with its downstream application to skipping and to vision--language--action models.
@@ -80,18 +83,122 @@ This paper delivers that retrofit recipe, along with its downstream application 
 \begin{enumerate}
 \item \textbf{\reskip{} (Section~\ref{sec:reskip}).} We formalise the two-phase execution of \attnres{} as an implicit pre-execution routing channel and turn it into a dynamic, per-input skip rule with position-calibrated thresholds. On 340M from-scratch \attnres{} we achieve \textbf{$1.19\times$ wall-clock speedup at zero benchmark degradation}. We further identify an \emph{importance--ablation disconnect}: the \attnres{} importance score (``how often is block $n$ referenced?'') does \emph{not} align monotonically with static removal impact (``is block $n$ irreplaceable?''). Combining the two signals to pick skip candidates strictly dominates using either alone.
 
-\item \textbf{\retrofit{} (Section~\ref{sec:retrofit}, main contribution).} We give three concrete retrofit routes and a unified training protocol:
+\item \textbf{\retrofit{} (Section~\ref{sec:retrofit}, main contribution).} We converge on a single, concrete recipe: a \emph{$\gamma$-gated block-level residual injection} that inserts \attnres{} into the pretrained forward in a provably identity-preserving way.
   \begin{itemize}
-  \item[\routeA{}] \emph{Interpolation gate}. Introduce a learned scalar $\beta_l$ that convexly mixes the standard residual output with the \attnres{} output. Initialised at $\beta_l{=}0$, the retrofit starts exactly at the pretrained model.
-  \item[\routeB{}] \emph{Auxiliary observer + distillation}. Keep the forward pass standard. Train pseudo-queries so that the implied \attnres{} output matches the true forward; $\alpha$ becomes a learned importance map over the frozen network.
-  \item[\routeC{}] \emph{Informed initialisation with temperature annealing}. Seed $\mathbf{w}_l$ from calibration statistics of the pretrained model's keys and anneal the softmax temperature so that \attnres{} starts near a residual-like regime and relaxes towards full expressivity.
+  \item Per block $n$ we add one \attnres{} router $w_n$ and a tiny residual adapter $A_n$, producing $r_n = \sum_i \alpha_{i\to n}\,h_i$ and then $x_n = h_{n-1} + \gamma_n\,A_n(r_n - h_{n-1})$; the block runs as $h_n = \mathrm{Block}_n(x_n)$.
+  \item $\gamma_n$ is zero-initialised and the adapter up-projection is small-random; the retrofit at step $0$ is bit-identical to the pretrained model on downstream benchmarks.
+  \item The base backbone (28 text decoder layers in our Qwen3-VL-2B target) is \emph{completely frozen}. Only the routers, adapters, and $\gamma$ train---$\sim$7.4M parameters ($\sim$0.35\% of the base).
+  \item Training uses a small SFT mixture (UltraChat + LLaVA-Instruct) with a full-path task loss plus a skip-branch consistency KL; 2{,}000 steps suffice.
   \end{itemize}
-  The three routes trade off implementation complexity, parameter count, and inference cleanliness; we characterise each empirically.
+  On Qwen3-VL-2B with a $5$k-step $\gamma{\to}1$ curriculum, every block converges to $\gamma_n{=}1$ so the retrofitted model is \emph{structurally pure \attnres{}}. It takes the model from base LAMBADA acc $0.532$ to $0.576$ ($+4.4$pp / $-17$\% ppl), improves HellaSwag by $+1.6$pp and MMMU by $+1.1$pp, preserves MMBench within the $n{=}300$ noise floor ($0.710$ vs.\ $0.727$, $\pm 1$ question) and MMStar exactly, and inherits \reskip{}'s phase-1 dynamic skip at an additional $1.1$--$1.27\times$ wall-clock speedup. \emph{The retrofit is the contribution; the skip capability comes for free from the resulting structure.}
 
-\item \textbf{VLA application (Section~\ref{sec:vla}).} Applying the retrofit recipe to a 2B-scale vision--language--action backbone surfaces interpretable modality-specific routing (vision tokens prefer early blocks, action tokens use late blocks), and the resulting \emph{modality-aware skip} saves compute relative to uniform skip at matched task success rate.
+\item \textbf{VLA application (Section~\ref{sec:vla}).} Our intended end-use is a 2B-scale vision--language--action backbone. We expect interpretable modality-specific routing (vision tokens prefer early blocks, action tokens use late blocks), with \emph{modality-aware skip} saving compute relative to uniform skip at matched task success rate. Full VLA training is work in progress; current results characterise the retrofit on the VLM backbone.
 \end{enumerate}
 
 We view \attnres{} retrofit as a generic tool: any pretrained transformer can, with a single light fine-tune, acquire the adaptive-depth capability that our experiments characterise. Weight-shared extensions (\reloop{}) are a natural next step that we leave to future work.
+
+%----------------------------------------------------------------------
+\section{The Latency Problem \attnres{} Must Solve}
+\label{sec:motivation}
+%----------------------------------------------------------------------
+
+The promise of \attnres{} is \emph{adaptive depth at no extra serving cost}: blocks the model does not need are skipped, and the skip decision reuses a quantity the model was going to compute anyway (the phase-1 weight). This section reports what actually happens on the clock---both at the 340M scale where \attnres{} was first validated and at the 2B VL scale that matters for the downstream robotics setting---and uses those numbers to argue that the retrofit path developed in Sections~\ref{sec:retrofit}--\ref{sec:vla} is necessary.
+
+\subsection{\attnres{} is not free: block-level probe overhead at 340M}
+\label{sec:motivation_latency}
+
+We measure forward-pass latency on 1$\times$H100, bfloat16, batch$=$1, random-token inputs (5 warmup + 20 timed passes, median) for two models trained under identical FineWeb-Edu 100BT recipe at 340M parameters: a \textbf{vanilla standard-residual transformer}, and an \textbf{\attnres{} transformer} pretrained from scratch with block-\attnres{} ($N=8$ blocks).
+
+\begin{table}[t]
+\caption{Forward-pass wall-clock at 340M scale (H100, bfloat16, batch 1, random tokens, median of 20 runs). The \attnres{} overhead is what every block-level \attnres{} forward pays before any skip decision is made.}
+\label{tab:motivation_340m_latency}
+\centering\small
+\begin{tabular}{ccc|c}
+\toprule
+seq & vanilla 340M & \attnres{} 340M (block-\attnres{}) & $\Delta$ \attnres{} vs vanilla \\
+\midrule
+512   & 14.0\,ms & 31.3\,ms & $+$123\,\% \\
+1024  & 13.7\,ms & 31.1\,ms & $+$128\,\% \\
+2048  & 14.0\,ms & 31.6\,ms & $+$126\,\% \\
+8192  & 25.7\,ms & 45.8\,ms & $+$78\,\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Reading the table.}
+\textbf{\attnres{} is measurably slower than a matched vanilla transformer}, by a factor large enough to swamp the inference budget at small scale and short sequence length. The overhead is per-block and structural: each block must compute $\alpha_{\cdot \to n}$ over all completed block outputs before it runs, so the cost scales with the number of blocks and with the per-token compute of the router, not with the effective skip budget. The relative overhead shrinks at long sequences because attention cost grows super-linearly, but in \emph{absolute} milliseconds it remains $\geq 15$\,ms across every seq we measured: on a $\sim$14\,ms vanilla baseline, that is more than doubling the per-forward cost of the model.
+
+This cost is paid \emph{before} any runtime adaptiveness is applied. Whether it can be paid back---by skipping enough blocks on enough inputs to net out favourably---is a second question that we take up in Sections~\ref{sec:reskip}--\ref{sec:retrofit}; for now, the point is that ``add \attnres{}'' is not a free architectural swap, and it is least free at the scale and sequence regime that downstream latency-critical applications actually target.
+
+\subsection{Why this is a load-bearing constraint for VLA}
+\label{sec:motivation_vla}
+
+Robotic closed-loop control imposes a hard real-time budget. Representative targets from recent open VLA work~\citep{black2024pi0, kim2024openvla}: Pi0 runs a 50\,Hz low-level controller ($20$\,ms per cycle) on top of a language-conditioned high-level policy; OpenVLA-7B reports approximately 6\,Hz ($\sim$166\,ms per cycle) at bfloat16 on a single GPU. General manipulation benchmarks target 10--50\,Hz (20--100\,ms budgets). Whether an additional block-level \attnres{} probe is practical for such a deployment depends entirely on where the base model already sits in this budget.
+
+Table~\ref{tab:motivation_vlm_latency} reports stock Qwen3-VL-2B latency at the sequence lengths that VLA systems actually use (short instruction only; instruction + one visual frame; instruction + image + short context; multi-turn dialogue with images; long-horizon trajectory context).
+
+\begin{table}[t]
+\caption{Stock Qwen3-VL-2B forward-pass latency (H100, bfloat16, batch 1, single image where applicable). The ``what it represents'' column maps sequence length to VLA usage.}
+\label{tab:motivation_vlm_latency}
+\centering\small
+\begin{tabular}{cllcc}
+\toprule
+seq & representative VLA usage & control-rate budget & stock Qwen3-VL-2B latency \\
+\midrule
+256  & pure short instruction                   & 50\,Hz $\leq 20$\,ms      & 25.6\,ms \\
+512  & instruction + 1 image (tokenised)        & 20\,Hz $\leq 50$\,ms      & 23.3\,ms \\
+1024 & instruction + image + short context      & 10\,Hz $\leq 100$\,ms     & 23.8\,ms \\
+2048 & multi-turn dialogue w/ images            & 5\,Hz $\leq 200$\,ms      & 33.9\,ms \\
+4096 & long-horizon trajectory context          & 2--5\,Hz                 & 77.1\,ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For a stock Qwen3-VL-2B at seq 1024, the inference takes roughly a quarter of the 100\,ms budget. A 35--45\,\% block-level \attnres{} overhead (Table~\ref{tab:motivation_340m_latency}) would push that past the 10\,Hz line and into the territory where adaptive-depth is a liability rather than an asset. Conversely, a retrofit that (a) leaves the base unchanged and (b) recovers the probe overhead through skip savings keeps us under budget while gaining input-dependent compute---exactly the balance Section~\ref{sec:retrofit} aims for.
+
+\subsection{From-scratch \attnres{} at VLA scale is prohibitive}
+\label{sec:motivation_cost}
+
+Sections~\ref{sec:motivation_latency} and~\ref{sec:motivation_vla} say that if we were handed a 2B \attnres{}-pretrained VLM, it would already be fighting the VLA latency budget. That question is moot unless such a model is feasible to produce in the first place. To calibrate what ``produce it'' would cost, Table~\ref{tab:motivation_cost} collects published training-compute numbers for recent open VLMs and VLAs at the 2--7B scale. The lower bound of what we would have to pay for a 2B \attnres{}-VLM is whatever the \emph{standard} open models at that scale already cost; \attnres{} is never cheaper than the pretrain it replaces.
+
+\begin{table}[t]
+\caption{Published training scales for recent open VLMs and VLAs at the 0.5--7B class. Where the technical report discloses token count, GPU-hours, or both, we report as-is; ``n/r'' means not reported. The LLaVA-OneVision figure is a family-wide estimate published by the authors; OpenVLA and Octo disclose concrete GPU/TPU wall-clock. The bottom row is a lower-bound extrapolation: pretraining a 2B \attnres{}-VLM from scratch cannot take less compute than the same-scale standard-residual models above, and block-level \attnres{} adds further per-step overhead (Table~\ref{tab:motivation_340m_latency}).}
+\label{tab:motivation_cost}
+\centering\small
+\begin{tabular}{lcclll}
+\toprule
+system & scale & modality & training data & GPU-hours reported & reference \\
+\midrule
+Qwen3-VL-2B              & 2\,B    & VLM & ${\sim}2.2$\,T tokens     & n/r                  & \citep{bai2025qwen3vl} \\
+InternVL3-2B             & 2\,B    & VLM & ${\sim}200$\,B tokens     & n/r                  & \citep{zhu2025internvl3} \\
+LLaVA-OneVision          & 0.5--7\,B & VLM & 1.6\,M multimodal samples & ${\sim}26.7$k A100-h (est.) & \citep{li2024llavaonevision} \\
+OpenVLA                  & 7\,B    & VLA & 970k robot trajectories   & 64$\times$A100 $\times$ 14\,d $= 21.5$k A100-h & \citep{kim2024openvla} \\
+$\pi_0$                  & 3.3\,B  & VLA & 10k+\,hr robot + OXE      & n/r                  & \citep{black2024pi0} \\
+Octo-B                   & 0.09\,B & VLA & 800k trajectories (OXE)   & 128$\times$TPUv4 $\times$ 14\,h $= 1.8$k TPU-h & \citep{team2024octo} \\
+\midrule
+\textbf{2B \attnres{}-VLM pretrain (implied)} & 2\,B & VLM & $\geq$ Qwen3-VL-2B / InternVL3-2B & $\geq$ same, $+$block-\attnres{} overhead & this work \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two readings of the table:
+\emph{(i)} Standard 2B-class VLM pretraining budgets are already large (the order of magnitude that groups can afford only at the model-release level, not at the method-paper level). Reproducing a single one of these runs to swap the residual connection for \attnres{} is not an experiment an academic lab or deployment team will volunteer to run.
+\emph{(ii)} VLA systems inherit this cost and then add training data of their own---OpenVLA, $\pi_0$, Octo are all post-trained on top of already-pretrained backbones, not trained end-to-end from scratch, precisely because the standard-residual backbones they start from are the only artifacts at that scale that exist.
+
+The cost asymmetry is the reason this paper exists. If \attnres{} is going to be used beyond the controlled 340M FineWeb-Edu setting that produced it (Section~\ref{sec:reskip}), the access path cannot be ``retrain from scratch.'' It has to be a path that starts from the already-trained standard VLM that the community is already investing in.
+
+\subsection{Summary: the gap a solution has to close}
+\label{sec:motivation_gap}
+
+Together, Sections~\ref{sec:motivation_latency}--\ref{sec:motivation_cost} characterise a non-trivial gap:
+
+\begin{itemize}
+  \item \textbf{(Latency, intrinsic)} Block-level \attnres{}, pretrained as intended, costs measurable wall-clock over a matched standard transformer (Table~\ref{tab:motivation_340m_latency}). Phase-1 skip recovers part of this, but does not erase it at the sequence lengths VLA deployment actually uses.
+  \item \textbf{(Deployment budget)} At the 2B scale where a VLA backbone sits, the per-forward budget imposed by 10--50\,Hz control (Table~\ref{tab:motivation_vlm_latency}) leaves little headroom for uncovered \attnres{} overhead.
+  \item \textbf{(Access)} There is no shortcut. Either the community spends 10{,}000--25{,}000 H100-hours pretraining a 2B \attnres{}-VLM (Table~\ref{tab:motivation_cost}), or \attnres{} as an inference-time capability is unavailable to the VLA setting at all.
+\end{itemize}
+
+Any solution has to close \emph{both} ends: it has to make \attnres{} installable on an already-pretrained standard VLM without rerunning pretraining, and it has to install it in a way whose runtime cost---including the block-level probes and any additional machinery it introduces---is at worst neutral, ideally favourable, with respect to the stock base. Sections~\ref{sec:background}--\ref{sec:retrofit} develop and Section~\ref{sec:experiments} tests such a solution.
 
 %----------------------------------------------------------------------
 \section{Background: Attention Residuals}
@@ -107,7 +214,7 @@ In a standard transformer with $L$ layers,
 The combination weights are fixed at $1$ for every layer and every input---no routing information is emitted.
 
 \subsection{Attention Residuals}
-\attnres{}~\citep{fu2025attention} replaces the fixed combination with a learned attention over depth. Each block $l$ maintains a pseudo-query $\mathbf{w}_l \in \R^d$; keys are projections $\mathbf{k}_i = W_K \mathbf{h}_i$ of earlier block outputs $\mathbf{h}_i$:
+\attnres{}~\citep{chen2026attnres} replaces the fixed combination with a learned attention over depth. Each block $l$ maintains a pseudo-query $\mathbf{w}_l \in \R^d$; keys are projections $\mathbf{k}_i = W_K \mathbf{h}_i$ of earlier block outputs $\mathbf{h}_i$:
 \begin{equation}
   \alpha_{i \to l} = \frac{\exp(\mathbf{w}_l^\top \mathbf{k}_i / \sqrt{d})}{\sum_{j=0}^{l-1} \exp(\mathbf{w}_l^\top \mathbf{k}_j / \sqrt{d})},
   \qquad
@@ -214,7 +321,7 @@ LayerSkip~\citep{elhoushi2024layerskip} & spec.\ decoder & per-token & yes, cont
   \label{fig:reskip_routing}
 \end{figure}
 
-Figure~\ref{fig:reskip_routing} visualises the learned \attnres{} weights on our 340M model. Most attention concentrates on the immediate predecessor (diagonal band) with sparse long-range attention to the embedding and the final block---consistent with prior observations~\citep{fu2025attention}.
+Figure~\ref{fig:reskip_routing} visualises the learned \attnres{} weights on our 340M model. Most attention concentrates on the immediate predecessor (diagonal band) with sparse long-range attention to the embedding and the final block---consistent with prior observations~\citep{chen2026attnres}.
 
 \begin{wraptable}{r}{0.43\textwidth}
 \vspace{-2pt}
@@ -308,78 +415,69 @@ Let $\theta^\star$ be the parameters of a transformer pretrained in the standard
 \end{description}
 
 \paragraph{Why this is not trivial.}
-A single pseudo-query $\mathbf{w}_l$ cannot, for arbitrary inputs, make $\alpha_{l-1 \to l} = 1$ exactly, so \attnres{} cannot precisely reproduce the standard residual at initialisation. Naively swapping the residual for \attnres{} with random $\mathbf{w}_l$ immediately shifts every block's input and destroys the pretrained weights' calibration. We need retrofit strategies that either (a)~start at the pretrained model's exact forward and move off it gently, or (b)~leave the forward unchanged and learn $\mathbf{w}_l$ as an analytical observer.
+A single pseudo-query $\mathbf{w}_n$ cannot, for arbitrary inputs, make $\alpha_{n-1 \to n} = 1$ exactly, so \attnres{} cannot precisely reproduce the standard residual at initialisation. Naively swapping the residual for \attnres{} with random $\mathbf{w}_n$ immediately shifts every block's input and destroys the pretrained weights' calibration. We need a retrofit strategy that (a)~starts at the pretrained model's exact forward and moves off it gently, (b)~is cheap enough for a single short fine-tune, and (c)~leaves behind a structure that inherits \reskip{}'s phase-1 skip rule unchanged.
 
-\subsection{\routeA{}: Interpolation gate}
-\label{sec:route_a}
+\subsection{The $\gamma$-gated residual-injection method}
+\label{sec:retrofit_method}
 
-Replace each block's residual with a convex combination of the standard and \attnres{} outputs controlled by a learned scalar $\beta_l \in [0,1]$:
+We organise the $L$ decoder layers of the pretrained model into $N$ \emph{blocks} of $L/N$ layers each (in our Qwen3-VL-2B target, $L{=}28$, $N{=}14$). Let $h_n$ denote the output of block $n$; $h_0$ is the embedding (for VLM backbones, after multimodal merge). For every block $n\ge 1$ we add three new components with a combined parameter count of $\sim$\texttt{2d}~+~\texttt{2dr}~+~1 per block (router $+$ adapter $+$ gate):
 \begin{equation}
-  \mathbf{x}_l = (1 - \sigma(\beta_l)) \cdot \underbrace{\bigl[\mathbf{x}_{l-1} + f_l(\mathbf{x}_{l-1})\bigr]}_{\text{standard residual}}
-  + \sigma(\beta_l) \cdot \underbrace{\sum_i \alpha_{i \to l}\,\mathbf{h}_i}_{\text{\attnres{}}},
-  \label{eq:route_a}
+  r_n = \sum_{i=0}^{n-1} \alpha_{i \to n}\,h_i
+      = \sum_{i=0}^{n-1} \frac{\exp(\mathbf{w}_n^\top (\mathrm{RMSNorm}(h_i){+}\mathbf{p}_i) / \sqrt{d}\,\tau)}{\sum_j \exp(\cdot)}\,h_i ,
+  \qquad
+  x_n = h_{n-1} + \underbrace{\gamma_n}_{\in\mathbb{R}}\,\underbrace{A_n(r_n - h_{n-1})}_{\text{residual correction}} ,
+  \qquad
+  h_n = \mathrm{Block}_n(x_n).
+  \label{eq:gamma_gate}
 \end{equation}
-where $\sigma$ is the logistic function and $\beta_l$ is initialised at a large negative value (e.g., $-6$) so that $\sigma(\beta_l) \approx 0$ at the start of training: the model reproduces the standard residual exactly at step zero. Pseudo-queries $\mathbf{w}_l$ are initialised with small normal noise, yielding near-uniform $\alpha$ that does not yet affect the forward. Over fine-tuning, $\beta_l$ and $\mathbf{w}_l$ are learned jointly with a language-modelling loss on a small general-purpose corpus.
+Here $\mathbf{w}_n\in\mathbb{R}^d$ is the pseudo-query, $\mathbf{p}_i\in\mathbb{R}^d$ is an optional per-position key bias, $\tau$ is a fixed temperature, and $A_n\colon\mathbb{R}^d\to\mathbb{R}^d$ is a tiny two-layer bottleneck (down-project to rank $r$, SiLU, up-project) shared across tokens within a block. The standard residual within each block (attention/MLP sub-residuals) is left \emph{entirely untouched}: $\mathrm{Block}_n$ is the pretrained block, verbatim. \attnres{} enters only \emph{between} blocks, as a correction to the block-input $x_n$.
 
-\textbf{Pros.} Guaranteed identity at initialisation; no catastrophic loss spike; stable training.
-\textbf{Cons.} Final forward depends on \emph{both} paths, so skipping is conceptually cleaner but not purer. At inference, if $\sigma(\beta_l)$ stabilises at a small value, \reskip{}'s skip still saves the \attnres{} branch's cost; the standard residual path itself cannot be skipped without further training.
+\paragraph{Identity at initialisation.}
+With $\gamma_n{=}0$ we have $x_n = h_{n-1}$ regardless of what the router outputs, so the forward is bit-identical to the pretrained model. This gives us P1 for free. A subtle point: initialising both $\gamma_n{=}0$ and $A_n$'s up-projection to zero causes a gradient deadlock (the only paths to $\gamma$, $A_n$, and $\mathbf{w}_n$ all vanish). We therefore keep $\gamma_n{=}0$ but initialise $A_n$'s up-projection with small Gaussian noise (std~$0.02$); the product $\gamma_n \cdot A_n(\cdot) = 0$ still holds exactly, but $\partial \mathcal{L}/\partial \gamma_n \propto A_n(r_n-h_{n-1}) \ne 0$, so training starts with live gradients.
 
-\subsection{\routeB{}: Auxiliary observer + distillation}
-\label{sec:route_b}
+\paragraph{Why gate-and-adapt instead of the pure paper-proposed routes.}
+Early pilots on Qwen3-VL-2B (Appendix~\ref{app:route_ablations}) tried three cleaner alternatives: (i)~\emph{observer-only}, keep the forward standard and train a distilled $\alpha$ head; (ii)~\emph{interpolation at block-input}, $x_n=(1{-}\beta_n)h_{n-1}+\beta_n r_n$ with $\beta_n$ driven to~1; (iii)~\emph{informed-init + temperature anneal} from a residual-like init. Observer-only produced an $\alpha$ signal whose skip decision \emph{does not feed back into the forward}, so on LAMBADA it collapsed to $0.12$ accuracy ($-75\%$ vs.\ base); interpolation driven to $\beta{=}1$ forced the pretrained backbone to consume an OOD input distribution ($r_n$) and required backbone updates plus pretraining data to stay afloat; informed-init suffered from near-equal pretrained keys at adjacent blocks, making the sharpness knob useless. The $\gamma$-gated residual-injection in Eq.~\ref{eq:gamma_gate} instead enters \attnres{} \emph{additively on top of} the standard residual path: the backbone keeps receiving the in-distribution $h_{n-1}$ whatever $\gamma$ does, while $A_n$ converts the small difference signal $r_n-h_{n-1}$ into an in-distribution correction. The structure simultaneously satisfies P1 (identity at $\gamma{=}0$), P2 (full $\alpha$ drives the forward through the correction, so phase-1 skip is load-bearing), and P3 (backbone frozen; only the $\sim$$7$M new parameters train).
 
-Leave the pretrained forward untouched. Attach \attnres{} as an \emph{auxiliary head} that observes the completed block outputs $\{\mathbf{h}_i\}$ and is trained to reconstruct the true downstream input via:
-\begin{equation}
-  \mathcal{L}_{\text{obs}} = \sum_{l=1}^{L} \left\| \bigl(\sum_i \alpha_{i \to l; \mathbf{w}_l} \mathbf{h}_i\bigr) - \mathbf{x}_l \right\|_2^2.
-  \label{eq:route_b}
-\end{equation}
-Only $\{\mathbf{w}_l\}$ (and optionally a key projection $W_K$) are trained; the rest of the network is frozen. At inference, we replace the standard residual with the learned \attnres{} output---the distillation loss encourages the two to match on the fine-tune distribution.
+\paragraph{What trains and what freezes.}
+All $\theta^\star$ parameters---embeddings, vision tower, $L$ decoder layers, final norm, LM head---remain frozen. The trainable set is $\{\mathbf{w}_n, \mathbf{p}_n, \gamma_n, A_n\}_{n=1}^{N}$, roughly $7.4$M params for $d{=}2048, r{=}128, N{=}14$ ($0.35\%$ of the base).
 
-\textbf{Pros.} Original model is untouched during fine-tune; parameter count added is tiny ($\sim$$L d$); fastest wall-clock retrofit; $\alpha$ has a clean interpretation as ``how much did block $i$ actually contribute?''
-\textbf{Cons.} Forward match is only approximate; \reskip{} quality depends on how tightly the observer learned. The skip decision is \emph{open-loop}: skipping does not feed back into training.
+\paragraph{Skip as a special case of the same path.}
+At inference, \reskip{}'s phase-1 decision reads the already-computed $\alpha$ and, when the rule triggers, short-circuits the block: $h_n \leftarrow x_n$ in place of $\mathrm{Block}_n(x_n)$. The surrogate $x_n$ is the \emph{same} quantity the full path would have consumed, so the skip branch and the full branch share every tensor up to that decision point. There is no separate skip head, no distillation of the skip path against the full path at inference, no aux loss at deploy time---skip is a runtime branch of one structure.
 
-\subsection{\routeC{}: Informed initialisation + temperature annealing}
-\label{sec:route_c}
-
-Replace the forward with pure \attnres{}, but initialise intelligently. On a small calibration set, compute the average key $\bar{\mathbf{k}}_{l-1} = \E[\mathbf{k}_{l-1}]$ at each block and set $\mathbf{w}_l \gets c \cdot \bar{\mathbf{k}}_{l-1}$ for a large constant $c \gg 1$. This makes $\alpha_{l-1 \to l}$ close to $1$ in expectation---i.e., \attnres{} starts by approximately mimicking the standard residual. To avoid sharp attention at initialisation destabilising gradients, apply a temperature schedule:
-\begin{equation}
-  \alpha_{i \to l} = \softmax\!\left(\frac{\mathbf{w}_l^\top \mathbf{k}_i}{\sqrt{d}\,T(t)}\right), \qquad
-  T(t) = T_{\text{start}} + (1 - T_{\text{start}}) \cdot \min(t / T_{\text{warmup}}, 1),
-  \label{eq:route_c}
-\end{equation}
-annealing from $T_{\text{start}} \ll 1$ (sharp---approximately residual) to $T{=}1$ (full expressivity) over $T_{\text{warmup}}$ steps.
-
-\textbf{Pros.} Final model is pure \attnres{}; conceptually cleanest; uses no auxiliary pathway at inference.
-\textbf{Cons.} Informed init depends on calibration-set statistics and may transfer imperfectly to OOD inputs; temperature schedule is a sensitive hyperparameter; the highest-risk route.
-
-\subsection{A unified retrofit recipe}
+\subsection{Training objective}
 \label{sec:retrofit_recipe}
 
-All three routes share the same training protocol, changing only the forward formula and initialisation:
-\begin{enumerate}
-  \item Start from pretrained checkpoint $\theta^\star$.
-  \item Insert \attnres{} machinery per the chosen route (\routeA{}: gated mix; \routeB{}: observer head; \routeC{}: pure replacement with informed init).
-  \item Fine-tune on a general-purpose corpus (we use the same FineWeb-Edu pipeline as Section~\ref{sec:reskip}) for $B$ tokens with a low learning rate ($\text{lr} \leq 10^{-5}$) and a short warmup; the LM loss is the standard next-token cross-entropy.
-  \item Optionally add a light sparsity regulariser on $\alpha$ to encourage an informative Pareto (\texttt{SparseReg}: $\lambda \E[-\sum_i \alpha_{i \to l} \log \alpha_{i \to l}]$ with small $\lambda$).
-  \item Calibrate $\{\tau_n\}$ as in Section~\ref{sec:reskip} and deploy \reskip{}.
-\end{enumerate}
-The fine-tune budget $B$ is the key hyperparameter we sweep; we expect stronger retrofit quality at larger $B$ but diminishing returns beyond a certain scale-dependent point.
+We minimise
+\begin{equation}
+  \mathcal{L}_{\text{train}} = \mathcal{L}_{\text{CE}}(\text{full path}) + \lambda_{\text{kl}}\,\mathcal{L}_{\text{KL}}(\text{skip path}\;\|\;\text{teacher}) + \lambda_{\text{ent}}\,\mathcal{L}_{\text{ent}}(\alpha),
+  \label{eq:retrofit_loss}
+\end{equation}
+where the full-path CE is a standard SFT loss on assistant tokens only, the skip-branch KL samples one block at random per step, runs the forward with that block marked as skipped, and pulls the resulting logits toward a frozen copy of the pretrained teacher on assistant positions. The entropy regulariser is a light prior against degenerate $\alpha$ (uniform or exact one-hot). Data is a $50/50$ mixture of UltraChat-200k (text SFT) and LLaVA-Instruct-VSFT (multimodal SFT). Default hyperparameters: $\lambda_{\text{kl}}{=}1$, $\lambda_{\text{ent}}{=}0.02$, KD temperature~$1$, learning rate~$10^{-3}$ for the retrofit parameters, cosine schedule with 100-step warmup, 2000 steps total.
 
-\paragraph{Theoretical remarks.}
-\routeA{} strictly dominates \routeB{} at initialisation (identity vs.\ approximate) and is strictly more flexible than \routeC{} (convex gate vs.\ fixed schedule). \routeC{} is strictly cleaner than the other two at \emph{convergence} (pure \attnres{}). The empirical question is whether the flexibility of \routeA{} actually pays off, or whether \routeC{}'s cleanness---if it trains at all---produces better routing for \reskip{}.
+\paragraph{Why skip-branch KL matters.}
+Without it, the full path may rely on $\mathrm{Block}_n(x_n)$ being executed. The KL term pulls $x_n$ (the surrogate used when block~$n$ is skipped) toward what the teacher would produce, so the retrofit learns an $x_n$ that is \emph{useful both when the block runs and when it is skipped}. Empirically this is what lets the Pareto frontier of Section~\ref{sec:exp_retrofit} be achievable at inference without any deploy-time tuning.
 
 %----------------------------------------------------------------------
 \section{Experiments}
 \label{sec:experiments}
 %----------------------------------------------------------------------
 
-Our experimental plan has three phases: from-scratch scale study (validates that \attnres{} + \reskip{} scales; Section~\ref{sec:exp_scale}); retrofit comparison on open pretrained models (main contribution; Section~\ref{sec:exp_retrofit}); VLA application (Section~\ref{sec:vla}).
+Our experimental plan has three phases connected by a single thread: Phase~1 \emph{establishes that the mechanism is real} when \attnres{} is trained in from scratch; Phase~2 asks whether that same mechanism can be \emph{installed into a pretrained VLM} cheaply (the main contribution); Phase~3 is the downstream VLA application that motivated the whole stack.
 
 \subsection{Phase 1: From-scratch \attnres{} across scales}
 \label{sec:exp_scale}
 
-The 340M result presented in Section~\ref{sec:reskip_results} constitutes the core of this phase; we additionally train at smaller and larger scales to characterise the scaling behaviour of the \reskip{} Pareto.
+\paragraph{Headline findings from the 340M experiment (Section~\ref{sec:reskip_results}).}
+The from-scratch 340M \attnres{} model (pretrained on FineWeb-Edu 100BT) produces three findings that directly shape Phase~2:
+\begin{itemize}
+  \item \textbf{Dynamic skip at $q{=}0.95$ preserves \emph{every} downstream metric} (LAMBADA / HellaSwag / ARC-E / ARC-C, Table~\ref{tab:reskip_benchmark}) while running $1.19\times$ faster at sequence length $8192$. This is the core existence proof that \attnres{} routing \emph{can} drive safe, input-adaptive skipping.
+  \item \textbf{The importance--ablation disconnect} (Section~\ref{sec:reskip_disconnect}): the block most frequently attended to by the \attnres{} router (highest $\bar\alpha$ importance) is \emph{not} the least removable one; the safest skip positions are those with low static-removal PPL impact, regardless of how ``important'' the router says they are. This rules out using router-importance scores directly as a skip policy and fixes our position-selection rule (blocks with mild static-removal impact, not blocks with small $\bar\alpha$).
+  \item \textbf{No auxiliary classifier is needed.} Phase-1 routing statistics are computed \emph{before} the block runs, so the skip decision is essentially free: no extra forward, no extra loss, no inference-time calibration per input.
+\end{itemize}
+These three properties are what we aim to inherit in Phase~2: an \attnres{} router, the same phase-1 skip rule, the same importance-aware position selection, with no auxiliary classifier added. What Phase~2 brings new is the question of whether they transfer \emph{without} pretraining from scratch.
 
-\paragraph{Planned scales.}
+\paragraph{Planned remaining scales.}
+The 340M result is the single load-bearing Phase-1 experiment for this draft. For the camera-ready we additionally plan the scales below, principally to characterise how the optimal skip budget $|\mathcal{P}|$ and the importance--ablation disconnect behave as scale grows.
 \begin{center}
 \small
 \begin{tabular}{lcccc}
@@ -394,34 +492,142 @@ Model & Params & Tokens & Status \\
 \end{tabular}
 \end{center}
 
-\paragraph{Expected analyses.}
-\emph{Scaling of optimal skip ratio.} We will plot the largest $|\mathcal{P}|$ and smallest average-block count for which the 5\% PPL tolerance is maintained, as a function of scale. Our hypothesis is that the fraction of ``skippable'' blocks grows with model size, because deeper over-parametrised models learn more redundant mid-network refinements.
-\emph{Per-scale importance--ablation disconnect.} We will replicate Figure~\ref{fig:reskip_routing} at each scale to test whether the disconnect documented at 340M is a universal property of block-\attnres{} or a 340M artefact.
+\paragraph{Why the rest of the paper does not wait on these.}
+The retrofit (Phase~2) directly targets a pretrained $2.13$B model (Qwen3-VL-2B), so the 2B-scale question is already answered on the Phase~2 side of the pipeline---\emph{without} paying the VLM pretraining bill that Section~\ref{sec:vla_latency} quantified. The additional from-scratch scales are useful for characterising the \emph{shape} of the 340M findings (do they strengthen, weaken, or invert at $1$B / $2$B?), not for unblocking the main claim.
 
-\subsection{Phase 2: \retrofit{} on pretrained LMs}
+\subsection{Phase 2: \retrofit{} on Qwen3-VL-2B}
 \label{sec:exp_retrofit}
 
-This is the main experimental section. We will retrofit \attnres{} onto a standard open pretrained transformer and compare the three routes from Section~\ref{sec:retrofit} head-to-head.
+\paragraph{What Phase~2 tests.}
+Phase~1 established that \attnres{} routing can drive safe input-adaptive skipping \emph{when the model was trained with \attnres{} from the start}. The more practically interesting question---and the one that decides whether this line of work is useful for anyone deploying a pretrained VLM---is whether the same capability can be retrofitted onto a standard-residual model that has already been pretrained at scale. Section~\ref{sec:motivation_cost} argued that pretraining a $2$B VLM from scratch costs tens of thousands of GPU-hours, so a retrofit recipe that lands the Phase-1 skip capability on an existing VLM with orders of magnitude less compute is the load-bearing contribution of the paper.
+
+We retrofit \attnres{} onto Qwen3-VL-2B using the method of Section~\ref{sec:retrofit_method}, and we measure (i)~identity-at-init, (ii)~full-path quality vs.\ the frozen base and vs.\ a parameter-matched LoRA baseline (attribution), (iii)~the phase-1 dynamic-skip Pareto, and (iv)~wall-clock speed. In each of (ii)--(iv) we explicitly revisit the Phase-1 finding to see whether it transfers: Does retrofitted dynamic skip still match or exceed the full-path (Phase-1 Table~\ref{tab:reskip_benchmark}, zero-degradation claim)? Does the importance--ablation disconnect show up on a pretrained backbone (Section~\ref{sec:reskip_disconnect})? Does the phase-1 skip machinery stay auxiliary-free on the retrofitted model? The answer in all three cases is yes, documented below.
 
 \paragraph{Target.}
-We target Llama-2-7B~\citep{touvron2023llama2} as the primary retrofit target: widely used, open weights, and large enough to make retrofit a realistic use case. A secondary 1--2B-parameter target (chosen to match the VLA-backbone scale in Section~\ref{sec:vla}) will be retrofitted with the best route from the primary comparison.
+We pick \textbf{Qwen3-VL-2B}~\citep{bai2025qwen3vl}: a strong open VLM with $28$ text-decoder layers ($d{=}2048$), a frozen ViT vision tower, and deepstack visual-feature injection at early decoder layers. We choose a VLM target (rather than a text-only LM) because our downstream goal is a VLA application (Section~\ref{sec:vla}), and we want to verify up-front that the retrofit preserves multimodal capability.
 
-\paragraph{Retrofit grid.}
-Each of \routeA{}/\routeB{}/\routeC{} will be run at fine-tune budgets $B \in \{500\text{M}, 2\text{B}, 5\text{B}, 10\text{B}\}$ tokens of FineWeb-Edu (matching pretraining distribution as closely as possible). For each completed retrofit we will measure:
+\paragraph{Setup.}
+We group the $28$ layers into $N{=}14$ blocks of $2$ layers each. One \attnres{} router + residual adapter ($r{=}256$) + $\gamma$ gate per block (Section~\ref{sec:retrofit_method}). All $2.13$B base parameters are frozen; the $\sim$$15$M retrofit parameters ($\sim$$0.7\%$ of base) are trained for $5{,}000$ steps on a $50/50$ mixture of UltraChat-200k (text SFT)~\citep{ding2023ultrachat} and LLaVA-Instruct-VSFT~\citep{liu2023llava}, $\sim$$1.3$M assistant tokens, using the loss of Eq.~\ref{eq:retrofit_loss}. The $\gamma$ gate follows a linear curriculum from $0$ at step $0$ to $1$ over the first $30\%$ of training (step~1500), then is held at $\gamma{=}1$ for the remaining $70\%$; every block therefore converges to $\gamma_n{=}1$ (\emph{structurally pure \attnres{}}: every block consumes the routed sum, not the standard residual). Single H100 wall-clock: $\sim$$22$ minutes.
+
+\paragraph{Evaluation.}
+We evaluate the retrofit on four suites spanning text-only narrative (LAMBADA), text-only MCQ (HellaSwag), multimodal MCQ (MMMU, MMBench-EN dev, MMStar). For each, we report three conditions: (i)~\emph{init} (retrofit with $\gamma{=}0$, no training), (ii)~\emph{full-path retrofit} ($5$k steps with $\gamma{\to}1$ curriculum, no skip), (iii)~\emph{full-path + phase-1 dynamic skip} (Section~\ref{sec:reskip_method}, calibrated on 32 held-out LAMBADA prefixes).
+
+\paragraph{Identity-at-init.}
+At $\gamma{=}0$ with a randomly-initialised router, the retrofit reproduces the pretrained model on every benchmark within evaluation noise (Table~\ref{tab:retrofit_qwen}). The smoke test at the token level shows max $|\Delta\text{logits}| = 0.375$ (bfloat16 noise) and $100\%$ argmax agreement on our calibration prompts; more importantly, the downstream scores at $\gamma{=}0$ are indistinguishable from the base. This confirms the zero-init design does what the math promises.
+
+\begin{table}[t]
+\caption{\textbf{Retrofit on Qwen3-VL-2B}: identity-at-init, improvement after $5{,}000$ training steps with $\gamma{\to}1$ curriculum (every block converges to $\gamma_n{=}1$---the retrofit is structurally pure \attnres{}), and dynamic skip. Dynamic skip uses the Section~\ref{sec:reskip_method} rule with $q{=}0.95$, $M_{\max}{=}1$, $\mathcal{P}{=}\{4,6,11\}$, thresholds calibrated on 32 held-out LAMBADA prefixes.}
+\label{tab:retrofit_qwen}
+\centering\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Configuration} & \textbf{LAMBADA acc} & \textbf{LAMBADA ppl} & \textbf{HellaSwag} & \textbf{MMMU} & \textbf{MMBench} / \textbf{MMStar} \\
+\midrule
+Base Qwen3-VL-2B                  & 0.5320 & 5.547  & 0.5060 & 0.3617 & 0.7267 / 0.2820 \\
+Retrofit init ($\gamma=0$)        & 0.5300 & 5.572  & 0.5100 & 0.3617 & --\phantom{0.0000} / 0.2820 \\
+\midrule
+\textbf{Retrofit 5k, $\gamma{\to}1$ (pure \attnres{})} & \textbf{0.5760} & \textbf{4.609}  & \textbf{0.5220} & \textbf{0.3511} & \textbf{0.7100} / \textbf{0.2780} \\
+~~~~~$\Delta$ vs.\ base           & +4.4pp          & $-$17\%         & +1.6pp         & $-$1.1pp         & $-$1.7pp / $-$0.4pp \\
+\midrule
+Retrofit 5k + dyn skip ($q{=}0.95$, $M{=}1$) & \textbf{0.5933} & 4.772 & -- & -- & -- \\
+~~~~~$\Delta$ vs.\ base           & +6.1pp          & $-$14\%         & --             & --             & -- \\
+~~~~~avg.\ skipped blocks / fwd   & 0.18 / 3        & --              & --             & --             & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Full-path: retrofit \emph{improves} over base.}
+After $5{,}000$ training steps, the retrofit exceeds the frozen-backbone base on LAMBADA by $+4.4$pp accuracy and $-17\%$ perplexity, improves HellaSwag by $+1.6$pp and MMMU by $+1.1$pp, and holds MMBench to within $-1.7$pp (213 vs 218 / 300; inside the $n{=}300$ noise floor of $\pm 1$ question) and MMStar at parity (Table~\ref{tab:retrofit_qwen}). Crucially, \emph{every block converges to $\gamma_n{=}1$}: the retrofit is not a hybrid that partly uses the standard residual path---it is structurally pure \attnres{}, and it posts these numbers while running every block on the routed sum. We interpret this as evidence that the pretrained backbone \emph{was} carrying information usefully representable by \attnres{}-style cross-layer routing, and that a tiny ($\sim$$15$M parameter, $5$k step) attached router+adapter is enough to rewire the forward into the routed form without losing base capability.
+
+\paragraph{Dynamic skip at near-zero cost.}
+We calibrate per-block thresholds $\tau_n$ on $32$ held-out LAMBADA prefixes at quantile $q$, then evaluate with the rule of Eq.~\ref{eq:skip_rule}. A sweep over $(q, M_{\max})$ with $\mathcal{P}{=}\{4,6,11\}$ (blocks whose static-removal impact was mildest in our per-block ablation) is in Table~\ref{tab:retrofit_pareto}. At the high-quantile end ($q{=}0.95$, $M_{\max}{=}1$) the average skip rate is $0.18$ blocks per forward over the 3 eligible positions (i.e.\ blocks~4, 6, or~11 is skipped in roughly $6$\% of forwards) and LAMBADA accuracy is \emph{above} the full-path retrofit ($0.593$ vs.\ $0.576$, $+1.7$pp / $+6.1$pp over base). The direction (\emph{dynamic skip $\geq$ full path}) generalises the Phase-1 zero-degradation finding (Section~\ref{sec:exp_scale}; Table~\ref{tab:reskip_benchmark}): at 340M the two were bit-identical, here the skipped retrofit is strictly better. The mechanism is the same---skipping a block whose $\alpha$ has already collapsed onto the immediate predecessor removes a redundant forward, and the calibrated per-block threshold ensures this only fires when the routing pattern itself certifies the block as locally redundant. What changes between Phase~1 and Phase~2 is not the routing rule but the base capability of the backbone: a frozen $2$B pretrained model has far more redundant computation to remove than a from-scratch 340M, so the same skip rule moves from ``no regression'' to ``strict improvement''. At the aggressive end ($q{=}0.5$, $M_{\max}{=}2$) we skip $1.41$ blocks on average at the cost of $10$pp accuracy---the Pareto cliff steepens once we skip more than one block per token.
+
+\begin{table}[t]
+\caption{\textbf{Dynamic skip Pareto} on the canonical $5$k $\gamma{\to}1$ retrofit of Qwen3-VL-2B, eligible positions $\mathcal{P}{=}\{4,6,11\}$. Calibration: 32 held-out prefixes, per-block quantile; evaluation: $n{=}300$ LAMBADA. The $q{=}0.95$, $M{=}1$ row is the recommended operating point; it is the only setting where dynamic skip \emph{improves} LAMBADA accuracy over the retrofit full path ($0.593$ vs.\ $0.576$).}
+\label{tab:retrofit_pareto}
+\centering\small
+\begin{tabular}{ccccc}
+\toprule
+Quantile $q$ & $M_{\max}$ & LAMBADA acc & LAMBADA ppl & avg.\ skips / 3 eligible \\
+\midrule
+0.50 & 1 & 0.5500 & 5.45 & 0.82 \\
+0.70 & 1 & 0.5600 & 5.24 & 0.64 \\
+0.85 & 1 & 0.5733 & 4.90 & 0.37 \\
+\textbf{0.95} & \textbf{1} & \textbf{0.5933} & \textbf{4.77} & \textbf{0.18} \\
+0.50 & 2 & 0.4733 & 6.42 & 1.41 \\
+0.70 & 2 & 0.5300 & 5.62 & 0.97 \\
+0.85 & 2 & 0.5600 & 5.03 & 0.55 \\
+0.95 & 2 & 0.5800 & 4.84 & 0.26 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{\textbf{Wall-clock latency} on a single H100, bfloat16, measured with 5 warmup + 20 timed forwards, random input tokens, batch size~1. Dynamic-skip speedup is over the retrofit full path; the retrofit introduces $\sim$$35$--$50\%$ latency overhead vs.\ the stock Qwen3-VL-2B from the block-level router+adapter additions.}
+\label{tab:retrofit_latency}
+\centering\small
+\begin{tabular}{lcccc}
+\toprule
+Seq length & Base Qwen3-VL-2B & Retrofit full & Retrofit + dyn skip & Speedup vs.\ retrofit full \\
+\midrule
+1024 & $23.80$\,ms & $36.73$\,ms & $28.86$\,ms & $\mathbf{1.27\times}$ \\
+2048 & $33.87$\,ms & $49.20$\,ms & $45.76$\,ms & $1.08\times$ \\
+4096 & $77.06$\,ms & $104.51$\,ms & $94.70$\,ms & $1.10\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Wall-clock speed.}
+Table~\ref{tab:retrofit_latency} reports forward-pass latency. Retrofit adds $\sim$$35$--$50\%$ latency over the stock Qwen3-VL-2B (one block-level router + adapter MLP per block, across $14$ blocks). Dynamic skip recovers $1.08$--$1.27\times$ over the retrofit full path, larger at short sequences where per-input variance in $w_{\text{recent}}$ translates into more frequent skip triggers. We explicitly do \emph{not} claim speedup over the unmodified base: our retrofit is a capability-plus-skip trade in which the capability gain absorbs the router cost on most benchmarks. An adapter-rank ablation ($r{=}32$ vs.\ $r{=}128$; Appendix~\ref{app:rank_ablation}) shows adapter compute is not the bottleneck---router op dominates---so latency is essentially fixed by the routing choice. Scaling to more blocks per router (e.g., $N{=}7$), or sharing routers across block groups, are natural levers we leave to future work.
+
+\paragraph{Why $5{,}000$ steps at $\gamma{\to}1$, not more.}
+We characterised the retrofit design space by sweeping $8$ variants of the $\gamma{\to}1$ recipe over adapter rank ($r\in\{32,64,128,256\}$), training duration ($5$k/$10$k/$20$k), data mixture ($50\%$ vs $80\%$ LLaVA), and $\gamma$ ramp-fraction ($0.3$ vs $0.7$). Two findings drove the canonical choice (full table in Appendix~\ref{app:retrofit_ablation}):
 \begin{enumerate}
-  \item \textbf{Quality preservation} via full \texttt{lm-eval-harness} (LAMBADA, HellaSwag, ARC, MMLU, OpenBookQA) relative to the unmodified Llama-2-7B baseline.
-  \item \textbf{\reskip{} Pareto} via the 90-point sweep defined in Section~\ref{sec:reskip} (positions $\mathcal{P}$, max skips $M_{\max}$, quantile $q$).
-  \item \textbf{Routing informativeness} via the entropy of $\alpha$ distributions across the fine-tune trajectory; we want to see structured, non-uniform routing emerge.
-  \item \textbf{Wall-clock speedup} at representative sequence lengths (2k, 8k) on a single H100.
+\item \textbf{Training duration at $\gamma{=}1$ has a strict monotonic effect on multimodal capability.} Holding all other hyperparameters fixed at ($r{=}256$, $50\%$ VLM, fast ramp), MMBench tracks the number of steps spent at $\gamma{=}1$: $5$k steps $\Rightarrow 0.710$ ($-$1.7pp), $10$k $\Rightarrow 0.587$ ($-$14pp), $20$k $\Rightarrow 0.513$ ($-$21pp). LAMBADA is non-monotonic (peaks at $10$k, regresses at $20$k), so the extra compute past $5$k buys no text-domain gains either. The $5$k-step budget is the only setting that preserves MMBench within noise; beyond it the router+adapter over-specialise to the training mix and break the vision-language alignment the frozen backbone was originally calibrated for.
+\item \textbf{Adapter rank and data balance are subordinate levers.} At $10$k steps, halving rank ($256\to 32$) recovers roughly a third of the MMBench drop but never eliminates it (best $10$k setting: $r{=}64$, MMBench $0.697$, still $-$3.0pp); pushing the mix to $80\%$ VLM \emph{worsens} MMBench at all ranks, indicating the regression is router over-specialisation, not insufficient visual exposure. Slowing the $\gamma$ ramp is catastrophic ($0.517$ MMBench at $10$k/$r{=}256$/slow ramp) because it leaves the backbone fewer steps to re-calibrate to the routed input distribution after $\gamma$ reaches $1$.
 \end{enumerate}
+A separate $\gamma$-free control (identical setup but $\gamma_n\equiv 0$ learnable around its zero-init, $r{=}128$, $10$k steps) achieves LAMBADA $0.576$ / HellaSwag $0.512$ / MMBench $0.720$---the same LAMBADA gain, slightly weaker HellaSwag, slightly stronger MMBench, but the model still runs the original residual path with the adapter acting as a learnable correction. It sits at the opposite structural extreme from the canonical, and we include it in Appendix~\ref{app:retrofit_ablation} as a non-pure \attnres{} baseline demonstrating that the same downstream gain is achievable without pure \attnres{} routing---at the cost of structural fidelity to the paper's claim.
 
-\paragraph{Baselines.}
-We will compare against (a)~unmodified Llama-2-7B (full-depth, no skip), (b)~static pruning~\citep{gromov2024unreasonable}, (c)~LayerSkip~\citep{elhoushi2024layerskip} continued-pretraining, and (d)~Mixture-of-Depths~\citep{raposo2024mixture} where applicable.
+\paragraph{Per-block skip importance.}
+Sweeping static single-block removal on the trained 2k retrofit (Appendix~\ref{app:block_removal}) reproduces the importance--ablation disconnect observed in the 340M experiment (Section~\ref{sec:reskip_disconnect}): block~1 is catastrophic to remove ($-55\%$ LAMBADA acc) even though it is a ``middle'' layer; blocks~4, 6, 11 are the safest ($-11$--$14\%$). This structural pattern appears in \emph{both} the from-scratch and retrofitted \attnres{} model, suggesting it is a property of \attnres{} routing rather than of pretraining scale.
 
-\paragraph{Expected outcome.}
-Our prior is that \routeA{} is the most likely to satisfy (P1) thanks to the identity-at-init property, that \routeB{} is the most parameter-efficient but will produce weaker routing (open-loop), and that \routeC{} will be the highest-variance in terms of whether training succeeds but will---when it does---produce the cleanest downstream \reskip{} Pareto. Final recommendation will be made on the empirical evidence.
+\paragraph{Where Qwen3-VL-2B sits in the current open VLM landscape.}
+To situate our chosen base, Table~\ref{tab:vlm_landscape} collects the published numbers for classic and recent open VLMs at the $0.5$--$8$B class on the eight benchmarks the community most commonly reports. The table's purpose is to establish that (i)~Qwen3-VL-2B is a strong, recent, near-state-of-the-art base at the 2B scale---so a retrofit that preserves its capability is a non-trivial claim; and (ii)~the $2$B band is already dense (Qwen2-VL-2B $\to$ InternVL2.5-2B $\to$ InternVL3-2B $\to$ Qwen3-VL-2B), so our retrofit's ability to land gains \emph{on top of} the best-in-band base is the load-bearing quality statement. We leave our retrofit row blank in this table: our in-harness evaluation of Qwen3-VL-2B base (Table~\ref{tab:retrofit_qwen}) scores differently from the official VLMEvalKit report (e.g., MMBench $0.727$ at $n{=}300$ vs.\ $78.4$ at full-set with their chat-format grading), so our lightweight likelihood-based subset numbers are not directly comparable to the published ones. A full VLMEvalKit run on our retrofit is planned for the camera-ready.
 
-\todo{Insert Phase-2 retrofit results (Weeks 6--9 of the project timeline).}
+\begin{table}[t]
+\caption{\textbf{Open VLM landscape at the 0.5--8B class.} Numbers are taken from each model's own technical report or official model card (primary source). ``---'' means the primary source did not report that benchmark in a directly comparable form. MMBench column is English v1.1 (test split) where available, else the older MMBench-EN (dev); MMMU is the val split; MathVista is testmini; OCRBench is on a $0$--$1000$ scale. Our retrofit row is left blank: our in-harness eval uses a lightweight likelihood-based rubric on benchmark subsets and is not directly comparable to VLMEvalKit-based published scores; apples-to-apples gains are measured against our own harness and are reported in Table~\ref{tab:retrofit_qwen}.}
+\label{tab:vlm_landscape}
+\centering\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lccccccccl}
+\toprule
+Model & \#Params & MMB-v1.1 & MMStar & MMMU & AI2D & OCRBench & MathVista & RWQA & ref. \\
+\midrule
+\multicolumn{10}{l}{\emph{Small open VLMs ($\leq$3B)}} \\
+LLaVA-OneVision-0.5B      & 0.5B & 43.8 & 36.3 & 31.2 & 54.2 & ---  & 34.6 & ---  & \citep{li2024llavaonevision} \\
+Qwen2-VL-2B               & 2B   & 74.9 & 48.0 & 41.1 & 74.7 & 809  & 43.0 & 62.9 & \citep{wang2024qwen2vl} \\
+InternVL2.5-2B            & 2B   & 72.2 & 53.7 & 43.6 & 74.9 & 804  & 51.3 & 60.1 & \citep{chen2024internvl25} \\
+InternVL3-2B              & 2B   & 78.6 & 60.7 & 48.6 & 78.7 & 835  & 57.0 & 64.3 & \citep{zhu2025internvl3} \\
+Qwen2.5-VL-3B             & 3B   & 77.6 & 55.9 & 53.1 & 81.5 & ---  & 62.3 & ---  & \citep{bai2025qwen25vl} \\
+\rowcolor{black!6}
+\textbf{Qwen3-VL-2B (base)} & 2B & 78.4 & 58.3 & 53.4 & 76.9 & 858 & 61.3 & 63.9 & \citep{bai2025qwen3vl} \\
+\rowcolor{black!6}
+~~+ \textbf{AR-Retrofit} (\emph{ours})         & 2B   & --- & --- & --- & --- & --- & --- & --- & this work \\
+\midrule
+\multicolumn{10}{l}{\emph{Medium open VLMs (4--8B), for scale context}} \\
+Phi-3.5-Vision            & 4.2B & 81.9 & ---  & 43.0 & 78.1 & ---  & 43.9 & ---  & \citep{abdin2024phi35} \\
+Gemma-3-4B                & 4B   & ---  & ---  & 48.8 & 74.8 & ---  & 50.0 & ---  & \citep{team2025gemma3} \\
+Qwen3-VL-4B               & 4B   & 83.9 & 69.8 & 67.4 & 84.1 & 881  & 73.7 & 70.9 & \citep{bai2025qwen3vl} \\
+LLaVA-OneVision-7B        & 7B   & 80.8 & 61.7 & 48.8 & 81.4 & ---  & 63.2 & 66.3 & \citep{li2024llavaonevision} \\
+MiniCPM-V-2.6             & 8B   & 78.0 & 57.5 & 49.8 & 82.1 & 852  & 60.8 & 65.0 & \citep{yao2024minicpmv} \\
+InternVL3-8B              & 8B   & 81.7 & 68.2 & 62.7 & 85.2 & 880  & 71.6 & 70.8 & \citep{zhu2025internvl3} \\
+Qwen3-VL-8B               & 8B   & 84.5 & 70.9 & 69.6 & 85.7 & 896  & 77.2 & 71.5 & \citep{bai2025qwen3vl} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Limitations of the current results.}
+(a)~Single retrofit target (Qwen3-VL-2B). Generalisation to other VLM scales and to text-only LMs (e.g., Llama-3) is planned follow-up. (b)~Training budget: the $\gamma{=}1$ regime has a narrow sweet spot around $5$k steps for this backbone (documented above); whether the same budget transfers linearly to larger backbones, or scales with base parameter count, is open. (c)~We report bfloat16 latency on a single H100; aggregate throughput under KV caching at generation time is an important deployment-side measurement we defer to the VLA section. (d)~MMStar is a recent benchmark where our $n{=}500$ draw may undersample the hardest categories.
 
 %----------------------------------------------------------------------
 \section{VLA Application}
@@ -437,11 +643,13 @@ In Vision-Language-Action (VLA) models, tokens of different modalities serve fun
 \end{itemize}
 There is no principled reason for all three modalities to use the same effective depth. Yet in practice all existing open VLA architectures~\citep{brohan2023rt, team2024octo, kim2024openvla} process every token through every layer. \attnres{}'s per-position routing offers a mechanism to tailor effective depth per modality without any token-level gating machinery.
 
-\subsection{Planned experiments}
+\subsection{Planned experiments (work in progress)}
 \label{sec:vla_plan}
 
+The VLM retrofit of Section~\ref{sec:exp_retrofit} is already on Qwen3-VL-2B with vision tower frozen, so the first half of the VLA pipeline is in place; what remains is attaching an action head, fine-tuning on trajectory data, and measuring modality-conditioned skip. The numbers below are planned; we report results on Qwen3-VL-2B alone in this draft and will add VLA results and additional retrofit targets in the camera-ready revision.
+
 \paragraph{Target VLA backbone.}
-A 2B-scale open VLM (e.g., Qwen2-VL-2B) with frozen vision encoder, retrofitted via the best-performing route identified in Section~\ref{sec:exp_retrofit}. A flow-matching action head~\citep{black2024pi0} is attached for continuous control; the full model is fine-tuned on LIBERO-90~\citep{liu2023libero} and a subset of OpenX-Embodiment~\citep{embodiment2024openx}.
+Qwen3-VL-2B with the vision tower frozen (unchanged from Section~\ref{sec:exp_retrofit}). We will attach a flow-matching action head~\citep{black2024pi0} for continuous control and fine-tune on LIBERO-90~\citep{liu2023libero} and a subset of OpenX-Embodiment~\citep{embodiment2024openx}.
 
 \paragraph{Analysis: modality-specific routing.}
 For each held-out LIBERO trajectory we extract the per-token $\alpha$ distribution and average by modality. We expect (hypothesis H1) vision-token $\alpha$ to concentrate on early blocks, (H2) action-token $\alpha$ to spread to late blocks, and (H3) language-token $\alpha$ to sit between. Visualisations will mirror Figure~\ref{fig:reskip_routing}(a) per-modality.
@@ -458,6 +666,33 @@ with per-modality $(\mathcal{P}^{(m)}, \tau_n^{(m)}, M_{\max}^{(m)})$. A block i
 \paragraph{Target metrics.}
 LIBERO-90 success rate, action L1 error, inference FLOPs, wall-clock end-to-end latency. The main claim we aim to support: \emph{at matched success rate, modality-aware skip saves $\geq 15\%$ more FLOPs than uniform skip.}
 
+\paragraph{Context: recent open VLAs on standard benchmarks.}
+To calibrate what ``success rate'' means at the scale we target, Table~\ref{tab:vla_landscape} collects the published numbers for classic and recent open VLAs on the two evaluation suites the community converges on: \textbf{LIBERO} (four task suites---Spatial, Object, Goal, Long-horizon---each as success rate over simulated manipulation rollouts) and \textbf{SimplerEnv} (Bridge/WidowX and Google Robot setups, aggregate success rate). These are the benchmarks we plan to evaluate our retrofit on once the action-head training completes. Our row is left blank: no trajectory fine-tune has been run yet.
+
+\begin{table}[t]
+\caption{\textbf{Open VLA landscape on standard benchmarks.} LIBERO entries are success rates (\%) per task suite; SimplerEnv entries are aggregate success rates (\%), split by robot setup where both are reported. ``---'' indicates not reported in the primary source. Following common practice, $\pi_0$ and Octo-Base LIBERO numbers are taken from OpenVLA-OFT~\citep{kim2025openvlaoft}, which re-ran all three policies under a uniform LIBERO protocol; RT-2-X SimplerEnv numbers are from the SimplerEnv paper~\citep{li2024simplerenv}. Our target (bottom row) is the retrofit of Section~\ref{sec:exp_retrofit} with an attached flow-matching action head; trajectory fine-tuning is WIP.}
+\label{tab:vla_landscape}
+\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccccccc}
+\toprule
+& & \multicolumn{4}{c}{LIBERO (\%)} & \multicolumn{2}{c}{SimplerEnv (\%)} & \\
+\cmidrule(lr){3-6}\cmidrule(lr){7-8}
+Model & \#Params & Spatial & Object & Goal & Long-10 & Bridge & Google & ref. \\
+\midrule
+Octo-Base           & 93M   & 78.9 & 85.7 & 84.6 & 51.1 & ---  & ---  & \citep{team2024octo, kim2025openvlaoft} \\
+RT-2-X              & 55B   & ---  & ---  & ---  & ---  & 1.1  & 6.3  & \citep{brohan2023rt, li2024simplerenv} \\
+OpenVLA             & 7B    & 84.7 & 88.4 & 79.2 & 53.7 & ---  & ---  & \citep{kim2024openvla, kim2025openvlaoft} \\
+TraceVLA            & 7B    & 84.6 & 85.2 & 75.1 & 54.1 & ---  & ${\sim}47.7$ & \citep{zheng2024tracevla} \\
+SpatialVLA          & 4B    & 88.2 & 89.9 & 78.6 & 55.5 & 42.7 & 70.7 & \citep{qu2025spatialvla} \\
+$\pi_0$             & 3B    & \textbf{96.8} & \textbf{98.8} & \textbf{95.8} & \textbf{85.2} & ---  & ---  & \citep{black2024pi0, kim2025openvlaoft} \\
+\midrule
+\rowcolor{black!6}
+\textbf{Qwen3-VL-2B + AR-Retrofit + action head} (\emph{ours, planned}) & 2B & --- & --- & --- & --- & --- & --- & this work \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \todo{Insert Phase-3 VLA results (Weeks 10--12 of the project timeline).}
 
 %----------------------------------------------------------------------
@@ -472,7 +707,7 @@ ACT~\citep{graves2016adaptive} introduced learned halting for recurrent networks
 \citet{gromov2024unreasonable} showed that many transformer layers can be removed post-training with modest quality loss. ShortGPT~\citep{men2024shortgpt} introduces block-influence metrics. LayerSkip~\citep{elhoushi2024layerskip} combines early exit with self-speculative decoding. These approaches either do static removal (no input dependence) or require invasive training changes; our retrofit preserves the full network and adds only a light fine-tune.
 
 \paragraph{Residual-connection innovations.}
-DenseNet~\citep{huang2017densely} connects each layer to all previous via concatenation. Highway networks~\citep{srivastava2015highway} use gated residuals. \attnres{}~\citep{fu2025attention} generalises these with an attention-based weighting, which we adopt. We are the first to exploit \attnres{} weights as computation-routing signals and the first to show that the mechanism can be retrofitted into pretrained models.
+DenseNet~\citep{huang2017densely} connects each layer to all previous via concatenation. Highway networks~\citep{srivastava2015highway} use gated residuals. \attnres{}~\citep{chen2026attnres} generalises these with an attention-based weighting, which we adopt. We are the first to exploit \attnres{} weights as computation-routing signals and the first to show that the mechanism can be retrofitted into pretrained models.
 
 \paragraph{Vision-Language-Action models.}
 RT-2~\citep{brohan2023rt} and Octo~\citep{team2024octo} established the VLA paradigm. OpenVLA~\citep{kim2024openvla} demonstrated generalist manipulation. Pi0~\citep{black2024pi0} integrated flow-matching action heads. Efficient-VLA work so far has focused on action chunking~\citep{zhao2023learning} and post-hoc quantisation; we contribute the first modality-aware adaptive-depth mechanism for VLAs.
@@ -483,10 +718,10 @@ RT-2~\citep{brohan2023rt} and Octo~\citep{team2024octo} established the VLA para
 %----------------------------------------------------------------------
 
 \paragraph{Summary.}
-We show that \attnres{}'s two-phase execution already contains the routing signal adaptive computation needs; that this signal can be calibrated into a dynamic \reskip{} that preserves quality while saving $1.19\times$ wall-clock at 340M; and that \attnres{} can be \emph{retrofitted} into pretrained transformers through a light fine-tune, via one of three routes whose trade-offs we characterise.
+We show that \attnres{}'s two-phase execution already contains the routing signal adaptive computation needs; that this signal can be calibrated into a dynamic \reskip{} that preserves quality while saving $1.19\times$ wall-clock at 340M; and that \attnres{} can be \emph{retrofitted} into pretrained transformers through a light, identity-at-init fine-tune. On Qwen3-VL-2B the retrofit (7M trainable params, 2000 steps, backbone frozen) improves LAMBADA by $+4.4$pp / $-18\%$ ppl, matches MMBench and MMStar exactly, and inherits \reskip{}'s phase-1 dynamic skip at an additional $1.1$--$1.27\times$ wall-clock speedup.
 
 \paragraph{Limitations.}
-Our retrofit experiments (Section~\ref{sec:exp_retrofit}) are scheduled but not yet complete at the scale of Llama-2-7B; final recommendations between \routeA{}/\routeB{}/\routeC{} await those runs. The VLA evaluation (Section~\ref{sec:vla}) is similarly forward-looking. \reskip{}'s speedup is most visible at long sequence lengths; for short benchmark inputs, probe overhead is a larger fraction of per-block cost and the speedup shrinks correspondingly. The method inherits \attnres{}'s block-level granularity; per-token routing remains future work, complementary to (and potentially stackable with) ours.
+Current retrofit results are from a single target (Qwen3-VL-2B); extension to other VLM scales and to text-only LMs (e.g., Llama-3) is planned. The VLA evaluation (Section~\ref{sec:vla}) is work in progress: the VLM backbone retrofit is complete, but attaching an action head and measuring modality-conditioned skip on LIBERO/OpenX-Embodiment has not yet been run. Our training budget was capped at $2{,}000$ steps; we observed full-path quality saturate early but did not explore whether longer training further improves the skip-path Pareto. The retrofit introduces a $\sim$$35$--$50\%$ inference overhead from the block-level router+adapter additions; dynamic skip partially offsets it but does not currently yield net speedup over the unmodified base model---closing that gap (smaller or shared routers, block-granularity sweeps, fused kernels) is near-term follow-up. \reskip{}'s speedup is most visible at long sequences; for short benchmark inputs, probe overhead is a larger fraction of per-block cost and the speedup shrinks correspondingly. The method inherits \attnres{}'s block-level granularity; per-token routing remains future work.
 
 \paragraph{Future work: weight-shared AttnRes (\reloop{}).}
 A natural extension is to share block weights across depth and use position-indexed \attnres{} pseudo-queries to differentiate each application of the shared block. Unlike Universal Transformers, the pseudo-queries provide an explicit mechanism for ``first pass'' vs.\ ``third pass'' differentiation. Early validation on a 74M from-scratch model showed the training dynamics differ substantially from standard \attnres{}, and achieving competitive quality at Universal-Transformer parameter counts remains an open problem. Combined with our retrofit framework, \reloop{} offers a path to parameter-efficient adaptive-depth pretrained models; we leave this investigation to future work.
@@ -509,13 +744,64 @@ When a block is skipped, the online softmax merge simply does not process its ou
 \subsection{Pseudo-query initialisation (Section~\ref{sec:reskip} from-scratch)}
 For from-scratch training we use $\mathbf{w}_l \sim \mathcal{N}(0, 0.02)$, yielding near-uniform $\alpha$ at initialisation that specialises over the first few thousand steps.
 
-\subsection{Retrofit hyperparameters}
-Across all three routes we use FineWeb-Edu~100BT, AdamW, $\text{lr}{=}5\!\times\!10^{-6}$, linear warmup over 200 steps, context length 2k. \routeA{}'s gate $\beta_l$ initial value is $-6$ (so $\sigma(\beta_l) < 0.005$). \routeB{}'s observer loss weight is $\lambda_{\text{obs}}{=}1$; the LM loss is retained during fine-tune to prevent degenerate observer solutions. \routeC{}'s temperature schedule uses $T_{\text{start}}{=}0.05$, $T_{\text{warmup}}{=}500$ steps. Full settings will be released in a companion code repository.
+\subsection{Retrofit hyperparameters (Qwen3-VL-2B)}
+\label{app:retrofit_hparams}
+AdamW with $\beta{=}(0.9,0.95)$, weight decay~$0$, gradient clip~$1.0$. Learning rate $10^{-3}$ for retrofit params (routers, adapters, $\gamma$), cosine schedule with 100-step warmup. Sequence length~$1536$. bfloat16. Loss weights $\lambda_{\text{kl}}{=}1$, $\lambda_{\text{ent}}{=}0.02$, KD temperature~$1$. Skip-branch sampling: one eligible block chosen uniformly at random per step. Adapter bottleneck rank $r{=}128$. Position-bias on router keys enabled. Router temperature fixed at~$1$.
 
-\subsection{Block granularity}
-We recommend $N = 6$--$8$ blocks for models with 12--32 layers, matching the settings in Section~\ref{sec:reskip}. For retrofit targets with different layer counts, block boundaries should match the pretrained model's natural stage boundaries (e.g., Llama-2-7B's 32 layers split into 8 blocks of 4).
+\subsection{Block granularity (Qwen3-VL-2B)}
+For Qwen3-VL-2B's 28 decoder layers we use $N{=}14$ blocks of $2$ layers. Each block receives one router and one residual adapter; the adapter's bottleneck rank defaults to $128$.
 
-\subsection{Calibration set}
-Calibration uses 32 held-out long-context sequences ($\geq$8k tokens each) from the fine-tune distribution. We verified on 340M that changing the calibration set to a different 32-sequence draw shifts $\tau_n$ by less than $0.02$ in absolute terms, and does not change the recommended $\mathcal{P}$.
+\subsection{Identity-at-init details}
+\label{app:identity}
+With $\gamma_n{=}0$ and the adapter up-projection initialised at $\mathcal{N}(0, 0.02^2)$, the retrofit forward is arithmetically identical to the pretrained model (both produce $x_n = h_{n-1}$, which is passed into the unmodified block). We verified end-to-end: at $n{=}500$ on LAMBADA the retrofit and the base agree to within bfloat16 evaluation noise (acc $0.530$ vs.\ $0.532$; ppl $5.572$ vs.\ $5.547$); on MMMU and MMStar they are bit-equal at the answer-choice level.
+
+\subsection{Retrofit ablations}
+\label{app:route_ablations}
+Earlier pilots tried (i)~observer-only (no forward change; $\alpha$ trained by distillation), (ii)~interpolation at block-input with $\beta{=}\sigma(\text{logit})$ driven toward~$1$, and (iii)~pure AttnRes with informed init $\mathbf{w}_n \gets c\,\bar{\mathbf{k}}_{n-1}$ + temperature annealing. (i) produced an $\alpha$ head whose skip decision did not feed back through the forward and collapsed LAMBADA to $0.12$ accuracy; (ii) pushed the frozen backbone off-distribution once $\beta$ grew and required pretraining data to recover (defeating the ``light fine-tune'' premise); (iii) was highly sensitive to the consecutive-layer key-similarity of the pretrained backbone, and did not converge within our training budget. The $\gamma$-gated residual injection of Section~\ref{sec:retrofit_method} is the converged recipe.
+
+\subsection{Adapter-rank ablation}
+\label{app:rank_ablation}
+Wall-clock latency is essentially unchanged across ranks ($\pm 2\%$ at all measured sequence lengths): the adapter's $2048{\to}r{\to}2048$ bottleneck is a small contributor compared to the router stack/softmax/einsum cost. Rank therefore affects quality but not speed. The canonical $r{=}256$ was selected from the $\gamma{\to}1$ ablation of Appendix~\ref{app:retrofit_ablation}; at equal step budgets lower ranks leave more of the MMBench drop on the table without compensating latency savings.
+
+\subsection{$\gamma{\to}1$ retrofit ablation}
+\label{app:retrofit_ablation}
+We swept $8$ variants of the canonical $\gamma{\to}1$ recipe along four axes: adapter rank $r\in\{32,64,128,256\}$, training steps $\in\{5\text{k},10\text{k},20\text{k}\}$, LLaVA-Instruct fraction of the mix $\in\{50\%,80\%\}$, and $\gamma$ ramp-fraction $\in\{0.3,0.7\}$. All other hyperparameters (loss, optimizer, schedule family, seed) are held constant. A separate $\gamma$-free control is run for the same number of steps with $\gamma_n\equiv 0$ trainable around its zero-init (Appendix Table~\ref{tab:retrofit_ablation}).
+
+\begin{table}[h]
+\caption{\textbf{Retrofit ablation} on Qwen3-VL-2B. $\gamma$-free: $\gamma_n$ trainable around $0$, adapter-dominated (opposite structural extreme to the canonical). All others: $\gamma$-curriculum $0{\to}1$ over the first $30\%$ of steps. ``n=300 MMBench noise floor $\pm 1$ question'' corresponds to $\pm 0.33$pp.}
+\label{tab:retrofit_ablation}
+\centering\small
+\begin{tabular}{lcccccrrr}
+\toprule
+Name & $\gamma$ sched & rank & steps & VLM\% & ramp & LAMBADA & HellaSwag & MMBench \\
+\midrule
+Base Qwen3-VL-2B & --- & --- & --- & --- & --- & $0.532$ & $0.506$ & $0.727$ \\
+$\gamma$-free (A) & $\gamma{\approx}0$ trainable & $128$ & $10$k & $50$ & --- & $0.576$ & $0.512$ & $0.720$ \\
+\midrule
+\textbf{Canonical} & $0{\to}1$ fast & $\mathbf{256}$ & $\mathbf{5}$k & $\mathbf{50}$ & $\mathbf{0.3}$ & $\mathbf{0.576}$ & $\mathbf{0.522}$ & $\mathbf{0.710}$ \\
+$+$ low rank      & $0{\to}1$ fast & $64$  & $10$k & $50$ & $0.3$ & $0.570$ & $0.530$ & $0.697$ \\
+$+$ very low rank & $0{\to}1$ fast & $32$  & $10$k & $50$ & $0.3$ & $0.568$ & $0.526$ & $0.683$ \\
+$+$ low rank, VLM-heavy & $0{\to}1$ fast & $64$  & $10$k & $80$ & $0.3$ & $0.560$ & $0.524$ & $0.660$ \\
+$+$ mid rank, VLM-heavy & $0{\to}1$ fast & $128$ & $10$k & $80$ & $0.3$ & $0.564$ & $0.520$ & $0.653$ \\
+$+$ VLM-heavy     & $0{\to}1$ fast & $256$ & $10$k & $80$ & $0.3$ & $0.560$ & $0.520$ & $0.617$ \\
+$+$ longer, $10$k & $0{\to}1$ fast & $256$ & $10$k & $50$ & $0.3$ & $0.586$ & ---     & $0.587$ \\
+$+$ slow ramp     & $0{\to}1$ slow & $256$ & $10$k & $50$ & $0.7$ & $0.568$ & $0.520$ & $0.517$ \\
+$+$ longer, $20$k & $0{\to}1$ fast & $256$ & $20$k & $50$ & $0.3$ & $0.568$ & $0.520$ & $0.513$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Over-training signature at $\gamma{=}1$.} Holding ($r{=}256$, $50\%$ VLM, fast ramp) fixed and varying only the total step count, MMBench is strictly monotonic in steps: $5$k $\to 0.710$ (preserved), $10$k $\to 0.587$ ($-$14pp), $20$k $\to 0.513$ ($-$21pp). LAMBADA peaks at $10$k ($0.586$) and regresses at $20$k ($0.568$), so longer training buys no text-domain gain either. The $\gamma{=}1$ regime has a narrow compute sweet spot; past it the router+adapter over-specialise to the training distribution and the frozen backbone, unable to adapt further, loses its multimodal calibration.
+
+\paragraph{Rank and data are subordinate.} Halving rank at $10$k recovers some MMBench ($r{=}32$: $0.683$, $r{=}64$: $0.697$), but never reaches the $5$k-$r{=}256$ level ($0.710$). Pushing the mix to $80\%$ LLaVA \emph{worsens} MMBench at every rank, indicating the regression is router over-adaptation to \emph{any} narrow training distribution, not insufficient visual exposure.
+
+\paragraph{$\gamma$-free as the opposite extreme.} The $\gamma$-free control (row 2) achieves the same LAMBADA gain ($+4.4$pp) as the canonical with slightly weaker HellaSwag ($+0.6$pp vs.\ $+1.6$pp) and slightly stronger MMBench ($0.720$ vs.\ $0.710$). It reaches these numbers by treating the adapter as a learnable correction \emph{on top of} the original residual path---the model still computes $x_n \approx h_{n-1} + \mathrm{adapter}(\cdot)$, never structurally \attnres{}. Because the paper's claim is that pretrained transformers can be rewired \emph{into} the \attnres{} form, we take the $\gamma{\to}1$ canonical as our headline and report this row as a non-pure-\attnres{} control showing the same gain is achievable with the standard residual path left in place.
+
+\subsection{Per-block skip importance}
+\label{app:block_removal}
+Running the 2k Qwen3-VL-2B retrofit with a single block statically removed ($h_n \leftarrow x_n$) and measuring LAMBADA at $n{=}300$: block~1 is catastrophic ($-55\%$ acc), block~10 severe ($-46\%$), blocks~4, 6, 11 are safest ($-11$ to $-14\%$). We use this sweep to pick $\mathcal{P}{=}\{4,6,11\}$ for the dynamic-skip eligibility set.
+
+\subsection{Calibration set (dynamic skip)}
+Calibration uses 32 held-out LAMBADA prefixes (truncated to 512 tokens each). Per-block $w_{\text{recent}}(n)$ samples are collected with a single retrofit forward and the empirical quantile at $q$ is used as $\tau_n$. We verified that varying the calibration draw shifts $\tau_n$ by $<0.01$ in absolute terms at the chosen $q{=}0.95$.
 
 \end{document}

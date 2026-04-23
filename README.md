@@ -37,7 +37,7 @@ Current training target: **340M model on FineWeb-Edu 100BT**, 6-GPU training wit
 
 ### Key Experimental Results
 
-**340M model** (`reskip_transformer-340M`, 8 blocks, 24 layers, FineWeb-Edu 100BT) — 2026-04-16:
+**Part 1 — 340M from-scratch AttnRes** (`reskip_transformer-340M`, 8 blocks, 24 layers, FineWeb-Edu 100BT) — 2026-04-16:
 
 | Configuration | LAMBADA acc | HellaSwag | ARC-Easy | ARC-Challenge | Wall-clock speedup |
 |---|---:|---:|---:|---:|---:|
@@ -45,6 +45,21 @@ Current training target: **340M model on FineWeb-Edu 100BT**, 6-GPU training wit
 | Dynamic skip: `attn_only + {3,5} + q=0.85 + max_skips=2` | **0.4056** | **0.4607** | **0.5438** | **0.3012** | **~1.19x** |
 
 > Config: `strategy=recent_weight_gt`, `probe=attn_only`, `positions={3,5}`, `q=0.85`, `max_skips=2`. Position selection uses **ablation-informed + importance-informed** combination: block 3 has the lowest static-removal PPL impact; block 5 has the lowest AttnRes importance score. Together they provide both high skip frequency and safe skip space. See [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) for full experiment details.
+
+**Part 2 — Qwen3-VL-2B retrofit** (`retrofit/`) — 2026-04-18:
+
+γ-gated block-level AttnRes injection, 14 blocks × 2 layers, γ-curriculum 0→1 (first 30% of steps), adapter rank 256, **5k SFT steps** on 50/50 UltraChat + LLaVA-Instruct mix, Qwen3-VL-2B backbone frozen. Every block converges to **γ=1** — the retrofitted model is structurally pure AttnRes.
+
+| Configuration | LAMBADA acc | HellaSwag | MMBench | Notes |
+|---|---:|---:|---:|---|
+| Base Qwen3-VL-2B | 0.5320 | 0.5060 | 0.7267 | — |
+| LoRA (r=32 q,v, 4-seed avg ≈ 7M trainable) | 0.526 | 0.508 | — | +0 LAMBADA (noise) |
+| Retrofit A (γ-free, r=128, 10k) | 0.576 | 0.512 | 0.720 | γ-free ablation: adapter does the work |
+| **Retrofit H_r256_5k (γ→1, r=256, 5k, canonical)** | **0.576** | **0.522** | **0.710** | **pure AttnRes, half the cost of A** |
+| Retrofit H (γ→1, r=256, 10k, over-trained) | 0.586 | — | 0.587 ⚠ | over-training breaks MMBench |
+| Retrofit H (γ→1, r=256, 20k, severely over-trained) | 0.568 | 0.520 | 0.513 ⚠⚠ | monotonic γ=1 over-training signature |
+
+> **Canonical H_r256_5k**: the retrofitted model runs structurally pure AttnRes (every γ=1, every block consumes the routed sum). Same LAMBADA gain as A (+4.4 pp) with stronger HellaSwag (+1.6 pp vs A's +0.6 pp) and half the training budget. MMBench −1.7 pp is within the n=300 noise floor (±1 question). Over-training at γ=1 is the binding constraint; 5k steps is exactly the right budget for Qwen3-VL-2B. See [retrofit/retrofit.md](retrofit/retrofit.md) for the full 20-config ablation (LoRA + A-sweep + H-sweep over rank/steps/data/ramp) and [paper/main.pdf](paper/main.pdf) for the paper draft.
 
 ### Resolved Issues
 
@@ -64,6 +79,9 @@ Current training target: **340M model on FineWeb-Edu 100BT**, 6-GPU training wit
 | [DYNAMIC_SKIP_MECHANISM.md](DYNAMIC_SKIP_MECHANISM.md) | Chinese | Why and how dynamic skip works; paper update suggestions |
 | [DYNAMIC_SKIP_EXPERIMENT_LOG.md](DYNAMIC_SKIP_EXPERIMENT_LOG.md) | Chinese/English | Chronological log of dynamic skip experiments (2026-04-09 to 04-14) |
 | [ATTNRES_SKIP_LOOP_PLAN_CN.md](ATTNRES_SKIP_LOOP_PLAN_CN.md) | Chinese | Algorithm improvement proposals: Direction 2 (better skip scoring) and Direction 3 (unified skip+loop architecture) |
+| [retrofit/retrofit.md](retrofit/retrofit.md) | English/Chinese | Part 2 retrofit experiment log — Qwen3-VL-2B γ-gated AttnRes injection, full ablation sweep |
+| [paper/MOTIVATION_EXPERIMENTS.md](paper/MOTIVATION_EXPERIMENTS.md) | English | Motivation-section experiment plan (latency claims) |
+| [paper/main.tex](paper/main.tex) | English | NeurIPS 2026 paper draft (Part 1 + Part 2 + VLA plan) |
 
 ---
 

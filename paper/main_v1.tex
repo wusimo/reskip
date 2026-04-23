@@ -71,7 +71,7 @@ Several lines of work address this inefficiency. \textit{Early exit} methods~\ci
 
 All these methods share a common limitation: they require \emph{additional} mechanisms---exit classifiers, importance estimators, routing networks, or auxiliary losses---that are external to the core transformer computation. This creates a fundamental tension: the routing signal is learned separately from the representations it routes.
 
-\textbf{Our key insight} is that Attention Residuals~\citep{fu2025attention}, which replace fixed residual connections with learned attention over the depth dimension, \emph{already provide} the routing signal needed for adaptive computation. The \attnres{} mechanism learns input-dependent weights $\alpha_{i \to l}$ that determine how much each layer~$l$ attends to each previous layer~$i$'s output. These weights are:
+\textbf{Our key insight} is that Attention Residuals~\citep{chen2026attnres}, which replace fixed residual connections with learned attention over the depth dimension, \emph{already provide} the routing signal needed for adaptive computation. The \attnres{} mechanism learns input-dependent weights $\alpha_{i \to l}$ that determine how much each layer~$l$ attends to each previous layer~$i$'s output. These weights are:
 \begin{enumerate}
     \item \textbf{Input-dependent}: Different inputs produce different depth-wise attention patterns
     \item \textbf{Decoupled from forward computation}: The pseudo-query $\mathbf{w}_l$ can be evaluated before executing layer~$l$
@@ -106,7 +106,7 @@ This is a \emph{fixed, uniform} combination---every layer's contribution has equ
 
 \subsection{Attention Residuals}
 
-\attnres{}~\citep{fu2025attention} replaces the fixed residual with a \emph{learned attention over depth}. Each layer $l$ has a pseudo-query $\mathbf{w}_l \in \R^d$ that attends over all previous layer outputs $\{\mathbf{h}_0, \ldots, \mathbf{h}_{l-1}\}$:
+\attnres{}~\citep{chen2026attnres} replaces the fixed residual with a \emph{learned attention over depth}. Each layer $l$ has a pseudo-query $\mathbf{w}_l \in \R^d$ that attends over all previous layer outputs $\{\mathbf{h}_0, \ldots, \mathbf{h}_{l-1}\}$:
 \begin{equation}
     \alpha_{i \to l} = \frac{\exp(\mathbf{w}_l^\top \mathbf{k}_i / \sqrt{d})}{\sum_{j=0}^{l-1} \exp(\mathbf{w}_l^\top \mathbf{k}_j / \sqrt{d})}
     \label{eq:attnres_weights}
@@ -147,7 +147,7 @@ where $\mathbf{k}_i = W_K \mathbf{h}_i$ is the key projection of layer $i$'s out
 
 \subsection{Motivation and two-phase execution}
 
-\citet{gromov2024unreasonable} showed that a significant fraction of transformer layers can be pruned with minimal performance loss. \citet{fu2025attention} observed that \attnres{} weights are highly concentrated: most layers attend overwhelmingly to their immediate predecessor and the embedding, with sparse off-diagonal connections. We go one step further and observe that \attnres{} block execution is \emph{naturally two-phase}: before block~$n$ runs, the model already computes attention over all previously completed block outputs $\{\mathbf{h}_0, \ldots, \mathbf{h}_{n-1}\}$ to form the block's input. This means the per-input routing statistics $\alpha_{\cdot \to n}$ are available \emph{as a pre-execution signal}, at near-zero additional cost. We exploit this structure to make a per-input skip decision for each block without any auxiliary classifier or training loss.
+\citet{gromov2024unreasonable} showed that a significant fraction of transformer layers can be pruned with minimal performance loss. \citet{chen2026attnres} observed that \attnres{} weights are highly concentrated: most layers attend overwhelmingly to their immediate predecessor and the embedding, with sparse off-diagonal connections. We go one step further and observe that \attnres{} block execution is \emph{naturally two-phase}: before block~$n$ runs, the model already computes attention over all previously completed block outputs $\{\mathbf{h}_0, \ldots, \mathbf{h}_{n-1}\}$ to form the block's input. This means the per-input routing statistics $\alpha_{\cdot \to n}$ are available \emph{as a pre-execution signal}, at near-zero additional cost. We exploit this structure to make a per-input skip decision for each block without any auxiliary classifier or training loss.
 
 \subsection{Method}
 \label{sec:reskip_method}
@@ -441,7 +441,7 @@ This connects to the Energetic Variational Approach (EVA) perspective: each bloc
 
 \textbf{Vision-Language-Action models.} RT-2~\citep{brohan2023rt} and Octo~\citep{team2024octo} established the VLA paradigm. OpenVLA~\citep{kim2024openvla} demonstrated generalist manipulation. Recent work on efficient VLAs includes action chunking~\citep{zhao2023learning} and model compression. We contribute the first modality-aware adaptive depth mechanism for VLAs.
 
-\textbf{Residual connection innovations.} DenseNet~\citep{huang2017densely} connects each layer to all previous layers via concatenation. Highway networks~\citep{srivastava2015highway} use gated residuals. \attnres{}~\citep{fu2025attention} generalizes these with attention-based weighting. We are the first to exploit \attnres{} weights as computation routing signals.
+\textbf{Residual connection innovations.} DenseNet~\citep{huang2017densely} connects each layer to all previous layers via concatenation. Highway networks~\citep{srivastava2015highway} use gated residuals. \attnres{}~\citep{chen2026attnres} generalizes these with attention-based weighting. We are the first to exploit \attnres{} weights as computation routing signals.
 
 %----------------------------------------------------------------------
 \section{Discussion and Future Work}
