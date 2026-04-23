@@ -33,3 +33,21 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+# Build / packaging artifacts
+build/
+
+# Training logs and checkpoints (too large for git)
+logs/
+flame/logs/
+flame/saves/
+starVLA/logs/
+starVLA/results/
+starVLA/playground/Datasets/
+starVLA/playground/Pretrained_models/
+rechange/outputs/
+
+# Local tool config
+.claude/
+.codex
+
