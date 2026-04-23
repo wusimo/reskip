@@ -101,10 +101,6 @@ class Qwenvl_OFT(baseframework):
             num_hidden_layers=self.qwen_vl_interface.get_num_hidden_layers(),
         )
 
-    def set_attnres_inference(self, **kwargs) -> None:
-        if self.attnres_adapter is not None:
-            self.attnres_adapter.set_inference_config(**kwargs)
-
     def _encode_backbone(
         self,
         qwen_inputs: dict,
@@ -112,28 +108,34 @@ class Qwenvl_OFT(baseframework):
         return_routing_info: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, dict]:
-        use_true_backbone_skip = bool(kwargs.get("enable_skipping")) and kwargs.get("skip_mode", "none") != "none"
-        if self.attnres_adapter is not None and use_true_backbone_skip and hasattr(self.qwen_vl_interface, "forward_with_attnres_skip"):
+        # When adapter is attached, ALWAYS route through forward_with_attnres_skip
+        # so that per-block AttnRes participates in the forward graph, regardless
+        # of whether skipping is currently enabled. Previously a non-skip
+        # training run fell through to the stock Qwen3-VL forward + an observer
+        # adapter that only patched last_hidden, leaving 13/14 routers/adapters
+        # disconnected from the loss.
+        if self.attnres_adapter is not None and hasattr(self.qwen_vl_interface, "forward_with_attnres_skip"):
             qwenvl_outputs, routing_info = self.qwen_vl_interface.forward_with_attnres_skip(
                 self.attnres_adapter,
                 **qwen_inputs,
                 output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
-                enable_skipping=bool(kwargs.get("enable_skipping")),
-                skip_mode=kwargs.get("skip_mode", "none"),
-                uniform_skip_threshold=kwargs.get("uniform_skip_threshold"),
-                vision_skip_threshold=kwargs.get("vision_skip_threshold"),
-                language_skip_threshold=kwargs.get("language_skip_threshold"),
-                action_skip_threshold=kwargs.get("action_skip_threshold"),
-                action_token_id=self.action_token_id,
+                use_cache=bool(kwargs.get("use_cache", False)),
+                enable_skipping=bool(kwargs.get("enable_skipping", False)),
+                dynamic_skip_config=kwargs.get("dynamic_skip_config"),
             )
-            last_hidden = qwenvl_outputs.hidden_states[-1]
+            # Qwen3-VL returns last_hidden_state at .last_hidden_state, but
+            # CausalLMOutputWithPast also exposes .hidden_states when requested.
+            last_hidden = getattr(qwenvl_outputs, "last_hidden_state", None)
+            if last_hidden is None:
+                last_hidden = qwenvl_outputs.hidden_states[-1]
             if not return_routing_info:
                 routing_info.pop("routing_weights", None)
                 routing_info.pop("executed_routing_weights", None)
             return last_hidden, routing_info
 
+        # No adapter → plain Qwen3-VL forward.
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **qwen_inputs,
@@ -142,26 +144,7 @@ class Qwenvl_OFT(baseframework):
                 return_dict=True,
             )
             last_hidden = qwenvl_outputs.hidden_states[-1]
-
-        routing_info = {}
-        if self.attnres_adapter is not None:
-            routing_info = self.attnres_adapter(
-                qwenvl_outputs.hidden_states,
-                input_ids=qwen_inputs.get("input_ids"),
-                image_token_ids=self.qwen_vl_interface.get_vision_token_ids(),
-                action_token_id=self.action_token_id,
-                action_token_range=self.qwen_vl_interface.get_action_token_range(),
-                enable_skipping=kwargs.get("enable_skipping"),
-                skip_mode=kwargs.get("skip_mode"),
-                uniform_skip_threshold=kwargs.get("uniform_skip_threshold"),
-                vision_skip_threshold=kwargs.get("vision_skip_threshold"),
-                language_skip_threshold=kwargs.get("language_skip_threshold"),
-                action_skip_threshold=kwargs.get("action_skip_threshold"),
-                return_routing_info=return_routing_info,
-            )
-            last_hidden = routing_info["hidden_states"]
-
-        return last_hidden, routing_info
+        return last_hidden, {}
 
     def forward(
         self,
@@ -198,7 +181,7 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        return_routing_info = bool(kwargs.get("return_routing_info", False))
+        return_routing_info = bool(kwargs.pop("return_routing_info", False))
         last_hidden, routing_info = self._encode_backbone(
             qwen_inputs,
             return_routing_info=return_routing_info,
@@ -227,8 +210,8 @@ class Qwenvl_OFT(baseframework):
                 "attnres_flops_ratio": routing_info["flops_ratio"],
                 "attnres_effective_block_ratio": routing_info["effective_block_ratio"],
                 "attnres_blocks_executed": routing_info["num_blocks_executed"],
-                "attnres_skip_mode": routing_info["skip_mode"],
                 "attnres_backbone_compute_preserved": routing_info["backbone_compute_preserved"],
+                "attnres_skipped_blocks": routing_info.get("skipped_blocks", []),
             })
             if return_routing_info:
                 result["attnres_routing"] = routing_info
@@ -268,7 +251,7 @@ class Qwenvl_OFT(baseframework):
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        return_routing_info = bool(kwargs.get("return_routing_info", False))
+        return_routing_info = bool(kwargs.pop("return_routing_info", False))
         last_hidden, routing_info = self._encode_backbone(
             qwen_inputs,
             return_routing_info=return_routing_info,
@@ -286,12 +269,12 @@ class Qwenvl_OFT(baseframework):
         result = {"normalized_actions": normalized_actions}
         if routing_info:
             result.update({
-                "attnres_flops_ratio": routing_info["flops_ratio"],
-                "attnres_effective_block_ratio": routing_info["effective_block_ratio"],
-                "attnres_blocks_executed": routing_info["num_blocks_executed"],
-                "attnres_skip_mode": routing_info["skip_mode"],
-                "attnres_keep_mask": routing_info["keep_mask"],
-                "attnres_backbone_compute_preserved": routing_info["backbone_compute_preserved"],
+                "attnres_flops_ratio": routing_info.get("flops_ratio", 1.0),
+                "attnres_effective_block_ratio": routing_info.get("effective_block_ratio", 1.0),
+                "attnres_blocks_executed": routing_info.get("num_blocks_executed", -1),
+                "attnres_skipped_blocks": routing_info.get("skipped_blocks", []),
+                "attnres_keep_mask": routing_info.get("keep_mask", None),
+                "attnres_backbone_compute_preserved": routing_info.get("backbone_compute_preserved", True),
             })
             if return_routing_info:
                 result["attnres_routing"] = routing_info

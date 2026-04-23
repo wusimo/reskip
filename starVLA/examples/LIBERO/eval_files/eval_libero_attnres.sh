@@ -18,11 +18,10 @@ task_suite_name=libero_goal
 num_trials_per_task=50
 video_out_path="results/${task_suite_name}/attnres_eval"
 enable_skipping=false
-skip_mode=none
-uniform_skip_threshold=0.01
-vision_skip_threshold=0.02
-language_skip_threshold=0.01
-action_skip_threshold=0.005
+# Optional JSON thresholds produced by retrofit/calibrate_vla_thresholds.py;
+# leave empty to run pure full-path AttnRes (no skip).
+dyn_skip_config_path=""
+use_cache=true
 
 ${LIBERO_Python} ./examples/LIBERO/eval_files/eval_libero.py \
   --args.pretrained-path ${your_ckpt} \
@@ -32,8 +31,5 @@ ${LIBERO_Python} ./examples/LIBERO/eval_files/eval_libero.py \
   --args.num-trials-per-task "$num_trials_per_task" \
   --args.video-out-path "$video_out_path" \
   --args.enable-skipping ${enable_skipping} \
-  --args.skip-mode ${skip_mode} \
-  --args.uniform-skip-threshold ${uniform_skip_threshold} \
-  --args.vision-skip-threshold ${vision_skip_threshold} \
-  --args.language-skip-threshold ${language_skip_threshold} \
-  --args.action-skip-threshold ${action_skip_threshold}
+  --args.dyn-skip-config-path "${dyn_skip_config_path}" \
+  --args.use-cache ${use_cache}

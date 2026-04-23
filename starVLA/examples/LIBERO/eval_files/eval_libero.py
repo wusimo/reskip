@@ -54,11 +54,10 @@ class Args:
 
     job_name: str = "test"
     enable_skipping: bool = False
-    skip_mode: str = "none"
-    uniform_skip_threshold: float = 0.01
-    vision_skip_threshold: float = 0.02
-    language_skip_threshold: float = 0.01
-    action_skip_threshold: float = 0.005
+    # Optional JSON path holding retrofit-style {"thresholds": {...}, "eligible_blocks": [...], "max_skips": N}.
+    # See retrofit/calibrate_vla_thresholds.py for how to produce one.
+    dyn_skip_config_path: str = ""
+    use_cache: bool = True
     return_routing_info: bool = False
 
 
@@ -91,17 +90,25 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
+    dyn_skip_cfg = None
+    if args.dyn_skip_config_path:
+        with open(args.dyn_skip_config_path) as f:
+            loaded = json.load(f)
+        # JSON keys are strings; coerce thresholds back to int-indexed dict.
+        thr = {int(k): float(v) for k, v in (loaded.get("thresholds") or {}).items()}
+        dyn_skip_cfg = {
+            "thresholds": thr,
+            "eligible_blocks": set(loaded["eligible_blocks"]) if loaded.get("eligible_blocks") is not None else None,
+            "max_skips": loaded.get("max_skips"),
+        }
     client_model = ModelClient(
         policy_ckpt_path=args.pretrained_path, # to get unnormalization stats
         host=args.host,
         port=args.port,
         image_size=args.resize_size,
         enable_skipping=args.enable_skipping,
-        skip_mode=args.skip_mode,
-        uniform_skip_threshold=args.uniform_skip_threshold,
-        vision_skip_threshold=args.vision_skip_threshold,
-        language_skip_threshold=args.language_skip_threshold,
-        action_skip_threshold=args.action_skip_threshold,
+        dynamic_skip_config=dyn_skip_cfg,
+        use_cache=args.use_cache,
         return_routing_info=args.return_routing_info,
     )
 

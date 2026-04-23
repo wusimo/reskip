@@ -210,5 +210,7 @@ def start_debugpy_once():
     start_debugpy_once._started = True
 
 if __name__ == "__main__":
-    start_debugpy_once()
+    import os
+    if os.environ.get("DEBUGPY", "0") == "1":
+        start_debugpy_once()
     main()

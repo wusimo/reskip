@@ -32,11 +32,8 @@ class ModelClient:
         host="0.0.0.0",
         port=10095,
         enable_skipping: bool = False,
-        skip_mode: str = "none",
-        uniform_skip_threshold: float = 0.01,
-        vision_skip_threshold: float = 0.02,
-        language_skip_threshold: float = 0.01,
-        action_skip_threshold: float = 0.005,
+        dynamic_skip_config: Optional[dict] = None,
+        use_cache: bool = True,
         return_routing_info: bool = False,
     ) -> None:
         
@@ -69,11 +66,8 @@ class ModelClient:
         self.action_norm_stats = self.get_action_stats(self.unnorm_key, policy_ckpt_path=policy_ckpt_path)
         self.action_chunk_size = self.get_action_chunk_size(policy_ckpt_path=policy_ckpt_path)
         self.enable_skipping = enable_skipping
-        self.skip_mode = skip_mode
-        self.uniform_skip_threshold = uniform_skip_threshold
-        self.vision_skip_threshold = vision_skip_threshold
-        self.language_skip_threshold = language_skip_threshold
-        self.action_skip_threshold = action_skip_threshold
+        self.dynamic_skip_config = dynamic_skip_config
+        self.use_cache = use_cache
         self.return_routing_info = return_routing_info
         
 
@@ -122,11 +116,8 @@ class ModelClient:
             "use_ddim": self.use_ddim,
             "num_ddim_steps": self.num_ddim_steps,
             "enable_skipping": self.enable_skipping,
-            "skip_mode": self.skip_mode,
-            "uniform_skip_threshold": self.uniform_skip_threshold,
-            "vision_skip_threshold": self.vision_skip_threshold,
-            "language_skip_threshold": self.language_skip_threshold,
-            "action_skip_threshold": self.action_skip_threshold,
+            "dynamic_skip_config": self.dynamic_skip_config,
+            "use_cache": self.use_cache,
             "return_routing_info": self.return_routing_info,
         }
         
@@ -135,15 +126,17 @@ class ModelClient:
         if step % action_chunk_size == 0:
             response = self.client.predict_action(vla_input)
             try:
-                normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        
+                normalized_actions = response["data"]["normalized_actions"] # B, chunk, D
             except KeyError:
                 print(f"Response data: {response}")
-                raise KeyError(f"Key 'normalized_actions' not found in response data: {response['data'].keys()}")
-            
-            normalized_actions = normalized_actions[0]    
+                raise KeyError(f"Key 'normalized_actions' not found in response data: {response.get('data', {}).keys()}")
+
+            normalized_actions = normalized_actions[0]
             self.raw_actions = self.unnormalize_actions(normalized_actions=normalized_actions, action_norm_stats=self.action_norm_stats)
-        
-        raw_actions = self.raw_actions[step % action_chunk_size][None]    
+            # Cache for routing-info readout on subsequent steps within the chunk
+            self._last_response = response
+
+        raw_actions = self.raw_actions[step % action_chunk_size][None]
 
         raw_action = {
             "world_vector": np.array(raw_actions[0, :3]),
@@ -152,17 +145,18 @@ class ModelClient:
         }
 
         result = {"raw_action": raw_action}
+        last_resp = getattr(self, "_last_response", {})
         for key in (
             "attnres_flops_ratio",
             "attnres_effective_block_ratio",
             "attnres_blocks_executed",
-            "attnres_skip_mode",
+            "attnres_skipped_blocks",
             "attnres_keep_mask",
             "attnres_backbone_compute_preserved",
             "attnres_routing",
         ):
-            if key in response.get("data", {}):
-                result[key] = response["data"][key]
+            if key in last_resp.get("data", {}):
+                result[key] = last_resp["data"][key]
         return result
 
     @staticmethod

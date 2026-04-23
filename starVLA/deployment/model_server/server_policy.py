@@ -22,15 +22,9 @@ def main(args) -> None:
 
     if args.use_bf16: # False
         vla = vla.to(torch.bfloat16)
-    if hasattr(vla, "set_attnres_inference"):
-        vla.set_attnres_inference(
-            enable_skipping=args.enable_skipping,
-            skip_mode=args.skip_mode,
-            uniform_skip_threshold=args.uniform_skip_threshold,
-            vision_skip_threshold=args.vision_skip_threshold,
-            language_skip_threshold=args.language_skip_threshold,
-            action_skip_threshold=args.action_skip_threshold,
-        )
+    # Skip config (enable_skipping / dynamic_skip_config / use_cache) is now
+    # threaded per-request from the client via vla_input; no server-side
+    # pre-configuration of the adapter needed.
     vla = vla.to("cuda").eval()
 
     hostname = socket.gethostname()
@@ -43,17 +37,7 @@ def main(args) -> None:
         host="0.0.0.0",
         port=args.port,
         idle_timeout=args.idle_timeout,
-        metadata={
-            "env": "simpler_env",
-            "attnres": {
-                "enable_skipping": args.enable_skipping,
-                "skip_mode": args.skip_mode,
-                "uniform_skip_threshold": args.uniform_skip_threshold,
-                "vision_skip_threshold": args.vision_skip_threshold,
-                "language_skip_threshold": args.language_skip_threshold,
-                "action_skip_threshold": args.action_skip_threshold,
-            },
-        },
+        metadata={"env": "simpler_env"},
     )
     logging.info("server running ...")
     server.serve_forever()
@@ -65,12 +49,6 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout" , type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
-    parser.add_argument("--enable_skipping", action="store_true")
-    parser.add_argument("--skip_mode", type=str, default="none", choices=["none", "uniform", "modality_aware"])
-    parser.add_argument("--uniform_skip_threshold", type=float, default=0.01)
-    parser.add_argument("--vision_skip_threshold", type=float, default=0.02)
-    parser.add_argument("--language_skip_threshold", type=float, default=0.01)
-    parser.add_argument("--action_skip_threshold", type=float, default=0.005)
     return parser
 
 

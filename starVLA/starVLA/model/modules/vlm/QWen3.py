@@ -71,10 +71,24 @@ class _QWen3_VL_Interface(nn.Module):
         # alin qwen3 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
 
-        # only for fast base model
+        # only for fast base model — resolve action token range from the
+        # tokenizer at load time (2B and 4B have different vocab sizes so the
+        # added robot_action_* tokens land at different ID ranges).
         if "-Action" in model_id:
-            self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
-            self._ACTION_TOKEN_MAX = _ACTION_TOKEN_MAX
+            tok = processor.tokenizer
+            start_id = tok.convert_tokens_to_ids("<robot_action_0>")
+            if start_id is None or start_id == tok.unk_token_id:
+                self._ACTION_TOKEN_MIN = _ACTION_TOKEN_MIN
+                self._ACTION_TOKEN_MAX = _ACTION_TOKEN_MAX
+            else:
+                last_id = start_id
+                for candidate in range(start_id + 2047, start_id, -1):
+                    tok_str = tok.convert_ids_to_tokens(candidate)
+                    if tok_str and tok_str.startswith("<robot_action_"):
+                        last_id = candidate
+                        break
+                self._ACTION_TOKEN_MIN = int(start_id)
+                self._ACTION_TOKEN_MAX = int(last_id)
 
     def get_hidden_size(self) -> int:
         text_cfg = getattr(self.model.config, "text_config", None)
@@ -104,31 +118,29 @@ class _QWen3_VL_Interface(nn.Module):
         adapter,
         *,
         enable_skipping: bool = False,
-        skip_mode: str = "none",
-        uniform_skip_threshold: Optional[float] = None,
-        vision_skip_threshold: Optional[float] = None,
-        language_skip_threshold: Optional[float] = None,
-        action_skip_threshold: Optional[float] = None,
-        action_token_id: Optional[int] = None,
+        dynamic_skip_config: Optional[dict] = None,
         **kwargs,
     ):
-        if kwargs.get("use_cache"):
-            raise NotImplementedError("AttnRes backbone skipping does not support use_cache=True")
+        """Run Qwen3-VL with per-block AttnRes in-backbone.
+
+        Args:
+            adapter: StarVLAAttnResAdapter holding router/adapters/γ.
+            enable_skipping: when True, per-block dyn-skip is consulted;
+                otherwise every block runs its transformer layers.
+            dynamic_skip_config: retrofit-style schema — see
+                ``StarVLABackboneSkipContext`` docstring. ``use_cache=True``
+                is supported; skipped blocks populate their KV cache via
+                a K/V-only path.
+            **kwargs: forwarded to ``self.model(...)`` (input_ids,
+                attention_mask, pixel_values, past_key_values, use_cache, ...).
+        """
         controller = StarVLABackboneSkipContext(
             adapter,
-            self.get_text_layers(),
-            layer_return_type="tensor",
-            input_ids=kwargs.get("input_ids"),
-            image_token_ids=self.get_vision_token_ids(),
-            action_token_id=action_token_id,
-            action_token_range=self.get_action_token_range(),
             enable_skipping=enable_skipping,
-            skip_mode=skip_mode,
-            uniform_skip_threshold=uniform_skip_threshold,
-            vision_skip_threshold=vision_skip_threshold,
-            language_skip_threshold=language_skip_threshold,
-            action_skip_threshold=action_skip_threshold,
+            dynamic_skip_config=dynamic_skip_config,
         )
+        # Bind the language_model so the context can monkey-patch its forward.
+        controller.bind_text_model(self.model.model.language_model)
         with controller, torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.model(
                 **kwargs,
@@ -206,9 +218,11 @@ class _QWen3_VL_Interface(nn.Module):
         )
 
         # if solutions, mask out the solution tokens in labels
-        if solutions is not None: #  here only for fast_tokenizer now. 
-            action_token_min = _ACTION_TOKEN_MIN # how can we know this range? --> we has other way for this, but is slower see qwenhelix branch
-            action_token_max = _ACTION_TOKEN_MAX # here only for fast_tokenizer, see starVLA/model/modules/vlm/tools/add_qwen_special_tokens/README.md
+        if solutions is not None: #  here only for fast_tokenizer now.
+            # Prefer tokenizer-resolved range (works for both 2B [151669, 153716]
+            # and 4B [151936, 153983]); fall back to hardcoded 2B range.
+            action_token_min = getattr(self, "_ACTION_TOKEN_MIN", _ACTION_TOKEN_MIN)
+            action_token_max = getattr(self, "_ACTION_TOKEN_MAX", _ACTION_TOKEN_MAX)
             labels = batch_inputs['input_ids'].clone()
             # For each sequence in the batch, find the first occurrence of an action token.
             for i in range(labels.size(0)):
