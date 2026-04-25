@@ -6,7 +6,7 @@ cd "${STARVLA_ROOT}"
 conda activate starVLA
 
 export LIBERO_HOME=/mnt/petrelfs/share/yejinhui/Projects/LIBERO
-export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero
+export LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH:-/home/user01/Minko/reskip2/libero_config}
 export LIBERO_Python=/mnt/petrelfs/share/yejinhui/Envs/miniconda3/envs/lerobot/bin/python
 export PYTHONPATH=$PYTHONPATH:${LIBERO_HOME}
 export PYTHONPATH=$(pwd):${PYTHONPATH}

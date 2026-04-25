@@ -75,8 +75,13 @@ def load_adapter_from_source(state_path: str, device, dtype, n_blocks=14, adapte
                 "a VLA ckpt whose state_dict has attnres_adapter.* entries"
             )
 
-    # Figure out hidden_size from router weights.
+    # Figure out hidden_size and n_blocks from router weights
+    # (w_query has shape [n_blocks+1, hidden] — +1 for w_current).
     hidden_size = router_sd["w_query"].shape[1]
+    inferred_nb = router_sd["w_query"].shape[0] - 1
+    if inferred_nb != n_blocks:
+        print(f"[calib] inferring n_blocks={inferred_nb} from router shape (was {n_blocks})")
+        n_blocks = inferred_nb
     # Get num_hidden_layers from base model config at load time.
     base_cfg = AutoModelForImageTextToText.from_pretrained(MODEL_PATH).config.text_config
     num_hidden_layers = base_cfg.num_hidden_layers

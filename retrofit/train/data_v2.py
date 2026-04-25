@@ -435,6 +435,14 @@ V3_MIX = MixSpec(weights={
     "open_thoughts":   0.10,
 })
 
+V3_VLONLY_MIX = MixSpec(weights={
+    # Ablation: v3 without any text-math data. Tests H4 (math-CoT text as
+    # adversary to diagram reasoning). If AI2D/MMStar recover here but
+    # LAMBADA drops, H4 is confirmed.
+    "llava_onevision": 0.80,
+    "ultrachat":       0.20,
+})
+
 
 def parse_mix_string(spec: str) -> MixSpec:
     """`name1:w1,name2:w2,...`  absolute weights, auto-normalised.
@@ -447,6 +455,8 @@ def parse_mix_string(spec: str) -> MixSpec:
         return V2_LONG_MIX
     if spec == "v3":
         return V3_MIX
+    if spec == "v3_vlonly":
+        return V3_VLONLY_MIX
     if spec == "v1":
         return MixSpec(weights={"ultrachat": 1.0, "llava_vsft": 1.0})
     d: dict[str, float] = {}

@@ -115,6 +115,19 @@ class Qwenvl_OFT(baseframework):
         # adapter that only patched last_hidden, leaving 13/14 routers/adapters
         # disconnected from the loss.
         if self.attnres_adapter is not None and hasattr(self.qwen_vl_interface, "forward_with_attnres_skip"):
+            # Normalise dynamic_skip_config into the shape
+            # StarVLABackboneSkipContext expects (int-keyed thresholds, set of
+            # eligible blocks). The wire format uses string keys + list so the
+            # payload survives msgpack strict_map_key and set-type ambiguity.
+            dyn_cfg = kwargs.get("dynamic_skip_config")
+            if isinstance(dyn_cfg, dict):
+                dyn_cfg = dict(dyn_cfg)
+                thr = dyn_cfg.get("thresholds")
+                if isinstance(thr, dict):
+                    dyn_cfg["thresholds"] = {int(k): float(v) for k, v in thr.items()}
+                elig = dyn_cfg.get("eligible_blocks")
+                if elig is not None and not isinstance(elig, set):
+                    dyn_cfg["eligible_blocks"] = set(int(x) for x in elig)
             qwenvl_outputs, routing_info = self.qwen_vl_interface.forward_with_attnres_skip(
                 self.attnres_adapter,
                 **qwen_inputs,
@@ -123,7 +136,7 @@ class Qwenvl_OFT(baseframework):
                 return_dict=True,
                 use_cache=bool(kwargs.get("use_cache", False)),
                 enable_skipping=bool(kwargs.get("enable_skipping", False)),
-                dynamic_skip_config=kwargs.get("dynamic_skip_config"),
+                dynamic_skip_config=dyn_cfg,
             )
             # Qwen3-VL returns last_hidden_state at .last_hidden_state, but
             # CausalLMOutputWithPast also exposes .hidden_states when requested.

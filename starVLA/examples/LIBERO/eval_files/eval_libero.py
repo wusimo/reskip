@@ -59,6 +59,11 @@ class Args:
     dyn_skip_config_path: str = ""
     use_cache: bool = True
     return_routing_info: bool = False
+    # If set, append one JSON line per forward containing attnres_routing
+    # (w_recents + skipped_blocks + effective_block_ratio). Used by
+    # retrofit/eval/calibrate_sim_thresholds.py to build sim-calibrated
+    # q-thresholds that match the VLA deployment distribution.
+    routing_dump_path: str = ""
 
 
 def eval_libero(args: Args) -> None:
@@ -94,11 +99,12 @@ def eval_libero(args: Args) -> None:
     if args.dyn_skip_config_path:
         with open(args.dyn_skip_config_path) as f:
             loaded = json.load(f)
-        # JSON keys are strings; coerce thresholds back to int-indexed dict.
-        thr = {int(k): float(v) for k, v in (loaded.get("thresholds") or {}).items()}
+        # Wire format: string keys (msgpack strict_map_key) + list eligible.
+        # Server-side QwenOFT._encode_backbone coerces back to int-keyed dict.
+        thr = {str(k): float(v) for k, v in (loaded.get("thresholds") or {}).items()}
         dyn_skip_cfg = {
             "thresholds": thr,
-            "eligible_blocks": set(loaded["eligible_blocks"]) if loaded.get("eligible_blocks") is not None else None,
+            "eligible_blocks": list(loaded["eligible_blocks"]) if loaded.get("eligible_blocks") is not None else None,
             "max_skips": loaded.get("max_skips"),
         }
     client_model = ModelClient(
@@ -109,7 +115,8 @@ def eval_libero(args: Args) -> None:
         enable_skipping=args.enable_skipping,
         dynamic_skip_config=dyn_skip_cfg,
         use_cache=args.use_cache,
-        return_routing_info=args.return_routing_info,
+        # Need routing info whenever we are dumping it for calibration.
+        return_routing_info=args.return_routing_info or bool(args.routing_dump_path),
     )
 
 
@@ -215,6 +222,18 @@ def eval_libero(args: Args) -> None:
                             "AttnRes backbone compute preserved: %s",
                             response["attnres_backbone_compute_preserved"],
                         )
+                if args.routing_dump_path and "attnres_routing" in response:
+                    # One JSON line per forward — append-only.
+                    with open(args.routing_dump_path, "a") as _rd:
+                        routing = response["attnres_routing"]
+                        _rd.write(json.dumps({
+                            "task": int(task_id),
+                            "episode": int(episode_idx),
+                            "step": int(step),
+                            "w_recents": routing.get("w_recents"),
+                            "skipped_blocks": routing.get("skipped_blocks"),
+                            "effective_block_ratio": routing.get("effective_block_ratio"),
+                        }) + "\n")
                 
                 world_vector_delta = np.asarray(raw_action.get("world_vector"), dtype=np.float32).reshape(-1)
                 rotation_delta = np.asarray(raw_action.get("rotation_delta"), dtype=np.float32).reshape(-1)

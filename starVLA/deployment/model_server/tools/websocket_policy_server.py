@@ -70,7 +70,7 @@ class WebsocketPolicyServer:
 
         while True:
             try:
-                msg = msgpack_numpy.unpackb(await websocket.recv())
+                msg = msgpack_numpy.unpackb(await websocket.recv(), strict_map_key=False)
                 self._last_active = time.time()  # 每次收到消息刷新活跃时间
                 ret = self._route_message(msg)  # route message
                 await websocket.send(packer.pack(ret))

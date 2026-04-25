@@ -5,7 +5,7 @@
 #
 # Prereqs:
 #   - Policy server running in main .venv (tradition: run_policy_server.sh)
-#   - LIBERO deps installed into dreamervla conda env
+#   - LIBERO deps installed into Minko .venv (uv-managed)
 #   - LIBERO source at /home/user01/yuxinglei/workspace/DreamerVLA/LIBERO
 #
 # We use the LOCAL machine paths.
@@ -16,9 +16,9 @@ SUITE="${2:?}"
 TRIALS="${3:-50}"
 PORT="${4:-5694}"
 
-export LIBERO_HOME=/home/user01/yuxinglei/workspace/DreamerVLA/LIBERO
-export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero
-export LIBERO_Python=/home/user01/miniconda3/envs/dreamervla/bin/python
+export LIBERO_HOME=${LIBERO_HOME:-/home/user01/Minko/reskip2/LIBERO_local}
+export LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH:-/home/user01/Minko/reskip2/libero_config}
+export LIBERO_Python=${LIBERO_Python:-/home/user01/Minko/reskip2/.venv/bin/python}
 
 export PYTHONPATH=${PYTHONPATH:-}:${LIBERO_HOME}
 

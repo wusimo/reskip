@@ -428,8 +428,16 @@ class StarVLABackboneSkipContext(contextlib.AbstractContextManager):
 
         hidden_states = text_model.norm(completed[-1])
 
-        # Summary
+        # Summary — also expose per-block w_recent so callers can calibrate
+        # sim-distribution thresholds (retrofit Part-1 recent_weight_gt).
+        # w_recent for block_idx is alpha[..., -1].mean() from router.route.
         n_exec = adapter.n_blocks - len(skipped_blocks)
+        w_recents = []
+        for a in alpha_list:
+            if a is not None and a.shape[-1] >= 2:
+                w_recents.append(float(a[..., -1].float().mean().item()))
+            else:
+                w_recents.append(float("nan"))
         self._summary = {
             "flops_ratio": n_exec / adapter.n_blocks,
             "effective_block_ratio": n_exec / adapter.n_blocks,
@@ -437,6 +445,7 @@ class StarVLABackboneSkipContext(contextlib.AbstractContextManager):
             "backbone_compute_preserved": len(skipped_blocks) == 0,
             "skipped_blocks": skipped_blocks,
             "keep_mask": [b not in skipped_blocks for b in range(adapter.n_blocks)],
+            "w_recents": w_recents,
         }
 
         return BaseModelOutputWithPast(
