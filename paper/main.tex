@@ -77,10 +77,10 @@ Every existing \attnres{} model is pretrained from scratch with the modified res
 
 \paragraph{Contributions.}
 \begin{itemize}
-\item \textbf{\reskip{}} (\S\ref{sec:reskip}). The phase-1 \attnres{} weights drive a per-input skip rule with position-calibrated thresholds, no auxiliary head. On a 340M from-scratch \attnres{} transformer this yields $1.19\times$ wall-clock at zero benchmark drop. We document an \emph{importance--ablation disconnect}: combining the routing-importance and static-removal signals to pick eligible positions strictly dominates either alone.
-\item \textbf{\retrofit{}} (\S\ref{sec:retrofit}, main contribution). A $\gamma$-gated residual injection installs \attnres{} into a frozen pretrained transformer through a single short fine-tune: identity-at-init, $\sim$$0.7\%$ new parameters, $\sim$$22$ GPU-minutes on Qwen3-VL-2B. Every block converges to $\gamma_n{=}1$ (\emph{structurally pure} \attnres{}). On Qwen3-VL-2B/4B the retrofit strictly improves base on $5$/$6$ full \texttt{lmms-eval} benchmarks at both scales (e.g., $+3.1$pp MMBench, $+1.8$pp MMMU on 2B; $+1.9$pp MMBench, $+3.1$pp MMMU on 4B), with the MMStar math subcategory swinging $+7.9$pp on $2$B---the largest single cell across the suite.
-\item \textbf{VLA application} (\S\ref{sec:vla}). A LIBERO policy warm-started from the retrofit beats a matched pure-OFT baseline at both 2B and 4B; a control that skips the retrofit and runs the $\gamma$-curriculum directly on VLA data plateaus $1.65$pp behind even at $2\times$ the VLA compute. \emph{Crucially, \reskip{} on top of the warm-start beats the no-skip backbone on the 4-suite mean} ($+1.10$pp on $2$B, $+0.20$pp on $4$B at the conservative operating point), reproducing on robotic action what we see for next-token prediction at $340$M.
-\item \textbf{Iso-cost speed} (\S\ref{sec:exp_retrofit}, ``Inference cost''). The accuracy results above are obtained at the same fast inference path. Under \texttt{torch.compile} (max-autotune, seq~$2048$, KV cache enabled), the retrofit forward measures $1.029\times$ base\_compiled and $0.864\times$ of the stock-HF base eager forward most deployments use. The paper's headline is therefore ``$+$accuracy at iso-cost'' rather than a speed/accuracy trade-off.
+\item \textbf{\reskip{}} (\S\ref{sec:reskip}). The \attnres{} routing weights drive a per-input layer-skip rule with no auxiliary head; the importance--ablation disconnect requires combining both signals to pick eligible positions.
+\item \textbf{\retrofit{}} (\S\ref{sec:retrofit}, main contribution). A $\gamma$-gated residual injection installs \attnres{} into a frozen pretrained transformer through a single short fine-tune ($\sim$$0.7\%$ new parameters, identity-at-init, tens of GPU-minutes per billion), with every block converging to $\gamma_n{=}1$.
+\item \textbf{VLA application} (\S\ref{sec:vla}). A LIBERO policy warm-started from the retrofit beats matched pure-OFT at $2$B and $4$B; \reskip{} on top of the trained policy beats the no-skip backbone on the 4-suite mean.
+\item \textbf{Iso-cost} (\S\ref{sec:exp_retrofit}). Under \texttt{torch.compile} the retrofit forward measures $1.029\times$ \texttt{base\_compiled}: $+$accuracy at the same fast forward, not a speed/accuracy trade-off.
 \end{itemize}
 
 \paragraph{Retrofit-as-tool: depth-axis System 2 for any pretrained transformer.}
@@ -88,9 +88,12 @@ Every existing \attnres{} model is pretrained from scratch with the modified res
 
 
 %----------------------------------------------------------------------
-\section{Background: Attention Residuals}
-\label{sec:background}
+\section{Method}
+\label{sec:method}
 %----------------------------------------------------------------------
+
+\subsection{Background: Attention Residuals}
+\label{sec:background}
 
 A standard transformer uses fixed scalar-$1$ combination, $\mathbf{x}_l = \mathbf{x}_{l-1} + f_l(\mathbf{x}_{l-1})$, emitting no routing signal. \attnres{}~\citep{chen2026attnres} replaces this with a learned attention over depth. Each block $l$ maintains a pseudo-query $\mathbf{w}_l \in \R^d$; keys are projections $\mathbf{k}_i = W_K \mathbf{h}_i$ of earlier block outputs $\mathbf{h}_i$, and
 \begin{equation}
@@ -101,10 +104,8 @@ A standard transformer uses fixed scalar-$1$ combination, $\mathbf{x}_l = \mathb
 \end{equation}
 \textbf{Two-phase execution.} Computing the input to block $l$ requires only $\{\mathbf{h}_i\}_{i<l}$ and $\mathbf{w}_l$---both available \emph{before} $f_l$ runs. We call the pre-execution attention computation \emph{phase~1} and $f_l$ itself \emph{phase~2}. Phase~1 is the routing signal we exploit. Block-\attnres{} groups layers into $N$ blocks and applies the softmax at the block level (the granularity used throughout). Algorithm~\ref{alg:two_phase} (Appendix~\ref{app:algorithm}) gives the full two-phase forward with \reskip{}'s skip check folded in.
 
-%----------------------------------------------------------------------
-\section{\reskip{}: AttnRes-Guided Layer Skipping}
+\subsection{\reskip{}: AttnRes-guided layer skipping}
 \label{sec:reskip}
-%----------------------------------------------------------------------
 
 \reskip{} turns the phase-1 signal into a per-input skip rule. Each block~$n$ has two offline scores: an \emph{\attnres{} importance} $I(n) = \max_{l > n}\,\E[\alpha_{n \to l}]$ (how often block $n$ is referenced; forward passes only) and an \emph{ablation impact} $A(n) = \mathrm{PPL}(\text{$n$ removed}) / \mathrm{PPL}(\text{full})$ (is block $n$ irreplaceable; $N{-}2$ ablated forwards). At inference, for each $n$ we read the mean weight $w_{\text{recent}}(n)$ that position $n$'s router places on the immediate predecessor and apply
 \begin{equation}
@@ -146,10 +147,8 @@ Full-depth & 0.4056 & 20.20 & 0.4607 & 0.5438 & 0.3012 \\
 \end{tabular}
 \end{table}
 
-%----------------------------------------------------------------------
-\section{\retrofit{}: Installing AttnRes into a Pretrained Transformer}
+\subsection{\retrofit{}: installing AttnRes into a pretrained transformer}
 \label{sec:retrofit}
-%----------------------------------------------------------------------
 
 \paragraph{Goal.} Take a transformer pretrained in the standard-residual regime and produce an \attnres{}-capable model that (P1) preserves benchmark quality, (P2) emits a routing $\alpha$ informative enough to drive \reskip{}, and (P3) trains in a single short fine-tune over off-the-shelf SFT data, with the base frozen.
 
@@ -401,7 +400,12 @@ We verify that the K/V-only skip path described in \S\ref{sec:retrofit} produces
 \label{app:gamma_stability}
 Under the v3 mix with ramp-fraction $0.3$ on $10$k steps, Qwen3-VL-4B diverged at step $\sim\!3{,}125$ (training CE climbed from $0.9$ to $6.5+$). The same configuration at $5$k steps, and at $10$k steps with the v3-VL-only mix (same ramp-fraction but reduced reasoning-gradient density), converged stably. Extending the ramp to fraction $0.5$ (ramp ends at step $5{,}000$ rather than step $3{,}000$) recovered convergence on $4$B $\times 10$k with no measurable effect on final quality: $4$B $\times 10$k at ramp $0.5$ is within $1$pp of $4$B $\times 5$k at ramp $0.3$ on every VLM benchmark, so the ramp-fraction difference does not confound the between-cell comparison in Appendix~\ref{app:block_partition}. Working rule: the $\gamma{=}1$ transition is stable whenever the schedule reaches $\gamma{=}1$ at step $\geq 5{,}000$, across every scale and partition we tested.
 
-\subsection{Retrofit ablations}
+%----------------------------------------------------------------------
+\section{Retrofit ablations and inference machinery}
+\label{app:ablations}
+%----------------------------------------------------------------------
+
+\subsection{Earlier design pilots (rejected)}
 \label{app:route_ablations}
 Earlier pilots tried (i)~observer-only (no forward change; $\alpha$ trained by distillation), (ii)~interpolation at block-input with $\beta{=}\sigma(\text{logit})$ driven toward~$1$, and (iii)~pure AttnRes with informed init $\mathbf{w}_n \gets c\,\bar{\mathbf{k}}_{n-1}$ + temperature annealing. (i) produced an $\alpha$ head whose skip decision did not feed back through the forward and collapsed LAMBADA to $0.12$ accuracy; (ii) pushed the frozen backbone off-distribution once $\beta$ grew and required pretraining data to recover (defeating the ``light fine-tune'' premise); (iii) was highly sensitive to the consecutive-layer key-similarity of the pretrained backbone, and did not converge within our training budget. The $\gamma$-gated residual injection of \S\ref{sec:retrofit} is the converged recipe.
 
@@ -506,6 +510,11 @@ The table crystallises three working rules for the retrofit's data mix.
 \end{algorithmic}
 \end{algorithm}
 
+%----------------------------------------------------------------------
+\section{Phase 1: 340M from-scratch validation}
+\label{app:phase1_section}
+%----------------------------------------------------------------------
+
 \subsection{Motivation: \attnres{} cost from-scratch is prohibitive}
 \label{app:motivation}
 We measured forward-pass latency on $1{\times}$H100 / bf16 / batch $1$ for two $340$M models trained under identical FineWeb-Edu 100BT recipes: a vanilla standard-residual transformer and an \attnres{} transformer with $N{=}8$ blocks. Block-\attnres{} adds $+78\%$ ($8192$ seq) to $+128\%$ ($1024$ seq) wall-clock vs.\ vanilla. At the $2$B VL scale a stock Qwen3-VL-2B forward already takes $\sim$$25.6$\,ms at seq $256$ on $1{\times}$H100, so a $35$--$45\%$ block-level \attnres{} overhead would push past common $50$\,Hz / $20$\,Hz robotic control budgets. Pretraining a $2$B \attnres{}-VLM costs at least what the matched standard-residual base costs ($\geq 10$k--$25$k H100-h reading published Qwen3-VL / InternVL3 / OpenVLA / LLaVA-OneVision tech reports), so the only practical access path is a retrofit on the already-trained standard model.
@@ -569,6 +578,11 @@ $\{2,3,4,5,6\}$ & 1.40 & 1.16$\times$ \\
 \caption{\reskip{} on 340M FineWeb-Edu: position-calibrated dynamic skip with $\mathcal{P}{=}\{3,5\}$ strictly dominates the single-position baseline at zero benchmark drop.}
 \label{fig:reskip_pareto_latency}
 \end{figure}
+
+%----------------------------------------------------------------------
+\section{Retrofit Pareto and breakdowns}
+\label{app:retrofit_extras}
+%----------------------------------------------------------------------
 
 \subsection{LoRA baselines}
 \label{app:lora_baselines}
@@ -648,6 +662,15 @@ The structural per-block router stack (\texttt{stack}$\to$\texttt{RMSNorm}$\to$\
 
 \paragraph{Skip on top of compile.} Eager-mode \reskip{} contributes a further $5$--$9\%$ when used on its own at $q{=}0.99$, but cannot currently be composed with \texttt{torch.compile} in a single forward: the dyn-skip rule requires an \texttt{.item()} on a per-token threshold comparison, which forces a CPU sync and breaks the captured CUDA graph. Production deployments pick one mode per latency budget---compile for high-throughput batch decode, eager-with-skip for variable-batch interactive workloads. A static-graph variant of the skip rule (compile-safe top-$k$ with a fixed routing decision per shape bucket) is a known direction.
 
+\subsection{Compile vs.\ eager: accuracy parity}
+\label{app:compile_accuracy}
+
+The iso-cost result of \S\ref{sec:exp_retrofit} requires that \texttt{torch.compile} preserve the retrofit's accuracy. We verified two parity tests on the canonical $L{=}4$ v3 $10$k retrofit.
+
+\paragraph{LAMBADA-$500$ accuracy parity.} Running LAMBADA-$500$ with the retrofit wrapped in \texttt{torch.compile(mode="default", dynamic=True)}: acc $0.5720$ compiled vs.\ $0.5700$ eager ($\Delta{=}+0.20$pp), ppl $4.534$ vs.\ $4.526$. Per-target argmax agreement against eager: $98.60\%$ — the residual $1.4\%$ are tokens where eager and compiled both fall within bf16 SDPA jitter and the rank-$1$/rank-$2$ logits flip.
+
+\paragraph{Per-token logit parity.} On real prompt tokens with \texttt{mode="reduce-overhead"} (the inference-time mode used for the speed table): per-token argmax agreement $98.51\%$, max $|\Delta\text{logits}|=0.50$, RMSE $0.060$ — same magnitude as the cache-on/cache-off SDPA jitter on the stock base (Appendix~\ref{app:kv_equiv}). Compile preserves the retrofit's forward to within bf16 evaluation noise; the $1.029\times$ \texttt{base\_compiled} number is at iso-accuracy.
+
 \subsection{Block partition sweep}
 \label{app:block_partition}
 \begin{table}[h]
@@ -695,6 +718,11 @@ $\Delta$ vs.\ $4$B base                   & $\mathbf{+3.9}$ & $-2.4$ & $+0.2$ & 
 \bottomrule
 \end{tabular}
 \end{table}
+
+%----------------------------------------------------------------------
+\section{VLA appendix}
+\label{app:vla_section}
+%----------------------------------------------------------------------
 
 \subsection{VLA seed variance on 2B}
 \label{app:vla_variance}
@@ -760,15 +788,6 @@ block~$1$: $0.4$; block~$4$: $34.0$; block~$0$: $58.1$; block~$5$: $87.0$; remai
 \paragraph{Threshold calibration.} Per-block thresholds $\tau_n$ are the $q$-th empirical quantile of $w_{\text{recent},n}$ over $31{,}286$ ($2$B) / $31{,}257$ ($4$B) sim-rollout records (one record per decoded action token across many trajectories). The Tab.~\ref{tab:vla_reskip_pareto} numbers use this protocol. A separate ``Method A'' that calibrates on retrofit pretokenized data (as if the VLA were just a long-context LM) accidentally lands at a conservative operating point that mimics $q{=}0.99$ on the action distribution; we use it as a sensitivity comparator in our internal ablations and recommend the action-distribution-calibrated thresholds for any deployment.
 
 \paragraph{Cross-modality threshold transfer is not safe.} The LAMBADA-calibrated thresholds at $q{=}0.85$ from Tab.~\ref{tab:retrofit_pareto}, applied unchanged to the same Path B policy at LIBERO inference, drop LIBERO-Spatial from $99.5\%$ (a $L{=}4$ $v3$ warm-start, partial eval) to $64\%$. The action distribution has more low-$w_{\text{recent}}$ mass than the language distribution at the same blocks; the language $q{=}0.85$ corresponds to roughly the action $q{=}0.50$, which over-skips. This is the empirical hard motivation for per-modality, per-token-class calibration in deployments that mix modalities within a single rollout.
-
-\subsection{Compile vs.\ eager: accuracy parity}
-\label{app:compile_accuracy}
-
-The iso-cost result of \S\ref{sec:exp_retrofit} requires that \texttt{torch.compile} preserve the retrofit's accuracy. We verified two parity tests on the canonical $L{=}4$ v3 $10$k retrofit.
-
-\paragraph{LAMBADA-$500$ accuracy parity.} Running LAMBADA-$500$ with the retrofit wrapped in \texttt{torch.compile(mode="default", dynamic=True)}: acc $0.5720$ compiled vs.\ $0.5700$ eager ($\Delta{=}+0.20$pp), ppl $4.534$ vs.\ $4.526$. Per-target argmax agreement against eager: $98.60\%$ — the residual $1.4\%$ are tokens where eager and compiled both fall within bf16 SDPA jitter and the rank-$1$/rank-$2$ logits flip.
-
-\paragraph{Per-token logit parity.} On real prompt tokens with \texttt{mode="reduce-overhead"} (the inference-time mode used for the speed table): per-token argmax agreement $98.51\%$, max $|\Delta\text{logits}|=0.50$, RMSE $0.060$ — same magnitude as the cache-on/cache-off SDPA jitter on the stock base (Appendix~\ref{app:kv_equiv}). Compile preserves the retrofit's forward to within bf16 evaluation noise; the $1.029\times$ \texttt{base\_compiled} number is at iso-accuracy.
 
 \subsection{VLA planned follow-ups}
 \label{app:vla_future}
