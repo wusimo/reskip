@@ -52,15 +52,7 @@
 \maketitle
 
 \begin{abstract}
-Different inputs deserve different amounts of computation---a System-1 / System-2 intuition with deep cognitive and neural roots~\citep{kahneman2011thinking, lamme2000distinct, kar2019recurrent}.
-Recent test-time compute scaling for LLMs operationalises this intuition along the \emph{token} axis (more reasoning tokens for harder problems)~\citep{openai2024o1, deepseek2025r1, snell2024scaling, wei2022chain}, but every token in a long reasoning trace still goes through every layer of the transformer.
-The complementary \emph{depth} axis---which blocks to invoke per input---is largely under-exploited, and existing methods (early exit, mixture-of-depths, layer pruning) bolt on a separate decider rather than producing the depth-allocation signal as a property of the forward pass.
-We use \emph{Attention Residuals} (\attnres{})~\citep{chen2026attnres}---a residual that attends over previous block outputs and so emits a per-block routing weight as a side-effect of forming each block's input---as the intrinsic handle, and develop a recipe to install it into any pretrained transformer.
-\textbf{(1)~\reskip{}.} We read the \attnres{} weight as a pre-execution skip signal: input-dependent, position-calibrated, no auxiliary head ($1.19\times$ wall-clock at $340$M from-scratch, zero benchmark drop).
-\textbf{(2)~\retrofit{} (main contribution).} A $\gamma$-gated residual-injection fine-tune converts \emph{any} pretrained decoder transformer into an \attnres{}-capable model: identity-at-init, base frozen, $\sim$$0.7\%$ new parameters, $\sim$$22$ GPU-minutes on $2$B. On Qwen3-VL-2B/4B the retrofit strictly improves base on $5$/$6$ full \texttt{lmms-eval} benchmarks at both scales ($+3.1$pp MMBench, $+1.8$pp MMMU on $2$B; $+1.9$pp MMBench, $+3.1$pp MMMU on $4$B), with the largest single-cell gain on the MMStar math subcategory ($+7.9$pp on $2$B).
-\textbf{(3)~VLA.} A LIBERO policy warm-started from the retrofit beats a matched pure-OFT baseline at both $2$B and $4$B; \reskip{} on top of the warm-start \emph{beats} the no-skip backbone on the LIBERO 4-suite mean ($+1.10$pp on $2$B, $+0.20$pp on $4$B at the conservative operating point).
-\textbf{(4)~Iso-cost.} All accuracy results above are obtained at the same fast forward path: under \texttt{torch.compile} max-autotune, the retrofit lands at $1.03\times$ base\_compiled and $0.864\times$ of the stock-HF base eager forward most deployments use today---there is no speed/accuracy trade-off to defend.
-The recipe is, to our knowledge, the cheapest existing path from an off-the-shelf transformer to a depth-axis-System-2-capable model, and is complementary to token-axis test-time-compute approaches at two orders of magnitude less compute.
+Different inputs deserve different amounts of computation. Recent test-time compute scaling realises this intuition along the \emph{token} axis (longer reasoning traces for harder problems)~\citep{openai2024o1, deepseek2025r1, snell2024scaling, wei2022chain}, but every token in such a trace still traverses every layer of the transformer; the complementary \emph{depth} axis---which blocks to invoke per input---is largely under-exploited, and existing methods (early exit, mixture-of-depths, layer pruning) bolt on a separate decider rather than producing the depth-allocation signal as a property of the forward pass itself. We use \emph{Attention Residuals} (\attnres{})~\citep{chen2026attnres}---a residual that attends over previous block outputs---as the intrinsic handle: each block's input arrives with a routing weight saying how much each predecessor contributed, and we read this weight as a pre-execution skip signal (\reskip{}). Because \attnres{} is an architectural change, the practical bottleneck is installation; our main contribution, \retrofit{}, is a $\gamma$-gated residual-injection fine-tune that converts any pretrained decoder transformer into an \attnres{}-capable model with the base frozen, well under $1\%$ new parameters, and tens of GPU-minutes per billion. On Qwen3-VL-2B and 4B the retrofit strictly improves the base on most \texttt{lmms-eval} benchmarks; a LIBERO VLA warm-started from the retrofit beats a matched pure-OFT baseline at both scales, and \reskip{} on top of the trained policy beats the no-skip backbone on the 4-suite mean. Under \texttt{torch.compile} the pipeline runs at iso-cost with the compiled base---accuracy gains are obtained at the same fast forward, not against it. To our knowledge this is the cheapest existing path from an off-the-shelf transformer to a depth-axis adaptive-compute model, complementary to token-axis test-time-compute approaches.
 \end{abstract}
 
 %----------------------------------------------------------------------
@@ -362,8 +354,16 @@ RT-2~\citep{brohan2023rt}, Octo~\citep{team2024octo}, OpenVLA~\citep{kim2024open
 \label{sec:discussion}
 %----------------------------------------------------------------------
 
-\paragraph{Summary.}
 \reskip{} reads phase-1 \attnres{} weights as an intrinsic skip signal: $1.19\times$ wall-clock at $340$M from-scratch with zero benchmark drop, plus an importance--ablation disconnect that requires combining both signals to pick eligible positions. \retrofit{} (the main contribution) installs \attnres{} into a frozen pretrained transformer through a single short fine-tune ($\sim$$0.7\%$ new parameters, identity-at-init, every block converges to $\gamma_n{=}1$): on Qwen3-VL-2B/4B at the canonical $L{=}4$ v3 recipe it strictly improves $5$/$6$ \texttt{lmms-eval} VLM benchmarks at both scales (MMBench $+3.1$/$+1.9$pp, MMMU $+1.8$/$+3.1$pp), lifts LAMBADA by $+3.3$/$+8.7$pp, and concentrates the largest single-cell gain on MMStar math ($+7.9$pp on $2$B). A LIBERO VLA warm-started from the retrofit beats matched pure-OFT at both scales, and \emph{\reskip{} on the trained VLA policy beats the no-skip backbone on the 4-suite mean} ($+1.10$pp $2$B / $+0.20$pp $4$B at the conservative operating point). All accuracy results above are obtained at iso-cost: under \texttt{torch.compile} max-autotune, the retrofit forward measures $1.029\times$ \texttt{base\_compiled} and $0.864\times$ of the stock-HF \texttt{base\_eager} forward---the paper's framing is therefore \emph{$+$accuracy at iso-cost} rather than a speed/accuracy trade-off.
+
+\bibliography{references}
+\bibliographystyle{plainnat}
+
+%----------------------------------------------------------------------
+\appendix
+\section{Limitations and future work}
+\label{app:limitations}
+%----------------------------------------------------------------------
 
 \paragraph{Limitations.}
 (i)~Two retrofit targets from one VLM family; extension to InternVL / Gemma-VL / text-only LMs is planned. (ii)~The compile-on iso-cost result requires \texttt{torch.compile}; eager-mode retrofit alone is $1.12\times$ at $L{=}4$, while eager \reskip{} contributes a further $5$--$9\%$ but cannot currently be composed in a single forward with compile (dyn-skip's \texttt{.item()} guard breaks the captured CUDA graph). Deployments pick one mode per latency budget; a Triton-fused router that lets the two co-exist is open future work. (iii)~Wall-clock is H100 / bf16; lower-end GPU / edge measurement is not yet done. (iv)~The VLA Pareto thresholds are sim-calibrated per scale, not per modality \emph{within} a single rollout; per-modality, per-token-class calibration is the next sweep. (v)~Block-level granularity is inherited from \attnres{}; per-token routing is future work.
@@ -371,11 +371,6 @@ RT-2~\citep{brohan2023rt}, Octo~\citep{team2024octo}, OpenVLA~\citep{kim2024open
 \paragraph{Future work: weight-shared AttnRes (\reloop{}).}
 A natural extension shares block weights across depth and differentiates each application via position-indexed pseudo-queries; the \attnres{} routing weight then doubles as the halt signal, unifying \reskip{} (``low $\alpha$ $\Rightarrow$ skip block'') and a \reloop{} halt rule (``low mean-recent $\alpha$ $\Rightarrow$ halt iteration''). A 74M validation produced a smooth depth--quality Pareto ($25\%$ compute saved at $<1\%$ ppl change); scaling and combining with the retrofit framework is open.
 
-\bibliography{references}
-\bibliographystyle{plainnat}
-
-%----------------------------------------------------------------------
-\appendix
 \section{Implementation details}
 \label{app:implementation}
 %----------------------------------------------------------------------
