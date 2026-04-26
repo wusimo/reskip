@@ -26,7 +26,7 @@ from qwen3vl_attnres_retrofit import Qwen3VLAttnResRetrofit
 from starvla_integration import StarVLAAttnResAdapter, StarVLABackboneSkipContext
 
 MODEL_PATH = "/home/user01/Minko/models/Qwen3-VL-2B"
-STATE_PATH = "/home/user01/Minko/reskip2/reskip/retrofit/outputs/H_r256_5k/retrofit_attnres_state.pt"
+DEFAULT_STATE_PATH = "/home/user01/Minko/reskip2/reskip/retrofit/outputs/H_r256_5k/retrofit_attnres_state.pt"
 
 
 @torch.no_grad()
@@ -50,6 +50,10 @@ def main():
     ap.add_argument("--seq-lens", default="1024,2048")
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--timed", type=int, default=20)
+    ap.add_argument("--state-path", default=DEFAULT_STATE_PATH,
+                    help="retrofit_attnres_state.pt path (defaults to H_r256_5k 14-block)")
+    ap.add_argument("--vla-n-blocks", type=int, default=14,
+                    help="num_blocks for the VLA-in-backbone adapter (must match state-path config)")
     args = ap.parse_args()
     device = f"cuda:{args.gpu}"
     dtype = torch.bfloat16
@@ -59,7 +63,7 @@ def main():
 
     # VLM retrofit on its OWN base (so true_base stays stock).
     vlm_base = AutoModelForImageTextToText.from_pretrained(MODEL_PATH, dtype=dtype).to(device).eval()
-    ck = torch.load(STATE_PATH, map_location="cpu")
+    ck = torch.load(args.state_path, map_location="cpu")
     cfg = ck.get("config", {})
     kw = dict(num_blocks=cfg.get("num_blocks", 14))
     if "adapter_rank" in cfg:
@@ -76,10 +80,10 @@ def main():
     vla_adapter = StarVLAAttnResAdapter(
         hidden_size=hidden_size,
         num_hidden_layers=num_hidden_layers,
-        n_blocks=14,
+        n_blocks=args.vla_n_blocks,
         adapter_rank=256,
     ).to(device=device, dtype=dtype).eval()
-    vla_adapter.load_retrofit_state(STATE_PATH, strict=False)
+    vla_adapter.load_retrofit_state(args.state_path, strict=False)
     vla_adapter = vla_adapter.to(device=device, dtype=dtype)
 
     for seq in [int(x) for x in args.seq_lens.split(",")]:

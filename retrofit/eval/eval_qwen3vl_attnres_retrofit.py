@@ -21,6 +21,7 @@ from datasets import load_dataset
 sys.path.insert(0, "/home/user01/Minko/reskip2/reskip/retrofit")
 from transformers import AutoModelForImageTextToText, AutoTokenizer
 from qwen3vl_attnres_retrofit import Qwen3VLAttnResRetrofit
+from compile_utils import wrap_compile, add_compile_arg
 
 
 MODEL_PATH = "/home/user01/Minko/models/Qwen3-VL-2B"
@@ -75,8 +76,10 @@ def load_model(model_type, state_path, device, num_blocks=14,
 
 
 @torch.no_grad()
-def forward_logits(model, ids, skip_block_indices=None):
-    if isinstance(model, Qwen3VLAttnResRetrofit):
+def forward_logits(model, ids, skip_block_indices=None, is_retrofit=False):
+    """is_retrofit: True when ``model`` wraps a Qwen3VLAttnResRetrofit
+    (also after torch.compile, which would otherwise break an isinstance check)."""
+    if is_retrofit:
         kwargs = {}
         if skip_block_indices:
             kwargs["skip_block_indices"] = skip_block_indices
@@ -86,7 +89,7 @@ def forward_logits(model, ids, skip_block_indices=None):
 
 
 @torch.no_grad()
-def eval_lambada(model, tok, device, n=500, skip_block_indices=None):
+def eval_lambada(model, tok, device, n=500, skip_block_indices=None, is_retrofit=False):
     ds = load_dataset("EleutherAI/lambada_openai", "en", split="test")
     if n < len(ds):
         ds = ds.select(range(n))
@@ -104,7 +107,7 @@ def eval_lambada(model, tok, device, n=500, skip_block_indices=None):
         if not tgt_ids:
             continue
         inp = torch.tensor([ctx_ids + tgt_ids], device=device)
-        logits = forward_logits(model, inp, skip_block_indices)
+        logits = forward_logits(model, inp, skip_block_indices, is_retrofit=is_retrofit)
         start = len(ctx_ids) - 1
         pred_logits = logits[0, start:start + len(tgt_ids), :]
         tgt = torch.tensor(tgt_ids, device=device)
@@ -120,7 +123,7 @@ def eval_lambada(model, tok, device, n=500, skip_block_indices=None):
 
 
 @torch.no_grad()
-def eval_hellaswag(model, tok, device, n=500, skip_block_indices=None):
+def eval_hellaswag(model, tok, device, n=500, skip_block_indices=None, is_retrofit=False):
     ds = load_dataset("Rowan/hellaswag", split="validation")
     if n < len(ds):
         ds = ds.select(range(n))
@@ -136,7 +139,7 @@ def eval_hellaswag(model, tok, device, n=500, skip_block_indices=None):
             if not tgt_ids:
                 scores.append(-1e9); continue
             inp = torch.tensor([ctx_ids + tgt_ids], device=device)
-            logits = forward_logits(model, inp, skip_block_indices)
+            logits = forward_logits(model, inp, skip_block_indices, is_retrofit=is_retrofit)
             start = len(ctx_ids) - 1
             pred_logits = logits[0, start:start + len(tgt_ids), :]
             lp = F.log_softmax(pred_logits.float(), dim=-1)
@@ -166,6 +169,7 @@ def main():
     p.add_argument("--label", default=None)
     p.add_argument("--model-path", default=None,
                    help="HF model dir. Default: Qwen3-VL-2B (MODEL_PATH constant).")
+    add_compile_arg(p)
     args = p.parse_args()
 
     device = f"cuda:{args.gpu}"
@@ -179,16 +183,25 @@ def main():
     skip_blocks = [int(x) for x in args.skip_blocks.split(",")] if args.skip_blocks else None
     if skip_blocks:
         label = f"{label}+skip{skip_blocks}"
+    # Wrap with torch.compile per the iso-cost paper claim. Variable-length
+    # LAMBADA / HellaSwag inputs → dynamic=True so the compile cache doesn't
+    # thrash. Skip-blocks path uses the retrofit wrapper which has a runtime
+    # branch; compile still works (graph-breaks at the branch but the bulk
+    # of layer kernels remain compiled). Use --compile-mode off to bypass.
+    is_retrofit = retrofit is not None
+    model = wrap_compile(model, mode=args.compile_mode, label=f"{label}")
     print(f"\n{'='*70}\n{label}\n{'='*70}", flush=True)
 
     acc, ppl, tot = eval_lambada(model, tok, device, n=args.lambada_n,
-                                 skip_block_indices=skip_blocks)
+                                 skip_block_indices=skip_blocks,
+                                 is_retrofit=is_retrofit)
     print(f"LAMBADA: acc={acc:.4f} ppl={ppl:.3f} n={tot}", flush=True)
 
     hs_acc = None
     if not args.skip_hellaswag:
         hs_acc, hs_tot = eval_hellaswag(model, tok, device, n=args.hellaswag_n,
-                                        skip_block_indices=skip_blocks)
+                                        skip_block_indices=skip_blocks,
+                                        is_retrofit=is_retrofit)
         print(f"HellaSwag: acc_norm={hs_acc:.4f} n={hs_tot}", flush=True)
 
     print(f"\n=== SUMMARY [{label}] ===", flush=True)

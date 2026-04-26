@@ -4,10 +4,23 @@
 
 import logging
 import socket
+import sys
 import argparse
 from deployment.model_server.tools.websocket_policy_server import WebsocketPolicyServer
 from starVLA.model.framework.base_framework import baseframework
 import torch, os
+
+# Make the retrofit compile_utils helper importable from the production server.
+# Path mirrors the one used by retrofit/bench scripts.
+sys.path.insert(
+    0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "retrofit")
+)
+try:
+    from compile_utils import wrap_compile  # type: ignore
+except Exception as _e:  # noqa: BLE001 — fall back to a passthrough on any failure
+    logging.warning("retrofit/compile_utils unavailable (%s); compile disabled.", _e)
+    def wrap_compile(model, mode=None, dynamic=None, label="model"):  # type: ignore
+        return model
 
 
 def main(args) -> None:
@@ -26,6 +39,10 @@ def main(args) -> None:
     # threaded per-request from the client via vla_input; no server-side
     # pre-configuration of the adapter needed.
     vla = vla.to("cuda").eval()
+    # Iso-cost paper claim: wrap the VLA policy with torch.compile so the
+    # default LIBERO inference matches the speed-bench number cited in the
+    # paper. Pass --compile-mode off to bypass for accuracy reproduction.
+    vla = wrap_compile(vla, mode=args.compile_mode, label="server_policy.vla")
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -49,6 +66,16 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     parser.add_argument("--idle_timeout" , type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
+    parser.add_argument(
+        "--compile-mode",
+        default=None,
+        help=(
+            "torch.compile mode for the policy at serve time. None → "
+            "RETROFIT_COMPILE_MODE env or 'max-autotune-no-cudagraphs' (paper "
+            "iso-cost default). Pass 'off' to disable compile for accuracy "
+            "reproduction."
+        ),
+    )
     return parser
 
 

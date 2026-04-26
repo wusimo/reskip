@@ -30,6 +30,7 @@ from lmms_eval.models.registry_v2 import ModelManifest
 from lmms_eval.models import MODEL_REGISTRY_V2
 
 from qwen3vl_attnres_retrofit import Qwen3VLAttnResRetrofit
+from compile_utils import wrap_compile
 
 
 @register_model("qwen3_vl_retrofit")
@@ -45,6 +46,7 @@ class Qwen3_VL_Retrofit(Qwen3_VL):
         dyn_quantile: float = 0.95,
         dyn_max_skips: int = 1,
         dyn_positions: str = "4,6,11",
+        compile_mode: str = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -59,6 +61,18 @@ class Qwen3_VL_Retrofit(Qwen3_VL):
                 max_skips=int(dyn_max_skips),
                 positions=tuple(int(x) for x in str(dyn_positions).split(",")),
             )
+        # Iso-cost paper claim: compile the underlying HF model so lmms-eval's
+        # ``self._model.generate(...)`` (which calls ``__call__``) goes through
+        # the retrofit-monkey-patched forward under torch.compile. Pass
+        # ``compile_mode=off`` in --model_args to bypass for accuracy
+        # reproduction. Dyn-skip path graph-breaks on the .item() guard but
+        # other layer kernels still compile, so we leave compile on by default
+        # there too.
+        self._model = wrap_compile(
+            self._model,
+            mode=compile_mode,
+            label="lmms_eval_retrofit",
+        )
 
     def _load_retrofit(self, state_path, num_blocks, adapter_rank):
         ck = torch.load(state_path, map_location="cpu")

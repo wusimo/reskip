@@ -23,7 +23,7 @@ from transformers import AutoModelForImageTextToText
 from qwen3vl_attnres_retrofit import Qwen3VLAttnResRetrofit
 
 MODEL_PATH = "/home/user01/Minko/models/Qwen3-VL-2B"
-STATE_PATH = "/home/user01/Minko/reskip2/reskip/retrofit/outputs/H_r256_5k/retrofit_attnres_state.pt"
+DEFAULT_STATE_PATH = "/home/user01/Minko/reskip2/reskip/retrofit/outputs/H_r256_5k/retrofit_attnres_state.pt"
 
 
 @torch.no_grad()
@@ -49,15 +49,18 @@ def main():
     ap.add_argument("--timed", type=int, default=15)
     ap.add_argument("--compile-mode", default="reduce-overhead",
                     help="torch.compile mode: default, reduce-overhead, max-autotune")
+    ap.add_argument("--state-path", default=DEFAULT_STATE_PATH,
+                    help="retrofit_attnres_state.pt path (defaults to H_r256_5k 14-block)")
     args = ap.parse_args()
     device = f"cuda:{args.gpu}"
     dtype = torch.bfloat16
 
     print(f"[compile-bench] loading models on {device} (mode={args.compile_mode})")
+    print(f"[compile-bench] state: {args.state_path}")
 
     true_base = AutoModelForImageTextToText.from_pretrained(MODEL_PATH, dtype=dtype).to(device).eval()
     vlm_base = AutoModelForImageTextToText.from_pretrained(MODEL_PATH, dtype=dtype).to(device).eval()
-    ck = torch.load(STATE_PATH, map_location="cpu")
+    ck = torch.load(args.state_path, map_location="cpu")
     cfg = ck.get("config", {})
     kw = dict(num_blocks=cfg.get("num_blocks", 14))
     if "adapter_rank" in cfg:
